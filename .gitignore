@@ -1,0 +1,71 @@
+# leasehold is a PUBLIC repo. This file is a safety net, not the only guard:
+# gitleaks runs as a pre-commit hook and in CI.
+
+# --- Secrets and local config (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.jks
+*.keystore
+*.truststore
+*.kubeconfig
+secrets/
+**/secrets.env
+*.vault
+vault.yml
+.netrc
+.pypirc
+
+# --- Python / uv ---
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+# uv.lock is committed on purpose (reproducible dev stack and CI).
+
+# --- Test, coverage, type-check, lint caches ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.hypothesis/
+.tox/
+.nox/
+
+# --- Local dev stack state (docker-compose volumes, Nomad dev agent) ---
+dev/.data/
+dev/.odc-dev.env
+.nomad-dev/
+*.log
+
+# --- Recorded fixtures: only curated ones go in, raw captures stay local ---
+# Raw captures can contain real domains, IPs and response bodies.
+fixtures/raw/
+**/fixtures/_capture/
+
+# --- Editors and OS ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Claude Code: shared project settings are fine, personal ones are not ---
+.claude/settings.local.json
+CLAUDE.local.md
