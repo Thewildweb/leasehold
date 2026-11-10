@@ -1,0 +1,37 @@
+# Example service: resolves domains found by certwatch.
+# Its `new-domains` processor reads certwatch's events and creates this
+# service's own task type. certwatch's service.yml does not reference it.
+spec_version: 1
+name: resolver
+description: Resolves A records for discovered domains
+owner: example
+
+components:
+  new-domains:
+    kind: processor
+    consumes: [certwatch.entries.v1]
+    creates_tasks: [resolver.a_record]
+    node_class: storage
+    resources: { cpu: 300, memory: 256 }
+
+  worker:
+    kind: task-worker
+    consumes_tasks: [resolver.a_record]
+    produces: [results]
+    node_class: processing
+    resources: { cpu: 300, memory: 256 }
+    count: { min: 1, max: 8 }
+
+kafka:
+  produces:
+    results:
+      payload_model: resolver_shared.models:LookupResult
+      partitions: 24
+      retention: 3d
+      key: domain
+
+frontier:
+  task_types:
+    resolver.a_record:
+      key: domain
+      recrawl_interval: 30d
