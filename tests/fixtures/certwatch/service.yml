@@ -1,0 +1,69 @@
+# Example service: reads Certificate Transparency logs.
+# Generic fixture; real budgets and counts live in the private operations repo.
+spec_version: 1
+name: certwatch
+description: Domains from Certificate Transparency logs
+owner: example
+
+components:
+  planner:
+    kind: scheduled
+    schedule: "*/5 * * * *"
+    node_class: services
+    resources: { cpu: 200, memory: 256 }
+    creates_tasks: [certwatch.chunk]
+
+  worker:
+    kind: task-worker
+    consumes_tasks: [certwatch.chunk]
+    produces: [entries]
+    node_class: processing
+    resources: { cpu: 500, memory: 256, memory_max: 512 }
+    count: { min: 2, max: 10 }
+    scaling: { metric: eligible_tasks, per_instance: 500 }
+
+kafka:
+  produces:
+    entries:
+      version: 1
+      payload_model: certwatch_shared.models:CertChunk
+      partitions: 12
+      retention: 24h
+      key: log_name
+
+frontier:
+  task_types:
+    certwatch.chunk:
+      key: "log_name:chunk_start"
+      max_attempts: 5
+      retry_backoff: 5m
+
+clickhouse:
+  database: certwatch
+  sinks:
+    domains: { topic: entries, schema_file: schema/domains.sql }
+    chunk_attempts: { topic: entries, schema_file: schema/chunk_attempts.sql }
+
+destinations:
+  ct_log:
+    per_egress_rps: 0.2
+    group_by: provider
+
+expects:
+  - name: chunks-advancing
+    sql: "SELECT count() FROM {database}.chunk_attempts WHERE attempted_at > now() - INTERVAL 1 DAY"
+    min: 100
+    every: 15m
+    priority: high
+
+alerts:
+  defaults:
+    no_progress: { for: 6h }
+  rules:
+    - name: chunk-failure-rate
+      component: worker
+      when: task_failure_ratio(certwatch.chunk) > 0.3
+      for: 1h
+      escalate:
+        - { after: 0, priority: info }
+        - { after: 6h, priority: high }
