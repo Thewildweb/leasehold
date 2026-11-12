@@ -24,7 +24,6 @@ jobs:
   test:
     name: tests
     runs-on: ubuntu-latest
-    if: hashFiles('pyproject.toml') != ''   # no-op until the package exists
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -32,4 +31,41 @@ jobs:
           python-version: "3.12"
       - run: uv sync --all-extras --dev
       - run: uv run ruff check .
+      - run: uv run ruff format --check .
       - run: uv run pytest
+
+  integration:
+    name: integration (dev stack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-extras --dev
+      - name: Start the dev stack
+        run: docker compose -f dev/docker-compose.yml up -d --wait
+      - name: Integration tests
+        env:
+          LEASEHOLD_TEST_KAFKA: localhost:19092
+          LEASEHOLD_TEST_POSTGRES: postgresql://leasehold:dev-leasehold@localhost:15432/leasehold
+          LEASEHOLD_TEST_GRAFANA: http://admin:dev-admin@localhost:13000
+        run: uv run pytest tests/integration -v
+      - name: Broker logs on failure
+        if: failure()
+        run: docker compose -f dev/docker-compose.yml logs kafka postgres grafana
+
+  images:
+    name: images (build only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the runtime base image
+        run: docker build -f images/base/Dockerfile --target runtime -t leasehold-base:ci .
+      - name: Build the control API image
+        run: docker build -f images/base/Dockerfile --target control-api -t leasehold-control-api:ci .
+      - name: Smoke test
+        run: |
+          docker run --rm leasehold-base:ci
+          docker run --rm leasehold-base:ci python -c "import leasehold.runtime"
+          docker run --rm leasehold-control-api:ci leasehold api serve --help

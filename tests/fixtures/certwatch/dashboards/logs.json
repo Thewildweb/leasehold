@@ -1,0 +1,30 @@
+{
+  "id": 12,
+  "uid": "exported-uid",
+  "version": 7,
+  "title": "Logs per CT log",
+  "tags": ["certwatch", "leasehold", "env:dev"],
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {"name": "database", "type": "constant", "query": "dev_certwatch", "hide": 2},
+      {"name": "log", "type": "custom", "query": "argon,xenon"}
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Entries per log",
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "some-other-uid"},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-clickhouse-datasource", "uid": "some-other-uid"},
+          "rawSql": "SELECT toStartOfHour(seen_at) t, log_name, count() FROM ${database}.domains GROUP BY t, log_name ORDER BY t",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 8}
+    }
+  ]
+}

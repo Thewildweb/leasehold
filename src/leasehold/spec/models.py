@@ -216,11 +216,34 @@ class TaskType(_Strict):
     retry_backoff: Duration = Field(
         default=timedelta(minutes=5), description="Base backoff; doubles per failed attempt"
     )
+    retry_backoff_max: Duration = Field(
+        default=timedelta(hours=6), description="Upper limit of the doubled backoff"
+    )
+    lease_duration: Duration = Field(
+        default=timedelta(minutes=5),
+        description="How long a lease lasts without renewal; an expired lease counts as a "
+        "failed attempt",
+    )
     default_priority: int = Field(default=50, ge=0, le=100)
     capabilities: list[Identifier] = Field(
         default_factory=list, description="What a worker needs, e.g. http, playwright"
     )
+    hash_partitions: int = Field(
+        default=1,
+        ge=1,
+        le=64,
+        description="Hash sub-partitions of this task type's table, by key. Fixed when the "
+        "table is created; use more than 1 for task types with tens of millions of rows",
+    )
     payload_model: str | None = None
+
+    @model_validator(mode="after")
+    def _limits(self) -> TaskType:
+        if self.retry_backoff_max < self.retry_backoff:
+            raise ValueError("retry_backoff_max must be >= retry_backoff")
+        if self.lease_duration < timedelta(seconds=10):
+            raise ValueError("lease_duration must be at least 10s")
+        return self
 
 
 class FrontierSection(_Strict):
@@ -353,6 +376,77 @@ class Alerts(_Strict):
         return merged
 
 
+# --- Dashboards -------------------------------------------------------------------------------
+
+ThresholdColor = Literal["green", "yellow", "orange", "red", "blue", "text"]
+
+
+class Threshold(_Strict):
+    color: ThresholdColor
+    from_: float | None = Field(
+        default=None, alias="from", description="Applies from this value up; omit on the first"
+    )
+
+
+class CockpitTile(_Strict):
+    """A stat tile in this service's row of the cockpit (and on its own dashboard)."""
+
+    title: str = Field(min_length=1, max_length=60)
+    datasource: Literal["prometheus", "clickhouse"]
+    query: str = Field(
+        min_length=1,
+        description="One number. ClickHouse: use {database}. Prometheus: use {namespace} "
+        "and {env} for the environment's Nomad namespace and name",
+    )
+    unit: str = Field(default="short", description="Grafana unit, e.g. short, percent, s, bytes")
+    decimals: int | None = Field(default=None, ge=0, le=6)
+    thresholds: list[Threshold] = Field(
+        default_factory=list, description="Colours; the first has no `from`"
+    )
+
+    @model_validator(mode="after")
+    def _thresholds_ordered(self) -> CockpitTile:
+        t = self.thresholds
+        if not t:
+            return self
+        if t[0].from_ is not None:
+            raise ValueError("the first threshold is the base colour and has no `from`")
+        values = [x.from_ for x in t[1:]]
+        if any(v is None for v in values):
+            raise ValueError("every threshold after the first needs `from`")
+        if values != sorted(values) or len(set(values)) != len(values):
+            raise ValueError("threshold `from` values must increase")
+        return self
+
+
+COCKPIT_MAX_TILES = 4
+
+
+class DashboardsSection(_Strict):
+    cockpit: list[CockpitTile] = Field(
+        default_factory=list,
+        max_length=COCKPIT_MAX_TILES,
+        description=f"Up to {COCKPIT_MAX_TILES} tiles in this service's cockpit row",
+    )
+    files: list[str] = Field(
+        default_factory=list,
+        description="Grafana dashboard JSON files, relative to service.yml",
+    )
+
+    @field_validator("files")
+    @classmethod
+    def _relative_json(cls, value: list[str]) -> list[str]:
+        for f in value:
+            if f.startswith("/") or ".." in f.split("/") or not f.endswith(".json"):
+                raise ValueError(f"{f!r}: a .json path inside the service directory")
+        if len(set(value)) != len(value):
+            raise ValueError("a dashboard file is listed twice")
+        stems = [f.rsplit("/", 1)[-1].removesuffix(".json") for f in value]
+        if len(set(stems)) != len(stems):
+            raise ValueError("dashboard file names must be unique (they become the dashboard ID)")
+        return value
+
+
 # --- The service ------------------------------------------------------------------------------
 
 
@@ -369,6 +463,7 @@ class ServiceSpec(_Strict):
     secrets: list[SecretPath] = Field(default_factory=list, description="Nomad variable paths")
     expects: list[Expect] = Field(default_factory=list)
     alerts: Alerts = Field(default_factory=Alerts)
+    dashboards: DashboardsSection = Field(default_factory=DashboardsSection)
 
     def topic_ref(self, topic_name: str) -> naming.TopicRef:
         """Reference to one of this service's own topics."""
@@ -385,10 +480,10 @@ class ServiceSpec(_Strict):
                 refs.update(naming.TopicRef.parse(r) for r in c.consumes)
         if self.clickhouse:
             for sink in self.clickhouse.sinks.values():
-                refs.add(self._resolve_sink_topic(sink.topic))
+                refs.add(self.sink_topic_ref(sink.topic))
         return refs
 
-    def _resolve_sink_topic(self, topic: str) -> naming.TopicRef:
+    def sink_topic_ref(self, topic: str) -> naming.TopicRef:
         if "." in topic:
             return naming.TopicRef.parse(topic)
         return self.topic_ref(topic)
@@ -416,6 +511,8 @@ class ServiceSpec(_Strict):
         consumed_tasks: set[str] = set()
         for cname, c in self.components.items():
             where = f"components.{cname}"
+            if cname in naming.RESERVED_COMPONENT_NAMES:
+                yield f"{where}: the component name {cname!r} is reserved"
             for t in c.produces:
                 if t not in own_topics:
                     yield f"{where}.produces: unknown topic {t!r}; declare it under kafka.produces"
@@ -470,6 +567,18 @@ class ServiceSpec(_Strict):
             if self.clickhouse is None:
                 yield f"{where}: expects query ClickHouse, but there's no clickhouse section"
             elif re.search(rf"\b{re.escape(self.clickhouse.database)}\.", exp.sql):
+                yield (
+                    f"{where}: hardcodes database {self.clickhouse.database!r}; write "
+                    f"{DATABASE_PLACEHOLDER} so each environment queries its own database"
+                )
+
+        for i, tile in enumerate(self.dashboards.cockpit):
+            where = f"dashboards.cockpit.{i}.query"
+            if tile.datasource != "clickhouse":
+                continue
+            if self.clickhouse is None:
+                yield f"{where}: a ClickHouse tile needs a clickhouse section"
+            elif re.search(rf"\b{re.escape(self.clickhouse.database)}\.", tile.query):
                 yield (
                     f"{where}: hardcodes database {self.clickhouse.database!r}; write "
                     f"{DATABASE_PLACEHOLDER} so each environment queries its own database"

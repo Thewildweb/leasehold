@@ -111,6 +111,34 @@ def consumer_group(env: str, service: str, component: str) -> str:
     return kafka_principal(env, service, component)
 
 
+def clickhouse_sink_principal(env: str, service: str) -> str:
+    """SCRAM user ClickHouse uses for a service's Kafka-engine sinks, e.g. ``certlog.clickhouse``.
+
+    The spec rejects a component named ``clickhouse``, so this can't collide with
+    a component's principal (``kafka_principal``).
+    """
+    _check(service, SERVICE_RE, "service name")
+    return f"{_dot_prefix(env)}{service}.clickhouse"
+
+
+def clickhouse_sink_group(env: str, service: str, sink: str) -> str:
+    """Consumer group of one ClickHouse sink, e.g. ``certlog.clickhouse.ct_domains``.
+
+    Each sink has its own group, so two sinks on the same topic both see every message.
+    """
+    _check(sink, SNAKE_RE, "sink name")
+    return f"{clickhouse_sink_principal(env, service)}.{sink}"
+
+
+def clickhouse_kafka_variable(service: str) -> str:
+    """Nomad Variable holding the sink principal's password (read by operators only)."""
+    _check(service, SERVICE_RE, "service name")
+    return f"leasehold/{service}/clickhouse-kafka"
+
+
+RESERVED_COMPONENT_NAMES = frozenset({"clickhouse"})
+
+
 def nomad_namespace(env: str) -> str:
     return "default" if check_env(env) == PROD else env
 

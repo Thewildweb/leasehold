@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -42,9 +43,48 @@ def load_spec(path: str | Path) -> ServiceSpec:
     if not isinstance(data, dict):
         raise SpecError(path, ["expected a mapping at the top level"])
     try:
-        return ServiceSpec.model_validate(data)
+        spec = ServiceSpec.model_validate(data)
     except ValidationError as e:
         raise SpecError(path, _format(e)) from e
+    errors = [m for f in spec.dashboards.files if (m := _check_dashboard_file(path.parent / f))]
+    if spec.clickhouse:
+        for sname, sink in spec.clickhouse.sinks.items():
+            if m := _check_schema_file(path.parent / sink.schema_file):
+                errors.append(f"clickhouse.sinks.{sname}.schema_file: {m}")
+    if errors:
+        raise SpecError(path, errors)
+    return spec
+
+
+def read_dashboard_files(spec_path: str | Path, spec: ServiceSpec) -> dict[str, dict]:
+    """The service's own dashboard files, by the name listed in ``service.yml``."""
+    base = Path(spec_path).parent
+    return {f: json.loads((base / f).read_text()) for f in spec.dashboards.files}
+
+
+def _check_schema_file(path: Path) -> str | None:
+    from leasehold.clickhouse.schema import SchemaFileError, parse
+
+    try:
+        parse(path.read_text())
+    except OSError as e:
+        return str(e)
+    except SchemaFileError as e:
+        return f"{path.name}: {e}"
+    return None
+
+
+def _check_dashboard_file(path: Path) -> str | None:
+    where = f"dashboards.files: {path.name}"
+    try:
+        data = json.loads(path.read_text())
+    except OSError as e:
+        return f"{where}: {e.strerror}"
+    except json.JSONDecodeError as e:
+        return f"{where}: invalid JSON: {e}"
+    if not isinstance(data, dict) or not isinstance(data.get("panels"), list):
+        return f"{where}: not a Grafana dashboard (no 'panels' list)"
+    return None
 
 
 def find_specs(paths: list[str | Path]) -> list[Path]:

@@ -1,0 +1,164 @@
+# leasehold dev stack: Kafka (KRaft, SASL/SCRAM, ACLs enforced), Karapace, kafka-ui,
+# Postgres for the frontier, Grafana for dashboards, and ClickHouse for sinks.
+#
+#   docker compose -f dev/docker-compose.yml up -d
+#
+# Host ports (loopback only):
+#   19092  Kafka, SASL_PLAINTEXT, SCRAM-SHA-512, user admin / dev-admin
+#   18081  Karapace schema registry
+#   18080  kafka-ui
+#   15432  Postgres 16, user leasehold / dev-leasehold, database leasehold
+#   13000  Grafana 11.3, user admin / dev-admin
+#   18123  ClickHouse 26.4 (HTTP), user admin / dev-admin
+#
+# The broker uses the same configuration as production (dev/kafka/server.properties),
+# so ACL and authentication behaviour is the same in dev, CI and prod.
+# Credentials here are dev-only.
+name: leasehold-dev
+
+x-kafka-image: &kafka-image apache/kafka:4.1.0
+
+services:
+  # Formats the data volume once, creating the admin SCRAM credential.
+  # --ignore-formatted makes it a no-op on later starts.
+  kafka-format:
+    image: *kafka-image
+    user: "1000"
+    entrypoint: ["/opt/kafka/bin/kafka-storage.sh"]
+    command:
+      - format
+      - --ignore-formatted
+      - --standalone
+      - --cluster-id=TxdC2Gt9T4eHvpiop0ZYeA
+      - --config=/etc/kafka/server.properties
+      - --add-scram=SCRAM-SHA-512=[name=admin,password=dev-admin]
+    volumes:
+      - ./kafka/server.properties:/etc/kafka/server.properties:ro
+      - kafka-data:/var/lib/kafka/data
+
+  kafka:
+    image: *kafka-image
+    user: "1000"
+    entrypoint: ["/opt/kafka/bin/kafka-server-start.sh"]
+    command: ["/etc/kafka/server.properties"]
+    depends_on:
+      kafka-format:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
+    ports:
+      - "127.0.0.1:19092:19092"
+    volumes:
+      - ./kafka/server.properties:/etc/kafka/server.properties:ro
+      - ./kafka/admin.properties:/etc/kafka/admin.properties:ro
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092
+          --command-config /etc/kafka/admin.properties > /dev/null
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  karapace:
+    image: ghcr.io/aiven-open/karapace:5.0.2
+    command: ["python3", "-m", "karapace"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KARAPACE_KARAPACE_REGISTRY: "true"
+      KARAPACE_HOST: 0.0.0.0
+      KARAPACE_PORT: "8081"
+      # The image's healthcheck builds its URL from these.
+      KARAPACE_ADVERTISED_PROTOCOL: http
+      KARAPACE_ADVERTISED_HOSTNAME: karapace
+      KARAPACE_REGISTRY_HOST: karapace
+      KARAPACE_REGISTRY_PORT: "8081"
+      KARAPACE_BOOTSTRAP_URI: kafka:9092
+      KARAPACE_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      KARAPACE_SASL_MECHANISM: SCRAM-SHA-512
+      # Dev uses the admin user; production gives Karapace its own user and ACLs.
+      KARAPACE_SASL_PLAIN_USERNAME: admin
+      KARAPACE_SASL_PLAIN_PASSWORD: dev-admin
+      KARAPACE_TOPIC_NAME: _schemas
+      KARAPACE_COMPATIBILITY: BACKWARD
+      KARAPACE_LOG_LEVEL: WARNING
+    ports:
+      - "127.0.0.1:18081:8081"
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.3.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: dev
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_MECHANISM: SCRAM-SHA-512
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_JAAS_CONFIG: >-
+        org.apache.kafka.common.security.scram.ScramLoginModule required
+        username="admin" password="dev-admin";
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://karapace:8081
+    ports:
+      - "127.0.0.1:18080:8080"
+
+  postgres:
+    # Same major version as production.
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: leasehold
+      POSTGRES_PASSWORD: dev-leasehold
+      POSTGRES_DB: leasehold
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leasehold -d leasehold"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  grafana:
+    # Same version as production.
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: dev-admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "127.0.0.1:13000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  clickhouse:
+    # Same version as production. Reads Kafka on the internal listener (kafka:9092).
+    image: clickhouse/clickhouse-server:26.4.2.10
+    environment:
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: dev-admin
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:18123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+volumes:
+  kafka-data:
+  postgres-data:
+  clickhouse-data:
