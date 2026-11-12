@@ -13,7 +13,7 @@ jobs:
     name: gitleaks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0          # scan the full history, not just the last commit
       - name: Scan for secrets
@@ -25,7 +25,7 @@ jobs:
     name: tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
@@ -38,7 +38,7 @@ jobs:
     name: integration (dev stack)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
@@ -59,7 +59,7 @@ jobs:
     name: images (build only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build the runtime base image
         run: docker build -f images/base/Dockerfile --target runtime -t leasehold-base:ci .
       - name: Build the control API image
