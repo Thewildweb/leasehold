@@ -10,10 +10,15 @@
 #   15432  Postgres 16, user leasehold / dev-leasehold, database leasehold
 #   13000  Grafana 11.3, user admin / dev-admin
 #   18123  ClickHouse 26.4 (HTTP), user admin / dev-admin
+#   14646  Nomad 1.9 (server only, no ACLs), namespace dev
+#   18500  mock CT log (leasehold mock ctlog): /log_list.json, /logs/<name>/ct/v1/...
 #
 # The broker uses the same configuration as production (dev/kafka/server.properties),
 # so ACL and authentication behaviour is the same in dev, CI and prod.
-# Credentials here are dev-only.
+# Credentials here are dev-only. dev/environment.yml points `leasehold apply` here.
+#
+# Nomad runs without a client: jobs are registered and planned, but not placed
+# (a Nomad client needs host cgroups). Variables work as in production.
 name: leasehold-dev
 
 x-kafka-image: &kafka-image apache/kafka:4.1.0
@@ -158,7 +163,49 @@ services:
       timeout: 5s
       retries: 60
 
+  nomad:
+    # Same version as production.
+    image: hashicorp/nomad:1.9.4
+    command:
+      - agent
+      - -server
+      - -bootstrap-expect=1
+      - -data-dir=/nomad/data
+      - -bind=0.0.0.0
+    ports:
+      - "127.0.0.1:14646:4646"
+    volumes:
+      - nomad-data:/nomad/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4646/v1/status/leader | grep -q 4647"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  # Creates the dev namespace (production has it already).
+  nomad-init:
+    image: hashicorp/nomad:1.9.4
+    command: ["namespace", "apply", "-address=http://nomad:4646", "dev"]
+    depends_on:
+      nomad:
+        condition: service_healthy
+
+  ctlog:
+    # Built from this repository; rebuild after changing it:
+    #   docker compose -f dev/docker-compose.yml build ctlog
+    build:
+      context: ..
+      dockerfile: images/base/Dockerfile
+      target: control-api
+      network: host  # dependency downloads use the host's network, not Docker's bridge
+    # 32 entries per get-entries, like the Google and TrustAsia logs.
+    command: ["leasehold", "mock", "ctlog", "--host", "0.0.0.0", "--port", "8500",
+              "--max-entries", "32"]
+    ports:
+      - "127.0.0.1:18500:8500"
+
 volumes:
   kafka-data:
   postgres-data:
   clickhouse-data:
+  nomad-data:

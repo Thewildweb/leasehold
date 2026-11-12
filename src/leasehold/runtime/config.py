@@ -15,13 +15,16 @@ LEASEHOLD_HTTP_PORT       /health and /metrics; Nomad's NOMAD_PORT_http wins.
 LEASEHOLD_DRAIN_TIMEOUT_S how long to finish in-flight work after SIGTERM
                           (default 25; keep it below the job's kill_timeout)
 LEASEHOLD_TIMEOUT_S       scheduled components: kill the run after this long
+LEASEHOLD_PAYLOAD_MODELS  processors: JSON, consumed topic reference → payload model
+                          of the service that produces it
 """
 
 from __future__ import annotations
 
+import json
 import os
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from leasehold import naming
@@ -47,6 +50,8 @@ class RuntimeConfig:
     http_port: int = 0
     drain_timeout: float = 25.0
     run_timeout: float | None = None
+    # Consumed topic reference (e.g. "certlog.entries.v1") → "module:Class".
+    payload_models: dict[str, str] = field(default_factory=dict, hash=False)
 
     @property
     def component_spec(self) -> Component:
@@ -90,6 +95,10 @@ class RuntimeConfig:
             raise ConfigError(f"{service} has no component {component!r}")
         port = e.get("NOMAD_PORT_http") or e.get("LEASEHOLD_HTTP_PORT") or "0"
         timeout = e.get("LEASEHOLD_TIMEOUT_S")
+        try:
+            models = json.loads(e.get("LEASEHOLD_PAYLOAD_MODELS") or "{}")
+        except ValueError as err:
+            raise ConfigError(f"LEASEHOLD_PAYLOAD_MODELS is not JSON: {err}") from None
         return cls(
             env=env,
             service=service,
@@ -103,4 +112,5 @@ class RuntimeConfig:
             http_port=int(port),
             drain_timeout=float(e.get("LEASEHOLD_DRAIN_TIMEOUT_S", "25")),
             run_timeout=float(timeout) if timeout else None,
+            payload_models=models,
         )

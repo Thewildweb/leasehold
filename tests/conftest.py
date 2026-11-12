@@ -44,8 +44,13 @@ RUNTIME_SPEC = {
     },
     "kafka": {
         "produces": {
-            "results": {"payload_model": "m:R", "partitions": 3, "retention": "1h", "key": "id"},
-            "routed": {"payload_model": "m:S", "partitions": 1, "retention": "1h"},
+            "results": {
+                "payload_model": "payload_models:R",
+                "partitions": 3,
+                "retention": "1h",
+                "key": "id",
+            },
+            "routed": {"payload_model": "payload_models:S", "partitions": 1, "retention": "1h"},
         }
     },
     "frontier": {"task_types": {"jobs.item": {"key": "id", "lease_duration": "30s"}}},
@@ -57,6 +62,7 @@ def runtime_spec() -> ServiceSpec:
 
 
 def runtime_cfg(component: str, env: str = "dev", **kw) -> RuntimeConfig:
+    kw.setdefault("payload_models", {"jobs.results.v1": "payload_models:R"})
     return RuntimeConfig(
         env=env, service="jobs", component=component, spec=runtime_spec(), instance="alloc-1", **kw
     )

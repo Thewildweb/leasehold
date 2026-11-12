@@ -137,6 +137,7 @@ def stack(tmp_path):
             kafka_bootstrap=BOOTSTRAP,
             kafka_password=passwords.get(naming.kafka_principal(env, spec.name, name)),
             drain_timeout=5,
+            payload_models={"jobs.results.v1": "payload_models:R"},
         )
         producer = EventProducer(cfg) if with_producer and cfg.component_spec.produces else None
         return Context(cfg, client=ControlClient(url, token=tokens[name]), producer=producer)

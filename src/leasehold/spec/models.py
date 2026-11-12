@@ -112,6 +112,12 @@ class _ComponentBase(_Strict):
         default=timedelta(seconds=30),
         description="Time between SIGTERM and SIGKILL, for a graceful drain",
     )
+    max_per_node: int | None = Field(
+        default=None,
+        ge=1,
+        description="At most this many instances on one machine. Use 1 for components that "
+        "keep their own rate limit per egress IP: instances on one machine share its IP",
+    )
 
     @field_validator("env")
     @classmethod

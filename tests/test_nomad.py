@@ -234,7 +234,13 @@ def test_diff_reports_and_prunes_stale_jobs(spec):
         "Meta": {"leasehold_service": "certwatch", "leasehold_env": "prod"},
     }
     other = {"ID": "other-x", "Status": "running", "Meta": {"leasehold_service": "other"}}
-    nomad = FakeNomad([_running(spec, "planner"), _running(spec, "worker"), old, other])
+    run = {  # one run of the periodic planner: its parent's Meta, not stale
+        "ID": "certwatch-planner/periodic-1794486600",
+        "ParentID": "certwatch-planner",
+        "Status": "running",
+        "Meta": {"leasehold_service": "certwatch", "leasehold_env": "prod"},
+    }
+    nomad = FakeNomad([_running(spec, "planner"), _running(spec, "worker"), old, other, run])
     d = diff(nomad, plan([spec], "prod", SHA, PLATFORM), ["certwatch"])
     assert d.stale == [("default", "certwatch-old")]
     apply(nomad, d)
@@ -266,3 +272,45 @@ def test_cli_plan_rejects_a_bad_sha(capsys):
     rc = main(["nomad", "plan", str(FIXTURES / "certwatch"), "--sha", "latest", "--api-url", "a"])
     assert rc == 1
     assert "git SHA" in capsys.readouterr().err
+
+
+def test_max_per_node_and_node_pool(spec):
+    job = render_job(spec, "worker", "prod", SHA, PLATFORM).job
+    assert "Constraints" not in job["TaskGroups"][0] and "NodePool" not in job
+    spec.components["worker"] = spec.components["worker"].model_copy(update={"max_per_node": 1})
+    pool = Platform(**{**PLATFORM.__dict__, "node_pool": "dev"})
+    job = render_job(spec, "worker", "dev", SHA, pool).job
+    assert job["TaskGroups"][0]["Constraints"] == [
+        {"LTarget": "${node.unique.id}", "RTarget": "1", "Operand": "distinct_property"}
+    ]
+    assert job["NodePool"] == "dev"
+
+
+def test_max_per_node_must_be_positive(spec):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        type(spec.components["worker"]).model_validate(
+            spec.components["worker"].model_dump(by_alias=True) | {"max_per_node": 0}
+        )
+
+
+def test_placement_failures_are_summarised():
+    from leasehold.nomad.apply import _placement_failures
+
+    full = {
+        f"distinct_property: ${{node.unique.id}}=node-{i} used by 1 allocs": 1 for i in range(41)
+    }
+    result = {
+        "FailedTGAllocs": {
+            "worker": {
+                "NodesEvaluated": 44,
+                "CoalescedFailures": 3,
+                "ConstraintFiltered": full | {"computed class ineligible": 3},
+            }
+        }
+    }
+    assert _placement_failures(result) == [
+        "group worker: 4 can't be placed (44 nodes evaluated): max_per_node reached on 41 "
+        "machines; computed class ineligible (3)"
+    ]

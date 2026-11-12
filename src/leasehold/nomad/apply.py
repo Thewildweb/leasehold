@@ -159,12 +159,19 @@ def _placement_failures(plan_result: dict[str, Any]) -> list[str]:
     out = []
     for tg, m in (plan_result.get("FailedTGAllocs") or {}).items():
         reasons = []
+        full = 0  # Nomad names every machine a distinct_property constraint filtered
         for k in ("ConstraintFiltered", "DimensionExhausted", "ClassExhausted"):
             for reason, n in (m.get(k) or {}).items():
-                reasons.append(f"{reason} ({n})")
+                if reason.startswith("distinct_property: ${node.unique.id}="):
+                    full += n
+                else:
+                    reasons.append(f"{reason} ({n})")
+        if full:
+            reasons.insert(0, f"max_per_node reached on {full} machines")
         nodes = m.get("NodesEvaluated", 0)
+        unplaced = m.get("CoalescedFailures", 0) + 1
         why = "; ".join(reasons) or "no eligible nodes"
-        out.append(f"group {tg} can't be placed ({nodes} nodes evaluated): {why}")
+        out.append(f"group {tg}: {unplaced} can't be placed ({nodes} nodes evaluated): {why}")
     return out
 
 
@@ -209,6 +216,8 @@ def diff(nomad: Nomad, plan: NomadPlan, services: list[str]) -> NomadDiff:
             and meta.get("leasehold_env") == plan.env
             and job["ID"] not in planned
             and job.get("Status") != "dead"
+            # Runs of a periodic job copy its Meta; they belong to their parent.
+            and not job.get("ParentID")
         ):
             d.stale.append((plan.namespace, job["ID"]))
     return d
