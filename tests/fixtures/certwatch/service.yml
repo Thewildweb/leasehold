@@ -67,3 +67,16 @@ alerts:
       escalate:
         - { after: 0, priority: info }
         - { after: 6h, priority: high }
+
+dashboards:
+  cockpit:
+    - title: Domains found (24h)
+      datasource: clickhouse
+      query: SELECT count() FROM {database}.domains WHERE seen_at > now() - INTERVAL 1 DAY
+      thresholds:
+        - { color: red }
+        - { color: green, from: 1 }
+    - title: Worker instances
+      datasource: prometheus
+      query: count(count by (alloc_id) (nomad_client_allocs_cpu_total_ticks{namespace="{namespace}", exported_job="certwatch-worker"}))
+  files: [dashboards/logs.json]

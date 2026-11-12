@@ -1,0 +1,22 @@
+# A component image, built in the service's directory (e.g. services/certlog):
+#
+#   docker build -f Dockerfile.worker --build-arg BASE=ghcr.io/thewildweb/leasehold-base:<version> \
+#     -t ghcr.io/<org>/certlog-worker:<git-sha> .
+#
+# One image per component (naming.image_name), tagged with the git SHA.
+
+ARG BASE
+FROM ${BASE}
+
+# Dependencies first, so code changes don't rebuild this layer.
+COPY requirements.txt /app/requirements.txt
+USER root
+RUN pip install --no-cache-dir -r /app/requirements.txt
+USER app
+
+# The service.yml the runtime reads (LEASEHOLD_SERVICE_FILE=/app/service.yml).
+COPY service.yml /app/service.yml
+COPY src /app/src
+ENV PYTHONPATH=/app/src
+
+CMD ["python", "-m", "certlog.worker"]

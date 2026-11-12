@@ -19,6 +19,8 @@ secrets/
 vault.yml
 .netrc
 .pypirc
+tokens.json
+entry.json
 
 # --- Python / uv ---
 __pycache__/
