@@ -18,7 +18,8 @@ The Kafka message key is the payload field named by the topic's ``key`` in
 ``service.yml``, unless a key is passed explicitly.
 
 A component may only produce to the topics in its ``produces`` list; the
-broker's ACLs enforce the same thing.
+broker's ACLs enforce the same thing. Payloads are validated against the topic's
+``payload_model`` before they're sent (see ``leasehold.runtime.payloads``).
 """
 
 from __future__ import annotations
@@ -33,9 +34,10 @@ from typing import Any
 
 from confluent_kafka import KafkaError, Producer
 from prometheus_client import Counter
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from leasehold import naming
+from leasehold.runtime import payloads
 from leasehold.runtime.config import RuntimeConfig
 
 log = logging.getLogger("leasehold")
@@ -45,6 +47,11 @@ MAX_PAYLOAD_BYTES = 1_900_000
 
 EVENTS = Counter("leasehold_events_produced", "Events confirmed by Kafka", ["topic"])
 PRODUCE_ERRORS = Counter("leasehold_produce_errors", "Events Kafka didn't accept", ["topic"])
+INVALID_PAYLOADS = Counter(
+    "leasehold_invalid_payloads",
+    "Payloads refused before producing: not the topic's model",
+    ["topic"],
+)
 
 
 class ProduceError(RuntimeError):
@@ -55,15 +62,13 @@ class PayloadTooLarge(ProduceError):
     pass
 
 
+class InvalidPayload(ProduceError):
+    pass
+
+
 def _ts() -> str:
     t = time.time()
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{int(t * 1000) % 1000:03d}Z"
-
-
-def _payload_dict(payload: Any) -> Any:
-    if isinstance(payload, BaseModel):
-        return payload.model_dump(mode="json")
-    return payload
 
 
 class Delivery:
@@ -93,7 +98,13 @@ class Delivery:
 class EventProducer:
     """One per process. Thread-safe: ``emit`` may be called from worker threads."""
 
-    def __init__(self, cfg: RuntimeConfig, producer: Producer | None = None):
+    def __init__(
+        self,
+        cfg: RuntimeConfig,
+        producer: Producer | None = None,
+        models: dict[str, type[BaseModel]] | None = None,
+    ):
+        """``models``: per topic name, instead of importing each ``payload_model``."""
         self.cfg = cfg
         spec = cfg.spec
         self.allowed = set(cfg.component_spec.produces)
@@ -101,6 +112,13 @@ class EventProducer:
             name: (naming.topic_for(cfg.env, spec.topic_ref(name)), t)
             for name, t in spec.kafka.produces.items()
         }
+        self.models = (
+            models
+            if models is not None
+            else payloads.load_models(
+                {name: spec.kafka.produces[name].payload_model for name in sorted(self.allowed)}
+            )
+        )
         self._producer = producer or Producer(
             cfg.kafka_conf()
             | {
@@ -140,8 +158,12 @@ class EventProducer:
                 f"{self.cfg.name} may not produce to {topic!r}; add it to `produces`"
             )
         actual, spec = self.topics[topic]
-        body = _payload_dict(payload)
-        if key is None and spec.key and isinstance(body, dict) and spec.key in body:
+        try:
+            body = payloads.validated(self.models[topic], payload)
+        except ValidationError as e:
+            INVALID_PAYLOADS.labels(actual).inc()
+            raise InvalidPayload(f"{topic}: {payloads.error_summary(e)}") from None
+        if key is None and spec.key and spec.key in body:
             key = str(body[spec.key])
         event_id = event_id or uuid.uuid4()
         envelope = {

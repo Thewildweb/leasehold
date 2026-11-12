@@ -1,0 +1,28 @@
+# `leasehold apply` against the dev stack (dev/docker-compose.yml):
+#
+#   export LEASEHOLD_KAFKA_PASSWORD=dev-admin LEASEHOLD_CLICKHOUSE_PASSWORD=dev-admin \
+#          LEASEHOLD_GRAFANA_PASSWORD=dev-admin \
+#          LEASEHOLD_DSN=postgresql://leasehold:dev-leasehold@localhost:15432/leasehold
+#   leasehold apply <services> -e dev/environment.yml --sha 0000000
+env: dev
+kafka:
+  bootstrap: localhost:19092
+  client_bootstrap: kafka:9092  # ClickHouse reads Kafka inside the compose network
+  username: admin
+  password_env: LEASEHOLD_KAFKA_PASSWORD
+postgres:
+  dsn_env: LEASEHOLD_DSN
+nomad:
+  url: http://localhost:14646
+  token_env: NOMAD_TOKEN  # unset: the dev Nomad has no ACLs
+clickhouse:
+  url: http://localhost:18123
+  user: admin
+  password_env: LEASEHOLD_CLICKHOUSE_PASSWORD
+grafana:
+  url: http://localhost:13000
+  user: admin
+  password_env: LEASEHOLD_GRAFANA_PASSWORD
+jobs:
+  registry: localhost:5000  # jobs aren't placed in dev; nothing pulls from here
+  api_url: http://localhost:8400

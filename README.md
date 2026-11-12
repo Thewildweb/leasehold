@@ -24,9 +24,37 @@ LEASEHOLD_TEST_GRAFANA=http://admin:dev-admin@localhost:13000 \
 ```
 
 The dev stack runs Kafka (KRaft, SASL/SCRAM, ACLs enforced), the Karapace schema
-registry, kafka-ui, Postgres 16 and Grafana 11.3 on loopback ports 19092, 18081, 18080,
-15432 and 13000.
+registry, kafka-ui, Postgres 16, Grafana 11.3, ClickHouse 26.4, a Nomad 1.9 server and a
+mock CT log on loopback ports 19092, 18081, 18080, 15432, 13000, 18123, 14646 and
+18500. Nomad has no client, so jobs are registered but not placed.
+
+The mock CT log (`leasehold mock ctlog`, `leasehold.mocks.ctlog`) serves RFC 6962
+`get-sth` and `get-entries` for a few growing logs, plus `/log_list.json` in Chrome's
+format. Entries are real certificates and precertificates generated per index, so a
+test knows which domains an index holds (`domains_for`, `GET /_mock/domains`).
+It rate-limits per client and operator (429), and `/_mock/stats`, `/_mock/grow`,
+`/_mock/fail` and `/_mock/reset` let a test check request rates and inject failures.
 `dev/kafka/server.properties` is also the reference configuration for production.
+
+Everything for an environment in one run: Kafka topics and ACLs, the frontier
+schema and task types, credentials, ClickHouse sinks, dashboards and Nomad jobs, in
+that order (dry run unless `--yes`). Addresses come from an environment file
+(`dev/environment.yml` for the dev stack), secrets from the environment variables
+it names:
+
+```bash
+export LEASEHOLD_KAFKA_PASSWORD=dev-admin LEASEHOLD_CLICKHOUSE_PASSWORD=dev-admin \
+       LEASEHOLD_GRAFANA_PASSWORD=dev-admin \
+       LEASEHOLD_DSN=postgresql://leasehold:dev-leasehold@localhost:15432/leasehold
+uv run leasehold apply path/to/services -e dev/environment.yml --sha <git-sha>
+```
+
+With `--yes`, a failed step stops the steps after it. `--only` and `--skip` pick
+steps; `--prune` and `--accept-table` work as in the single-step commands below.
+In a dry run the clickhouse step assumes the passwords the credentials step would
+create, so it shows what the real run will do.
+
+The single steps:
 
 Running the control API against the dev stack:
 

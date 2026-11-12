@@ -23,23 +23,28 @@ What the loop does:
 - A batch that fails is retried with backoff, ``max_attempts`` times; then the
   process exits non-zero and Nomad restarts it (the crashloop alert fires if it
   keeps failing). The offsets stay where they were.
-- Messages that aren't valid envelopes are skipped and counted
-  (``leasehold_processor_invalid_events_total``); there is no dead-letter topic yet.
+- Messages that aren't valid envelopes, or whose payload doesn't fit the topic's
+  payload model, are skipped and counted (``leasehold_processor_invalid_events_total``);
+  there is no dead-letter topic yet. ``Event.payload`` is the model's JSON (defaults
+  filled in); the models come from ``LEASEHOLD_PAYLOAD_MODELS``.
 - Exports ``leasehold_kafka_consumer_lag{group,topic,partition}`` every 30s.
 - On SIGTERM: finish the current batch, commit, leave the group.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from collections.abc import Callable
 
 from confluent_kafka import Consumer, KafkaException, TopicPartition
 from prometheus_client import Counter, Gauge, Histogram
+from pydantic import BaseModel, ValidationError
 
 from leasehold import naming
 from leasehold.runtime import log as lh_log
+from leasehold.runtime import payloads
 from leasehold.runtime.context import Context, build
 from leasehold.runtime.events import Event, InvalidEvent, ProduceError, parse
 
@@ -77,7 +82,9 @@ class Processor:
         batch_wait: float = 1.0,
         max_attempts: int = 5,
         consumer: Consumer | None = None,
+        models: dict[str, type[BaseModel]] | None = None,
     ):
+        """``models``: per consumed topic reference, instead of LEASEHOLD_PAYLOAD_MODELS."""
         cfg = ctx.cfg
         comp = cfg.component_spec
         self.ctx = ctx
@@ -88,6 +95,14 @@ class Processor:
         self.group = naming.consumer_group(cfg.env, cfg.service, cfg.component)
         refs = [naming.TopicRef.parse(r) for r in comp.consumes]
         self.refs = {naming.topic_for(cfg.env, r): r for r in refs}
+        if models is None:
+            missing = sorted(str(r) for r in refs if str(r) not in cfg.payload_models)
+            if missing:
+                raise payloads.PayloadModelError(
+                    f"no payload model for {', '.join(missing)} in LEASEHOLD_PAYLOAD_MODELS"
+                )
+            models = payloads.load_models({str(r): cfg.payload_models[str(r)] for r in refs})
+        self.models = models
         self.consumer = consumer or Consumer(
             cfg.kafka_conf()
             | {
@@ -127,7 +142,7 @@ class Processor:
                 log.warning("consumer error", extra={"fields": {"error": str(m.error())}})
                 continue
             try:
-                events.append(parse(m, self.refs[m.topic()]))
+                events.append(self._event(m))
             except InvalidEvent as e:
                 INVALID.labels(m.topic()).inc()
                 log.error("skipping invalid event", extra={"fields": {"error": str(e)}})
@@ -140,6 +155,16 @@ class Processor:
                 EVENTS_IN.labels(e.topic).inc()
         self._lag()
         return True
+
+    def _event(self, m) -> Event:
+        ref = self.refs[m.topic()]
+        e = parse(m, ref)
+        try:
+            body = payloads.validated(self.models[str(ref)], e.payload)
+        except ValidationError as err:
+            where = f"{e.topic}[{e.partition}]@{e.offset}"
+            raise InvalidEvent(f"{where}: payload: {payloads.error_summary(err)}") from None
+        return dataclasses.replace(e, payload=body)
 
     def _handle(self, events: list[Event]) -> bool:
         delay = 1.0

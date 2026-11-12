@@ -6,7 +6,11 @@ What each job gets:
   ``Meta`` with ``leasehold_env``, ``leasehold_service``, ``leasehold_component`` and
   ``leasehold_version`` (how ``apply`` finds the jobs it manages).
 - A constraint on ``node_class``, the spec's priority and resources (``memory_max``
-  becomes ``MemoryMaxMB``), and ``kill_timeout``.
+  becomes ``MemoryMaxMB``), and ``kill_timeout``. ``max_per_node`` becomes a
+  ``distinct_property`` constraint on ``${node.unique.id}``: at most that many
+  instances per machine, so instances that limit themselves per egress IP don't
+  share one. The environment's node pool (``Platform.node_pool``), when set, keeps
+  its jobs on that pool's machines (e.g. dev on dedicated nodes with clean IPs).
 - The image ``<registry>/<service>-<component>:<git sha>``, never ``latest``.
 - Env: ``LEASEHOLD_ENV``, ``_SERVICE``, ``_COMPONENT``, ``_VERSION``, ``_API_URL``,
   ``_KAFKA_BOOTSTRAP`` (components that use Kafka), ``_DRAIN_TIMEOUT_S`` (5 s under
@@ -30,7 +34,8 @@ that range) so a redeploy doesn't undo scaling; a new job starts at ``min``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
 
@@ -54,9 +59,12 @@ def _ns(d: timedelta) -> int:
 class Platform:
     """Addresses that are the same for every service in an environment."""
 
-    registry: str  # e.g. ghcr.io/open-data-collection
+    registry: str  # e.g. ghcr.io/example
     api_url: str  # control API, e.g. http://control-api.service:8400
     kafka_bootstrap: str | None = None  # e.g. kafka.service:9092
+    node_pool: str | None = None  # Nomad node pool for the environment's jobs (default pool)
+    # Topic reference → payload model, for every topic; ``plan`` fills it in.
+    payload_models: dict[str, str] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)
@@ -118,6 +126,12 @@ def _env(
         if not platform.kafka_bootstrap:
             raise ValueError(f"{spec.name}.{cname} uses Kafka; set the Kafka bootstrap address")
         out["LEASEHOLD_KAFKA_BOOTSTRAP"] = platform.kafka_bootstrap
+    if isinstance(c, Processor):
+        missing = sorted(r for r in c.consumes if r not in platform.payload_models)
+        if missing:
+            raise ValueError(f"{spec.name}.{cname} consumes {', '.join(missing)}: no producer")
+        models = {r: platform.payload_models[r] for r in sorted(c.consumes)}
+        out["LEASEHOLD_PAYLOAD_MODELS"] = json.dumps(models, separators=(",", ":"))
     if isinstance(c, Scheduled):
         out["LEASEHOLD_TIMEOUT_S"] = str(int(c.timeout.total_seconds()))
     # The spec's own env can't override the platform variables.
@@ -204,6 +218,14 @@ def render_job(
     namespace = naming.nomad_namespace(env)
     task = _task(spec, cname, c, env, version, platform)
     group: dict[str, Any] = {"Name": cname, "Tasks": [task]}
+    if c.max_per_node is not None:
+        group["Constraints"] = [
+            {
+                "LTarget": "${node.unique.id}",
+                "RTarget": str(c.max_per_node),
+                "Operand": "distinct_property",
+            }
+        ]
     job: dict[str, Any] = {
         "ID": job_id,
         "Name": job_id,
@@ -219,6 +241,8 @@ def render_job(
         },
         "TaskGroups": [group],
     }
+    if platform.node_pool:
+        job["NodePool"] = platform.node_pool
 
     if isinstance(c, Scheduled):
         job["Type"] = "batch"
@@ -259,6 +283,15 @@ def render_job(
 def plan(specs: list[ServiceSpec], env: str, version: str, platform: Platform) -> NomadPlan:
     """Every component's job. ``version`` is the git SHA the images are tagged with."""
     naming.check_env(env)
+    platform = replace(
+        platform,
+        payload_models={
+            str(s.topic_ref(name)): t.payload_model
+            for s in specs
+            for name, t in s.kafka.produces.items()
+        }
+        | platform.payload_models,
+    )
     jobs = [
         render_job(spec, cname, env, version, platform)
         for spec in sorted(specs, key=lambda s: s.name)

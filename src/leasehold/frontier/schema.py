@@ -122,7 +122,11 @@ def migrate(conn: psycopg.Connection, env: str) -> list[int]:
     with conn.transaction():
         # One migrator at a time per environment.
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"leasehold-migrate:{s}",))
-        conn.execute(_q("CREATE SCHEMA IF NOT EXISTS {s}", s))
+        # A schema made beforehand (owned by the environment's role) needs no CREATE
+        # privilege on the database; CREATE SCHEMA IF NOT EXISTS would still check it.
+        exists = conn.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (s,)).fetchone()
+        if not exists:
+            conn.execute(_q("CREATE SCHEMA {s}", s))
         conn.execute(
             _q(
                 "CREATE TABLE IF NOT EXISTS {s}.schema_migrations ("

@@ -97,15 +97,16 @@ def test_json_logs_carry_identity_and_scope():
 
 
 def test_health_and_metrics_endpoints():
-    live = Liveness(stall_after=0.2)
+    live = Liveness(stall_after=1.0)
     server = serve(0, live, host="127.0.0.1")
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
+        live.beat()  # a busy test machine may take a while to get here
         with urllib.request.urlopen(base + "/health") as r:
             assert r.status == 200 and json.loads(r.read())["status"] == "ok"
         with urllib.request.urlopen(base + "/metrics") as r:
             assert b"python_info" in r.read()
-        time.sleep(0.3)
+        time.sleep(1.1)
         with pytest.raises(urllib.error.HTTPError) as e:
             urllib.request.urlopen(base + "/health")
         assert e.value.code == 503

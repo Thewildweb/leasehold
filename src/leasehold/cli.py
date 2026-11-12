@@ -7,7 +7,7 @@ import json
 import os
 import sys
 
-from leasehold import __version__, naming
+from leasehold import __version__, naming, steps
 from leasehold import kafka as lh_kafka
 from leasehold.spec import (
     ServiceSpec,
@@ -98,8 +98,6 @@ def _cmd_kafka_plan(args: argparse.Namespace) -> int:
 
 
 def _cmd_kafka_apply(args: argparse.Namespace) -> int:
-    from leasehold.kafka import apply as kafka_apply
-
     specs = _load_all(args.paths)
     if specs is None:
         return 1
@@ -107,22 +105,10 @@ def _cmd_kafka_apply(args: argparse.Namespace) -> int:
     if not password:
         print(f"set the admin password in ${args.password_env}", file=sys.stderr)
         return 1
-    p = lh_kafka.plan(specs, args.env)
-    admin = kafka_apply.admin_client(args.bootstrap, args.username, password)
-    d = kafka_apply.diff(admin, p, [s.name for s in specs])
-    for w in d.warnings:
-        print(f"warning  {w}")
-    if d.empty:
-        print("no changes")
-        return 0
-    for c in d.changes:
-        print(c)
-    if not args.yes:
-        print("\ndry run; pass --yes to apply")
-        return 0
-    kafka_apply.apply(admin, d, prune=args.prune)
-    print("applied")
-    return 0
+    return _run_step(
+        steps.kafka, specs, args.env, bootstrap=args.bootstrap, username=args.username,
+        password=password, yes=args.yes, prune=args.prune,
+    )  # fmt: skip
 
 
 def _dsn(args: argparse.Namespace) -> str | None:
@@ -270,10 +256,8 @@ def _cmd_grafana_plan(args: argparse.Namespace) -> int:
 
 
 def _cmd_grafana_apply(args: argparse.Namespace) -> int:
-    from leasehold.grafana import apply as grafana_apply
-
-    p = _grafana_plan(args)
-    if p is None:
+    services = _load_with_dashboards(args.paths)
+    if services is None:
         return 1
     token = os.environ.get(args.token_env)
     password = os.environ.get(args.password_env) if args.user else None
@@ -284,34 +268,15 @@ def _cmd_grafana_apply(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    if args.only:
-        if args.prune:
-            print("--only and --prune can't be combined", file=sys.stderr)
-            return 1
-        unknown = sorted(set(args.only) - {d.uid for d in p.dashboards})
-        if unknown:
-            print(f"not in the plan: {', '.join(unknown)}", file=sys.stderr)
-            return 1
-        p = grafana_apply.only(p, set(args.only))
-    g = grafana_apply.Grafana(args.url, token=token, user=args.user, password=password)
-    try:
-        d = grafana_apply.diff(g, p)
-    except grafana_apply.GrafanaError as e:
-        print(e, file=sys.stderr)
+    if args.only and args.prune:
+        print("--only and --prune can't be combined", file=sys.stderr)
         return 1
-    for c in [] if args.only else d.stale:
-        print(f"stale    {c}" + ("" if args.prune else "  (kept; --prune deletes)"))
-    if not d.changes and not (args.prune and d.stale):
-        print("no changes")
-        return 0
-    for c in d.changes:
-        print(c)
-    if not args.yes:
-        print("\ndry run; pass --yes to apply")
-        return 0
-    grafana_apply.apply(g, d, prune=args.prune)
-    print("applied")
-    return 0
+    return _run_step(
+        steps.grafana, services, args.env, url=args.url, token=token, user=args.user,
+        password=password, prometheus_uid=args.prometheus_uid,
+        clickhouse_uid=args.clickhouse_uid, only=set(args.only or []) or None,
+        yes=args.yes, prune=args.prune,
+    )  # fmt: skip
 
 
 def _nomad_plan(args: argparse.Namespace):
@@ -321,7 +286,10 @@ def _nomad_plan(args: argparse.Namespace):
     if specs is None:
         return None
     platform = nomad.Platform(
-        registry=args.registry, api_url=args.api_url, kafka_bootstrap=args.kafka_bootstrap
+        registry=args.registry,
+        api_url=args.api_url,
+        kafka_bootstrap=args.kafka_bootstrap,
+        node_pool=args.node_pool,
     )
     try:
         naming.image_ref(args.registry, "x", "x", args.sha)
@@ -359,51 +327,21 @@ def _cmd_nomad_plan(args: argparse.Namespace) -> int:
 
 
 def _cmd_nomad_apply(args: argparse.Namespace) -> int:
-    from leasehold.nomad import apply as nomad_apply
-
-    p = _nomad_plan(args)
-    if p is None:
+    specs = _load_all(args.paths)
+    if specs is None:
         return 1
-    if args.only:
-        if args.prune:
-            print("--only and --prune can't be combined", file=sys.stderr)
-            return 1
-        unknown = sorted(set(args.only) - {j.job_id for j in p.jobs})
-        if unknown:
-            print(f"not in the plan: {', '.join(unknown)}", file=sys.stderr)
-            return 1
-        p = type(p)(env=p.env, namespace=p.namespace,
-                    jobs=[j for j in p.jobs if j.job_id in args.only])  # fmt: skip
-    client = nomad_apply.Nomad(args.url, token=os.environ.get(args.token_env))
-    try:
-        d = nomad_apply.diff(client, p, sorted({j.service for j in p.jobs}))
-        for w in d.warnings:
-            print(f"warning  {w}")
-        for ns, job_id in [] if args.only else d.stale:
-            print(f"stale    {ns}/{job_id}" + ("" if args.prune else "  (kept; --prune stops it)"))
-        if d.empty and not (args.prune and d.stale):
-            print("no changes")
-            return 0
-        for c in d.changes:
-            print(c)
-        if not args.yes:
-            print("\ndry run; pass --yes to apply")
-            return 0
-        evals = nomad_apply.apply(client, d, prune=args.prune)
-    except nomad_apply.NomadError as e:
-        print(e, file=sys.stderr)
+    if args.only and args.prune:
+        print("--only and --prune can't be combined", file=sys.stderr)
         return 1
-    finally:
-        client.close()
-    print(f"applied ({len(evals)} evaluations)")
-    return 0
+    return _run_step(
+        steps.nomad, specs, args.env, url=args.url, token=os.environ.get(args.token_env),
+        sha=args.sha, registry=args.registry, api_url=args.api_url,
+        kafka_bootstrap=args.kafka_bootstrap, node_pool=args.node_pool,
+        only=set(args.only or []) or None, yes=args.yes, prune=args.prune,
+    )  # fmt: skip
 
 
 def _cmd_credentials_apply(args: argparse.Namespace) -> int:
-    from leasehold import credentials
-    from leasehold.kafka.apply import KafkaException, admin_client
-    from leasehold.nomad.apply import Nomad, NomadError
-
     specs = _load_all(args.paths)
     if specs is None:
         return 1
@@ -411,46 +349,29 @@ def _cmd_credentials_apply(args: argparse.Namespace) -> int:
     if not password:
         print(f"set the Kafka admin password in ${args.kafka_password_env}", file=sys.stderr)
         return 1
-    creds = credentials.plan(specs, args.env)
-    admin = admin_client(args.bootstrap, args.kafka_username, password)
-    nomad = Nomad(args.url, token=os.environ.get(args.token_env))
-    services = sorted(s.name for s in specs)
-    try:
-        d = credentials.diff(admin, nomad, creds, args.env, services, rotate=args.rotate)
-        for u in d.stale_users:
-            print(f"stale    kafka user {u}" + ("" if args.prune else "  (kept; --prune deletes)"))
-        for ns, path in d.stale_variables:
-            print(f"stale    {ns}/{path}" + ("" if args.prune else "  (kept; --prune clears)"))
-        stale = d.stale_users or d.stale_variables
-        if d.empty and not (args.prune and stale):
-            print(f"no changes ({len(creds)} credentials in place)")
-            return 0
-        for c in d.changes:
-            print(c)
-        if not args.yes:
-            print("\ndry run; pass --yes to apply")
-            return 0
-        credentials.apply(admin, nomad, d, prune=args.prune)
-    except (KafkaException, NomadError) as e:
-        print(e, file=sys.stderr)
-        return 1
-    finally:
-        nomad.close()
-    print("applied")
-    return 0
+    return _run_step(
+        steps.credentials, specs, args.env, bootstrap=args.bootstrap,
+        kafka_username=args.kafka_username, kafka_password=password, nomad_url=args.url,
+        nomad_token=os.environ.get(args.token_env), rotate=args.rotate, yes=args.yes,
+        prune=args.prune,
+    )  # fmt: skip
+
+
+def _with_dirs(specs: list[ServiceSpec], paths: list[str]):
+    """Each spec with the directory of its service.yml."""
+    from pathlib import Path
+
+    by_name = {s.name: s for s in specs}
+    return [(by_name[load_spec(p).name], Path(p).parent) for p in find_specs(paths)]
 
 
 def _clickhouse_plan(args: argparse.Namespace):
-    from pathlib import Path
-
     from leasehold import clickhouse
 
     specs = _load_all(args.paths)
     if specs is None:
         return None
-    by_name = {s.name: s for s in specs}
-    services = [(by_name[load_spec(p).name], Path(p).parent) for p in find_specs(args.paths)]
-    return clickhouse.plan(services, args.env)
+    return clickhouse.plan(_with_dirs(specs, args.paths), args.env)
 
 
 def _cmd_clickhouse_plan(args: argparse.Namespace) -> int:
@@ -468,63 +389,148 @@ def _cmd_clickhouse_plan(args: argparse.Namespace) -> int:
 
 
 def _cmd_clickhouse_apply(args: argparse.Namespace) -> int:
-    from leasehold.clickhouse.apply import ClickHouse, ClickHouseError, apply, diff
-    from leasehold.nomad.apply import Nomad, NomadError
-
-    p = _clickhouse_plan(args)
-    if p is None:
+    specs = _load_all(args.paths)
+    if specs is None:
         return 1
     ch_password = os.environ.get(args.password_env)
     if ch_password is None:
         print(f"set the ClickHouse password in ${args.password_env}", file=sys.stderr)
         return 1
-    ch = ClickHouse(args.url, args.user, ch_password)
-    nomad = Nomad(args.nomad_url, token=os.environ.get(args.nomad_token_env))
+    return _run_step(
+        steps.clickhouse, _with_dirs(specs, args.paths), args.env, url=args.url,
+        user=args.user, password=ch_password, kafka_bootstrap=args.kafka_bootstrap,
+        nomad_url=args.nomad_url, nomad_token=os.environ.get(args.nomad_token_env),
+        accept_tables=set(args.accept_table or []), yes=args.yes, prune=args.prune,
+    )  # fmt: skip
+
+
+def _run_step(step, *a, yes: bool, **kw) -> int:
+    """Run one step on its own: print its changes and how it ended."""
     try:
-        versions, passwords = {}, {}
-        for s in p.sinks():
-            if s.principal in versions:
-                continue
-            var = nomad.var_get(s.credential_path, s.namespace)
-            pw = ((var or {}).get("Items") or {}).get("password")
-            if pw:
-                versions[s.principal] = str(var["ModifyIndex"])
-                passwords[s.principal] = pw
-        d = diff(ch, p, args.kafka_bootstrap, versions, set(args.accept_table or []))
-        for w in d.warnings:
-            print(f"warning  {w}")
-        for name, engine in d.stale:
-            kept = engine not in ("MaterializedView", "Kafka")
-            note = (
-                "  (data table: kept, drop by hand)"
-                if kept
-                else ("" if args.prune else "  (kept; --prune drops)")
-            )
-            print(f"stale    {name} [{engine}]{note}")
-        if d.empty and not (args.prune and d.stale):
-            print("no changes" + (f" (skipped: {', '.join(d.skipped)})" if d.skipped else ""))
-            return 1 if d.skipped else 0
-        for db in d.new_databases:
-            print(f"create   database {db.name}")
-        for db in d.errors_tables:
-            print(f"create   table {db.name}.sink_errors")
-        for c in d.changes:
-            print(f"sink     {c}")
-        if not args.yes:
-            print("\ndry run; pass --yes to apply")
-            return 0
-        apply(ch, d, args.kafka_bootstrap, passwords, prune=args.prune)
-    except (ClickHouseError, NomadError) as e:
-        print(e, file=sys.stderr)
+        r = step(print, *a, yes=yes, **kw)
+    except Exception as e:  # noqa: BLE001 - shown to the operator, exit 1
+        print(_error(e), file=sys.stderr)
         return 1
-    finally:
-        ch.close()
-        nomad.close()
-    if d.skipped:
-        print(f"applied, except: {', '.join(d.skipped)} (see warnings)")
+    print(_ending(r, yes))
+    if not yes and r.changes:
+        print("\ndry run; pass --yes to apply")
+    return 1 if r.skipped else 0
+
+
+def _error(e: Exception) -> str:
+    text = str(e)
+    if type(e).__module__.startswith("leasehold"):
+        return text
+    return f"{type(e).__name__}: {text}"
+
+
+def _ending(r: steps.Result, yes: bool) -> str:
+    skipped = f" (skipped: {', '.join(r.skipped)})" if r.skipped else ""
+    if not r.changes:
+        return "no changes" + skipped
+    if r.applied:
+        return "applied" + skipped
+    return f"{r.changes} change{'s' if r.changes != 1 else ''}" + skipped
+
+
+def _cmd_apply(args: argparse.Namespace) -> int:
+    from leasehold import environment
+
+    try:
+        e = environment.load(args.environment)
+    except environment.EnvironmentFileError as err:
+        print(err, file=sys.stderr)
         return 1
-    print("applied")
-    return 0
+    chosen = [s for s in steps.ORDER if s in (args.only or steps.ORDER) and s not in args.skip]
+    problems = environment.missing_sections(e, chosen)
+    if "nomad" in chosen and not args.sha:
+        problems.append("step nomad needs --sha (or --skip nomad)")
+    secrets, missing = environment.secrets(e, chosen)
+    if missing:
+        problems.append("set " + ", ".join(missing))
+    if problems:
+        for p in problems:
+            print(p, file=sys.stderr)
+        return 1
+    specs = _load_all(args.paths)
+    if specs is None:
+        return 1
+
+    kw = {"yes": args.yes, "prune": args.prune}
+    calls = {
+        "kafka": lambda: steps.kafka(
+            print, specs, e.env, bootstrap=e.kafka.bootstrap, username=e.kafka.username,
+            password=secrets["kafka"], **kw,
+        ),
+        "frontier": lambda: steps.frontier(print, specs, e.env, dsn=secrets["dsn"], yes=args.yes),
+        "credentials": lambda: steps.credentials(
+            print, specs, e.env, bootstrap=e.kafka.bootstrap, kafka_username=e.kafka.username,
+            kafka_password=secrets["kafka"], nomad_url=e.nomad.url,
+            nomad_token=secrets["nomad"], **kw,
+        ),
+        "clickhouse": lambda: steps.clickhouse(
+            print, _with_dirs(specs, args.paths), e.env, url=e.clickhouse.url,
+            user=e.clickhouse.user, password=secrets["clickhouse"],
+            kafka_bootstrap=e.kafka.clients, nomad_url=e.nomad.url,
+            nomad_token=secrets["nomad"], accept_tables=set(args.accept_table or []),
+            assume_passwords=new_passwords, **kw,
+        ),
+        "grafana": lambda: steps.grafana(
+            print, _load_with_dashboards(args.paths), e.env, url=e.grafana.url,
+            token=secrets.get("grafana_token"), user=e.grafana.user,
+            password=secrets.get("grafana_password"), prometheus_uid=e.grafana.prometheus_uid,
+            clickhouse_uid=e.grafana.clickhouse_uid, **kw,
+        ),
+        "nomad": lambda: steps.nomad(
+            print, specs, e.env, url=e.nomad.url, token=secrets["nomad"], sha=args.sha,
+            registry=e.jobs.registry, api_url=e.jobs.api_url,
+            kafka_bootstrap=e.kafka.clients, node_pool=e.jobs.node_pool, **kw,
+        ),
+    }  # fmt: skip
+
+    print(f"# environment {e.env} ({args.environment})" + ("" if args.yes else ", dry run"))
+    new_passwords: set[str] = set()
+    summary: list[tuple[str, str]] = []
+    failed = incomplete = False
+    for name in chosen:
+        print(f"\n== {name}")
+        if failed and args.yes:
+            summary.append((name, "not run"))
+            print("not run: an earlier step failed")
+            continue
+        try:
+            r = calls[name]()
+        except Exception as err:  # noqa: BLE001 - shown to the operator, exit 1
+            failed = True
+            print(f"failed: {_error(err)}")
+            summary.append((name, "failed"))
+            continue
+        new_passwords |= r.new_passwords
+        ending = _ending(r, args.yes)
+        print(ending)
+        summary.append((name, ending))
+        # Skipped parts need a hand; later steps don't depend on them, so they still run.
+        incomplete = incomplete or bool(r.skipped)
+
+    print("\n== summary")
+    width = max(len(n) for n, _ in summary)
+    for name, ending in summary:
+        print(f"{name:<{width}}  {ending}")
+    if not args.yes and any(e not in ("no changes", "failed") for _, e in summary):
+        print("\ndry run; pass --yes to apply")
+    return 1 if failed or incomplete else 0
+
+
+def _ct_log_arg(value: str):
+    from leasehold.mocks import ctlog
+
+    return ctlog.parse_log(value)
+
+
+def _cmd_mock_ctlog(args: argparse.Namespace) -> int:
+    from leasehold.mocks import ctlog
+
+    return ctlog.main(args)
 
 
 def _cmd_schema(args: argparse.Namespace) -> int:
@@ -644,6 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
         x.add_argument("--registry", default="ghcr.io/open-data-collection")
         x.add_argument("--api-url", required=True, help="control API, e.g. http://...:8400")
         x.add_argument("--kafka-bootstrap", help="needed when a component uses Kafka")
+        x.add_argument("--node-pool", help="Nomad node pool for these jobs (default pool)")
 
     nmp = nmsub.add_parser("plan", help="show the jobs for an environment")
     nomad_common(nmp)
@@ -652,7 +659,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     nma = nmsub.add_parser("apply", help="compare with Nomad and apply (dry run by default)")
     nomad_common(nma)
-    nma.add_argument("--url", required=True, help="e.g. http://100.83.247.12:4646")
+    nma.add_argument("--url", required=True, help="e.g. http://<nomad>:4646")
     nma.add_argument(
         "--token-env", default="NOMAD_TOKEN", help="environment variable holding the ACL token"
     )
@@ -673,7 +680,7 @@ def build_parser() -> argparse.ArgumentParser:
     cra.add_argument("--bootstrap", required=True, help="Kafka, e.g. localhost:19092")
     cra.add_argument("--kafka-username", default="admin")
     cra.add_argument("--kafka-password-env", default="LEASEHOLD_KAFKA_PASSWORD")
-    cra.add_argument("--url", required=True, help="Nomad, e.g. http://100.83.247.12:4646")
+    cra.add_argument("--url", required=True, help="Nomad, e.g. http://<nomad>:4646")
     cra.add_argument("--token-env", default="NOMAD_TOKEN")
     cra.add_argument("--rotate", action="store_true", help="new passwords for all credentials")
     cra.add_argument("--yes", action="store_true", help="apply the changes")
@@ -692,7 +699,7 @@ def build_parser() -> argparse.ArgumentParser:
     cha = chsub.add_parser("apply", help="compare with ClickHouse and apply (dry run by default)")
     cha.add_argument("paths", nargs="+", help="service.yml files or directories (all services)")
     cha.add_argument("--env", default=naming.PROD)
-    cha.add_argument("--url", required=True, help="ClickHouse HTTP, e.g. http://100.81.80.15:8123")
+    cha.add_argument("--url", required=True, help="ClickHouse HTTP, e.g. http://<clickhouse>:8123")
     cha.add_argument("--user", default="default")
     cha.add_argument("--password-env", default="LEASEHOLD_CLICKHOUSE_PASSWORD")
     cha.add_argument(
@@ -711,6 +718,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--prune", action="store_true", help="drop Kafka tables and views of removed sinks"
     )
     cha.set_defaults(func=_cmd_clickhouse_apply)
+
+    ap = sub.add_parser(
+        "apply",
+        help="run every apply step for an environment, in order (dry run by default)",
+        description="Steps, in order: " + ", ".join(steps.ORDER) + ". Addresses come from "
+        "the environment file, secrets from the environment variables it names. With "
+        "--yes, a failed step stops the steps after it.",
+    )
+    ap.add_argument("paths", nargs="+", help="service.yml files or directories (all services)")
+    ap.add_argument("--environment", "-e", required=True, metavar="FILE",
+                    help="environment file (see leasehold.environment)")  # fmt: skip
+    ap.add_argument("--sha", help="git SHA the component images are tagged with (nomad step)")
+    ap.add_argument("--only", action="append", choices=steps.ORDER, metavar="STEP",
+                    help="run only this step; repeatable")  # fmt: skip
+    ap.add_argument("--skip", action="append", default=[], choices=steps.ORDER, metavar="STEP",
+                    help="leave out this step; repeatable")  # fmt: skip
+    ap.add_argument("--accept-table", action="append", metavar="DATABASE.TABLE",
+                    help="clickhouse: record a table changed by hand; repeatable")  # fmt: skip
+    ap.add_argument("--yes", action="store_true", help="apply the changes")
+    ap.add_argument(
+        "--prune",
+        action="store_true",
+        help="also remove what these services no longer declare (every step)",
+    )
+    ap.set_defaults(func=_cmd_apply)
+
+    mk = sub.add_parser("mock", help="fake outside services for tests and the dev stack")
+    mksub = mk.add_subparsers(dest="mock_command", required=True)
+    mct = mksub.add_parser("ctlog", help="a Certificate Transparency log server (RFC 6962)")
+    mct.add_argument("--host", default="127.0.0.1")
+    mct.add_argument("--port", type=int, default=8500)
+    mct.add_argument(
+        "--log",
+        action="append",
+        type=_ct_log_arg,
+        metavar="NAME:OPERATOR:SIZE[:GROWTH]",
+        help="a log to serve; repeatable (default: three logs of two operators)",
+    )
+    mct.add_argument("--rps", type=float, default=5.0,
+                     help="requests per second per client and operator; 0 = no limit")  # fmt: skip
+    mct.add_argument("--max-entries", type=int, default=1000, help="entries per get-entries")
+    mct.set_defaults(func=_cmd_mock_ctlog)
 
     a = sub.add_parser("api", help="the control API")
     asub = a.add_subparsers(dest="api_command", required=True)
