@@ -290,6 +290,7 @@ def _nomad_plan(args: argparse.Namespace):
         api_url=args.api_url,
         kafka_bootstrap=args.kafka_bootstrap,
         node_pool=args.node_pool,
+        host_network=args.host_network,
     )
     try:
         naming.image_ref(args.registry, "x", "x", args.sha)
@@ -337,7 +338,8 @@ def _cmd_nomad_apply(args: argparse.Namespace) -> int:
         steps.nomad, specs, args.env, url=args.url, token=os.environ.get(args.token_env),
         sha=args.sha, registry=args.registry, api_url=args.api_url,
         kafka_bootstrap=args.kafka_bootstrap, node_pool=args.node_pool,
-        only=set(args.only or []) or None, yes=args.yes, prune=args.prune,
+        host_network=args.host_network, only=set(args.only or []) or None,
+        yes=args.yes, prune=args.prune,
     )  # fmt: skip
 
 
@@ -484,7 +486,8 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "nomad": lambda: steps.nomad(
             print, specs, e.env, url=e.nomad.url, token=secrets["nomad"], sha=args.sha,
             registry=e.jobs.registry, api_url=e.jobs.api_url,
-            kafka_bootstrap=e.kafka.clients, node_pool=e.jobs.node_pool, **kw,
+            kafka_bootstrap=e.kafka.clients, node_pool=e.jobs.node_pool,
+            host_network=e.jobs.host_network, **kw,
         ),
     }  # fmt: skip
 
@@ -651,6 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
         x.add_argument("--api-url", required=True, help="control API, e.g. http://...:8400")
         x.add_argument("--kafka-bootstrap", help="needed when a component uses Kafka")
         x.add_argument("--node-pool", help="Nomad node pool for these jobs (default pool)")
+        x.add_argument("--host-network", help="Nomad host network for the http port")
 
     nmp = nmsub.add_parser("plan", help="show the jobs for an environment")
     nomad_common(nmp)

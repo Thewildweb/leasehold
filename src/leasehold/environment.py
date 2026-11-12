@@ -25,6 +25,7 @@ secrets; it never holds a secret itself::
       registry: ghcr.io/example
       api_url: http://control-api:8400
       node_pool: dev                    # optional: run only on this Nomad node pool
+      host_network: tailscale           # optional: publish ports only on this host network
 
 A section may be left out when the steps that need it are skipped.
 """
@@ -87,6 +88,7 @@ class Jobs(_Model):
     registry: str
     api_url: str
     node_pool: str | None = None  # Nomad node pool; unset: the default pool
+    host_network: str | None = None  # Nomad host network for the http port, e.g. tailscale
 
 
 class Environment(_Model):

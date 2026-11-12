@@ -11,6 +11,8 @@ What each job gets:
   instances per machine, so instances that limit themselves per egress IP don't
   share one. The environment's node pool (``Platform.node_pool``), when set, keeps
   its jobs on that pool's machines (e.g. dev on dedicated nodes with clean IPs).
+  ``Platform.host_network`` binds the http port to a Nomad host network (e.g. the
+  nodes' ``tailscale`` network), so it isn't published on their public address.
 - The image ``<registry>/<service>-<component>:<git sha>``, never ``latest``.
 - Env: ``LEASEHOLD_ENV``, ``_SERVICE``, ``_COMPONENT``, ``_VERSION``, ``_API_URL``,
   ``_KAFKA_BOOTSTRAP`` (components that use Kafka), ``_DRAIN_TIMEOUT_S`` (5 s under
@@ -63,6 +65,10 @@ class Platform:
     api_url: str  # control API, e.g. http://control-api.service:8400
     kafka_bootstrap: str | None = None  # e.g. kafka.service:9092
     node_pool: str | None = None  # Nomad node pool for the environment's jobs (default pool)
+    # Nomad host network for the http port (/health, /metrics), e.g. "tailscale": the
+    # port is published only on that network's address, which is also the address the
+    # service registers (and Prometheus scrapes). Unset: the node's default network.
+    host_network: str | None = None
     # Topic reference → payload model, for every topic; ``plan`` fills it in.
     payload_models: dict[str, str] = field(default_factory=dict, hash=False)
 
@@ -261,7 +267,10 @@ def render_job(
     assert isinstance(c, TaskWorker | Processor | Api)
     job["Type"] = "service"
     group["Count"] = c.count.min
-    group["Networks"] = [{"DynamicPorts": [{"Label": HTTP_PORT}]}]
+    port: dict[str, Any] = {"Label": HTTP_PORT}
+    if platform.host_network:
+        port["HostNetwork"] = platform.host_network
+    group["Networks"] = [{"DynamicPorts": [port]}]
     group["Services"] = [_service(spec, cname, env)]
     group["RestartPolicy"] = {
         "Attempts": 10,

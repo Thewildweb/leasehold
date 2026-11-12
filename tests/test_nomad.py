@@ -314,3 +314,13 @@ def test_placement_failures_are_summarised():
         "group worker: 4 can't be placed (44 nodes evaluated): max_per_node reached on 41 "
         "machines; computed class ineligible (3)"
     ]
+
+
+def test_host_network(spec):
+    job = render_job(spec, "worker", "prod", SHA, PLATFORM).job
+    assert job["TaskGroups"][0]["Networks"] == [{"DynamicPorts": [{"Label": "http"}]}]
+    ts = Platform(**{**PLATFORM.__dict__, "host_network": "tailscale"})
+    job = render_job(spec, "worker", "prod", SHA, ts).job
+    assert job["TaskGroups"][0]["Networks"] == [
+        {"DynamicPorts": [{"Label": "http", "HostNetwork": "tailscale"}]}
+    ]

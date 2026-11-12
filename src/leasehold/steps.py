@@ -261,6 +261,7 @@ def nomad(
     api_url: str,
     kafka_bootstrap: str | None,
     node_pool: str | None = None,
+    host_network: str | None = None,
     only: set[str] | None = None,
     yes: bool,
     prune: bool,
@@ -270,7 +271,11 @@ def nomad(
     from leasehold.nomad import apply as na
 
     platform = lh_nomad.Platform(
-        registry=registry, api_url=api_url, kafka_bootstrap=kafka_bootstrap, node_pool=node_pool
+        registry=registry,
+        api_url=api_url,
+        kafka_bootstrap=kafka_bootstrap,
+        node_pool=node_pool,
+        host_network=host_network,
     )
     naming.image_ref(registry, "x", "x", sha)  # checks the SHA and registry
     p = lh_nomad.plan(specs, env, sha, platform)
