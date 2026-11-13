@@ -11,14 +11,16 @@ Two kinds of credentials, both sent as ``Authorization: Bearer <token>``:
 
       {"tokens": [
         {"sha256": "<hex>", "admin": "erik"},
-        {"sha256": "<hex>", "service": "certlog", "component": "worker"}
+        {"sha256": "<hex>", "service": "certlog", "component": "worker"},
+        {"sha256": "<hex>", "alerts": "grafana"}
       ]}
 
   ``leasehold api token`` creates a token and prints its entry.
 
 Permissions come from ``service.yml``: a task-worker may lease the task types in its
 ``consumes_tasks``; a component may create the task types in its ``creates_tasks``.
-Admins may create any task type and pause or resume task types.
+Admins may create any task type and pause or resume task types. An ``alerts`` token
+(for Grafana's webhook) may only post alert notifications.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ class Caller:
     service: str | None = None
     component: str | None = None
     admin: bool = False
+    alerts: bool = False  # may post alert notifications, nothing else
     instance: str | None = None  # Nomad allocation ID, when known
 
 
@@ -115,6 +118,8 @@ def load_tokens(path: Path | None) -> list[_StaticEntry]:
     for i, t in enumerate(data.get("tokens", [])):
         if "admin" in t:
             caller = Caller(name=f"admin:{t['admin']}", admin=True)
+        elif "alerts" in t:
+            caller = Caller(name=f"alerts:{t['alerts']}", alerts=True)
         elif "service" in t and "component" in t:
             caller = Caller(
                 name=f"{t['service']}.{t['component']}",
@@ -122,7 +127,9 @@ def load_tokens(path: Path | None) -> list[_StaticEntry]:
                 component=t["component"],
             )
         else:
-            raise ValueError(f"{path}: token {i} needs 'admin', or 'service' and 'component'")
+            raise ValueError(
+                f"{path}: token {i} needs 'admin', 'alerts', or 'service' and 'component'"
+            )
         if not re.fullmatch(r"[0-9a-f]{64}", t.get("sha256", "")):
             raise ValueError(f"{path}: token {i} needs a 'sha256' hex digest")
         out.append(_StaticEntry(t["sha256"], caller))
@@ -167,7 +174,7 @@ class Authenticator:
         for entry in self.tokens:
             if hmac.compare_digest(entry.sha256, digest):
                 c = entry.caller
-                if not c.admin and self.registry.component(c) is None:
+                if not (c.admin or c.alerts) and self.registry.component(c) is None:
                     raise AuthError(f"token for unknown component {c.name}")
                 return c
         raise AuthError("unknown token")

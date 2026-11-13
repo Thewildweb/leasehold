@@ -15,6 +15,9 @@ Endpoints (all under ``/v1`` need a bearer token):
     POST /v1/task-types/{name}/pause   stop leasing; release current leases (admin)
     POST /v1/task-types/{name}/resume  (admin)
     GET  /v1/whoami                the caller, as the API sees it
+    POST /v1/alerts                Grafana webhook: store alert notifications (alerts token)
+    GET  /v1/alerts                alert incidents with their latest state (admin)
+    GET  /v1/alerts/events         the alert notifications themselves (admin)
     GET  /health                   200 when the database answers
     GET  /metrics                  Prometheus
 """
@@ -24,10 +27,10 @@ import contextlib
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -40,6 +43,7 @@ from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict, Field
 
+from leasehold.api.alerts import AlertInbox, InboxError, default_database, rows_from_webhook
 from leasehold.api.auth import (
     Authenticator,
     AuthError,
@@ -59,6 +63,7 @@ from leasehold.frontier.store import (
     UpsertItem,
 )
 from leasehold.spec import ServiceSpec, find_specs, load_spec
+from leasehold.types import parse_duration
 
 log = logging.getLogger("leasehold.api")
 
@@ -218,6 +223,18 @@ class Metrics:
         self.dead = g("leasehold_frontier_dead_tasks", "Tasks that ran out of attempts")
         self.paused = g("leasehold_frontier_paused", "1 when the task type is paused")
         self.rows = g("leasehold_frontier_rows_estimate", "Rows per task type (planner estimate)")
+        self.alerts = Counter(
+            "leasehold_alerts_received",
+            "Alert notifications stored in the alert inbox",
+            ["env", "status"],
+            registry=self.registry,
+        )
+        self.alert_errors = Counter(
+            "leasehold_alerts_store_errors",
+            "Alert notifications that could not be stored (ClickHouse unavailable)",
+            ["env"],
+            registry=self.registry,
+        )
 
 
 # --- app --------------------------------------------------------------------------------------
@@ -255,6 +272,27 @@ def create_app(
             except Exception:
                 log.exception("%s failed", name)
             await asyncio.sleep(interval)
+
+    inbox = (
+        AlertInbox(
+            settings.clickhouse_url,
+            settings.clickhouse_user,
+            settings.clickhouse_password,
+            settings.alerts_database or default_database(settings.env),
+        )
+        if settings.clickhouse_url
+        else None
+    )
+
+    async def inbox_table() -> None:
+        # Retried until ClickHouse answers; the frontier doesn't wait for it.
+        while inbox is not None and not inbox.ready:
+            try:
+                await inbox.ensure_table()
+                log.info("alert inbox: %s", inbox.table)
+            except InboxError as e:
+                log.warning("alert inbox not ready: %s", e)
+                await asyncio.sleep(30)
 
     lock_key = f"leasehold-sweeper:{frontier.schema}"
 
@@ -299,6 +337,7 @@ def create_app(
         tasks = [
             asyncio.create_task(background("sweeper", settings.sweep_interval, sweep_once)),
             asyncio.create_task(background("stats", settings.stats_interval, stats_once)),
+            asyncio.create_task(inbox_table()),
         ]
         try:
             yield
@@ -309,6 +348,8 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
             await pool.close()
+            if inbox is not None:
+                await inbox.close()
 
     app = FastAPI(title="leasehold control API", version="1", lifespan=lifespan)
     app.state.settings = settings
@@ -316,6 +357,7 @@ def create_app(
     app.state.metrics = metrics
     app.state.sweep_once = sweep_once
     app.state.stats_once = stats_once
+    app.state.inbox = inbox
 
     @app.exception_handler(AuthError)
     async def _auth_error(request: Request, exc: AuthError):
@@ -331,8 +373,13 @@ def create_app(
     async def _unknown(request: Request, exc: UnknownTaskType):
         return JSONResponse({"detail": f"unknown task type {exc.args[0]!r}"}, status_code=404)
 
-    async def caller(authorization: Annotated[str | None, Header()] = None) -> Caller:
+    async def any_caller(authorization: Annotated[str | None, Header()] = None) -> Caller:
         return await auth.authenticate(authorization)
+
+    async def caller(c: Annotated[Caller, Depends(any_caller)]) -> Caller:
+        if c.alerts:
+            raise Forbidden(f"{c.name} may only post alert notifications")
+        return c
 
     CallerDep = Annotated[Caller, Depends(caller)]
 
@@ -495,6 +542,99 @@ def create_app(
             "may_lease": sorted(registry.leasable(c)),
             "may_create": sorted(registry.creatable(c)),
         }
+
+    # --- alert inbox ---
+
+    def require_inbox() -> AlertInbox:
+        if inbox is None:
+            raise HTTPException(404, "the alert inbox is not configured on this API")
+        if not inbox.ready:
+            raise HTTPException(503, "the alert inbox is not ready (ClickHouse unavailable)")
+        return inbox
+
+    def since_param(since: str) -> timedelta:
+        try:
+            d = parse_duration(since)
+        except ValueError as e:
+            raise HTTPException(422, f"since: {e}") from None
+        if d <= timedelta(0) or d > timedelta(days=365):
+            raise HTTPException(422, "since: between 1s and 365d")
+        return d
+
+    @app.post("/v1/alerts")
+    async def receive_alerts(
+        c: Annotated[Caller, Depends(any_caller)], payload: Annotated[dict, Body()]
+    ):
+        if not (c.alerts or c.admin):
+            raise Forbidden(f"{c.name} may not post alerts")
+        ib = require_inbox()
+        try:
+            rows = rows_from_webhook(payload)
+        except (ValueError, TypeError, AttributeError) as e:
+            raise HTTPException(422, f"not a Grafana webhook notification: {e}") from None
+        try:
+            await ib.insert(rows)
+        except InboxError as e:
+            metrics.alert_errors.labels(settings.env).inc(len(rows))
+            log.error("alert inbox: %d notifications not stored: %s", len(rows), e)
+            raise HTTPException(503, "alert inbox unavailable") from None
+        for r in rows:
+            metrics.alerts.labels(settings.env, r["status"]).inc()
+        return {"stored": len(rows)}
+
+    @app.get("/v1/alerts")
+    async def list_alerts(
+        c: CallerDep,
+        status: Literal["firing", "resolved"] | None = None,
+        since: str = "24h",
+        env: str | None = None,
+        service: str | None = None,
+        priority: str | None = None,
+        alertname: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ):
+        require_admin(c)
+        ib = require_inbox()
+        try:
+            rows = await ib.incidents(
+                since_param(since),
+                status=status,
+                limit=limit,
+                env=env,
+                service=service,
+                priority=priority,
+                alertname=alertname,
+            )
+        except InboxError as e:
+            raise HTTPException(503, f"alert inbox: {e}") from None
+        return {"alerts": rows}
+
+    @app.get("/v1/alerts/events")
+    async def alert_events(
+        c: CallerDep,
+        since: str = "24h",
+        fingerprint: str | None = None,
+        env: str | None = None,
+        service: str | None = None,
+        priority: str | None = None,
+        alertname: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ):
+        require_admin(c)
+        ib = require_inbox()
+        try:
+            rows = await ib.events(
+                since_param(since),
+                limit=limit,
+                fingerprint=fingerprint,
+                env=env,
+                service=service,
+                priority=priority,
+                alertname=alertname,
+            )
+        except InboxError as e:
+            raise HTTPException(503, f"alert inbox: {e}") from None
+        return {"events": rows}
 
     # --- operations ---
 
