@@ -487,7 +487,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             print, specs, e.env, url=e.nomad.url, token=secrets["nomad"], sha=args.sha,
             registry=e.jobs.registry, api_url=e.jobs.api_url,
             kafka_bootstrap=e.kafka.clients, node_pool=e.jobs.node_pool,
-            host_network=e.jobs.host_network, **kw,
+            host_network=e.jobs.host_network, node_classes=e.jobs.node_classes, **kw,
         ),
     }  # fmt: skip
 

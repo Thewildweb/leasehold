@@ -324,3 +324,14 @@ def test_host_network(spec):
     assert job["TaskGroups"][0]["Networks"] == [
         {"DynamicPorts": [{"Label": "http", "HostNetwork": "tailscale"}]}
     ]
+
+
+def test_node_classes(spec):
+    job = render_job(spec, "worker", "dev", SHA, PLATFORM).job
+    original = job["Constraints"][0]["RTarget"]
+    mapped = Platform(**{**PLATFORM.__dict__, "node_classes": {original: "other"}})
+    job = render_job(spec, "worker", "dev", SHA, mapped).job
+    assert job["Constraints"] == [{"LTarget": "${node.class}", "RTarget": "other", "Operand": "="}]
+    unrelated = Platform(**{**PLATFORM.__dict__, "node_classes": {"nope": "other"}})
+    job = render_job(spec, "worker", "dev", SHA, unrelated).job
+    assert job["Constraints"][0]["RTarget"] == original

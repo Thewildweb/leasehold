@@ -262,6 +262,7 @@ def nomad(
     kafka_bootstrap: str | None,
     node_pool: str | None = None,
     host_network: str | None = None,
+    node_classes: dict[str, str] | None = None,
     only: set[str] | None = None,
     yes: bool,
     prune: bool,
@@ -276,6 +277,7 @@ def nomad(
         kafka_bootstrap=kafka_bootstrap,
         node_pool=node_pool,
         host_network=host_network,
+        node_classes=node_classes or {},
     )
     naming.image_ref(registry, "x", "x", sha)  # checks the SHA and registry
     p = lh_nomad.plan(specs, env, sha, platform)

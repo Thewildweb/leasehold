@@ -11,6 +11,9 @@ What each job gets:
   instances per machine, so instances that limit themselves per egress IP don't
   share one. The environment's node pool (``Platform.node_pool``), when set, keeps
   its jobs on that pool's machines (e.g. dev on dedicated nodes with clean IPs).
+  ``Platform.node_classes`` maps a spec's node class to the class used in this
+  environment, for a pool that has no machine of that class (dev's pool has only
+  ``processing`` machines, so ``services`` maps to ``processing`` there).
   ``Platform.host_network`` binds the http port to a Nomad host network (e.g. the
   nodes' ``tailscale`` network), so it isn't published on their public address.
 - The image ``<registry>/<service>-<component>:<git sha>``, never ``latest``.
@@ -69,6 +72,8 @@ class Platform:
     # port is published only on that network's address, which is also the address the
     # service registers (and Prometheus scrapes). Unset: the node's default network.
     host_network: str | None = None
+    # Spec node class → node class in this environment; classes not listed are kept.
+    node_classes: dict[str, str] = field(default_factory=dict, hash=False)
     # Topic reference → payload model, for every topic; ``plan`` fills it in.
     payload_models: dict[str, str] = field(default_factory=dict, hash=False)
 
@@ -232,13 +237,14 @@ def render_job(
                 "Operand": "distinct_property",
             }
         ]
+    node_class = platform.node_classes.get(c.node_class, c.node_class)
     job: dict[str, Any] = {
         "ID": job_id,
         "Name": job_id,
         "Namespace": namespace,
         "Datacenters": ["*"],
         "Priority": c.priority,
-        "Constraints": [{"LTarget": "${node.class}", "RTarget": c.node_class, "Operand": "="}],
+        "Constraints": [{"LTarget": "${node.class}", "RTarget": node_class, "Operand": "="}],
         "Meta": {
             "leasehold_env": env,
             MANAGED_META: spec.name,
