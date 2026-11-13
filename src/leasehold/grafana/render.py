@@ -11,6 +11,7 @@ Per environment, ``plan`` produces:
   - the service's **own dashboards** (``dashboards.files``);
 - the **cockpit** in a platform folder: one row per service with its instance count,
   its backlog and dead tasks, and its cockpit tiles;
+- per service its **alert rules** (``alerts.py``), in the service's folder;
 - in prod only, the **fleet** dashboard in the platform folder (``fleet.py``): capacity,
   reservations and use across the whole Nomad cluster.
 
@@ -89,6 +90,7 @@ class GrafanaPlan:
     env: str
     folders: list[FolderPlan]
     dashboards: list[DashboardPlan]
+    rules: list[Any] = field(default_factory=list)  # alerts.RulePlan
 
 
 def env_tag(env: str) -> str:
@@ -722,9 +724,13 @@ def plan(
         dashboards.append(
             DashboardPlan(fleet["uid"], fleet["title"], platform.uid, None, "fleet", fleet)
         )
+    from leasehold.grafana.alerts import service_rules
+
+    rules = []
     for spec, files in sorted(services, key=lambda x: x[0].name):
         folder = FolderPlan(_uid("lhf", env, spec.name), spec.name + _suffix(env))
         folders.append(folder)
+        rules += service_rules(spec, env, folder.uid, ds.prometheus, ds.clickhouse)
         d = service_dashboard(spec, env, ds)
         dashboards.append(
             DashboardPlan(d["uid"], d["title"], folder.uid, spec.name, "generated", d)
@@ -734,4 +740,4 @@ def plan(
             dashboards.append(
                 DashboardPlan(d["uid"], d["title"], folder.uid, spec.name, f"file:{path}", d)
             )
-    return GrafanaPlan(env, folders, dashboards)
+    return GrafanaPlan(env, folders, dashboards, rules)

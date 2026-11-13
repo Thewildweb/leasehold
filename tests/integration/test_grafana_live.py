@@ -46,6 +46,8 @@ def env():
     yield e
     g = _client()
     p = plan(_services(), e)
+    for r in p.rules:
+        g.request("DELETE", f"/api/v1/provisioning/alert-rules/{r.uid}")
     for d in p.dashboards:
         g.request("DELETE", f"/api/dashboards/uid/{d.uid}")
     for f in p.folders:
@@ -56,7 +58,10 @@ def test_apply_idempotent_and_detects_edits(env):
     g = _client()
     p = plan(_services(), env)
     d = diff(g, p)
-    assert sorted(c.action for c in d.changes) == ["create"] * 4 + ["create-folder"] * 3
+    dashboards = [
+        c.action for c in d.changes if "rule" not in c.action and c.action != "group-interval"
+    ]
+    assert sorted(dashboards) == ["create"] * 4 + ["create-folder"] * 3
     apply(g, d)
     assert diff(g, p).empty
 
@@ -87,8 +92,47 @@ def test_stale_dashboards_reported_and_pruned(env):
     # resolver's service.yml is gone.
     smaller = plan([s for s in _services() if s[0].name != "resolver"], env)
     d = diff(g, smaller)
-    assert [c.uid for c in d.stale] == [f"lh-{env}-resolver"]
+    assert [c.uid for c in d.stale if c.action == "delete"] == [f"lh-{env}-resolver"]
+    assert {c.action for c in d.stale} == {"delete", "delete-rule"}
     apply(g, d)  # without prune: kept
     assert g.get(f"/api/dashboards/uid/lh-{env}-resolver") is not None
     apply(g, d, prune=True)
     assert g.get(f"/api/dashboards/uid/lh-{env}-resolver") is None
+
+
+def test_alert_rules(env):
+    g = _client()
+    p = plan(_services(), env)
+    assert p.rules
+    d = diff(g, p)
+    assert {c.action for c in d.changes if "rule" in c.action} == {"create-rule"}
+    apply(g, d)
+    assert diff(g, p).empty  # rules and group intervals are as planned
+
+    for r in p.rules:
+        have = g.get(f"/api/v1/provisioning/alert-rules/{r.uid}")
+        assert have["labels"]["env"] == env
+        assert have["folderUID"] == r.folder_uid
+        assert have["for"] == r.rule["for"]
+    groups = {(r.folder_uid, r.group): r.interval_s for r in p.rules}
+    for (folder, group), interval in groups.items():
+        cur = g.get(f"/api/v1/provisioning/folder/{folder}/rule-groups/{group}")
+        assert cur["interval"] == interval
+
+    # A rule edited in Grafana is overwritten.
+    r = p.rules[0]
+    have = g.get(f"/api/v1/provisioning/alert-rules/{r.uid}")
+    have["annotations"]["leasehold_hash"] = "edited"
+    g.send("PUT", f"/api/v1/provisioning/alert-rules/{r.uid}", have)
+    d = diff(g, p)
+    assert [(c.action, c.uid) for c in d.changes] == [("update-rule", r.uid)]
+    apply(g, d)
+    assert diff(g, p).empty
+
+    # Rules of a service that is gone are stale; deleted only with prune.
+    smaller = plan([s for s in _services() if s[0].name != "resolver"], env)
+    gone = {x.uid for x in p.rules if x.service == "resolver"}
+    d = diff(g, smaller)
+    assert {c.uid for c in d.stale if c.action == "delete-rule"} == gone
+    apply(g, d, prune=True)
+    assert all(g.get(f"/api/v1/provisioning/alert-rules/{u}") is None for u in gone)
