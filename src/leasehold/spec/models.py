@@ -264,6 +264,13 @@ class Sink(_Strict):
         description="A topic of this service by name ('entries'), or any topic by reference"
     )
     schema_file: str = Field(min_length=1, description="SQL file, relative to service.yml")
+    consumers: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        description="Kafka consumers in ClickHouse, each on its own thread; raise it when "
+        "one can't keep up (at most the topic's partitions)",
+    )
 
 
 class ClickHouseSection(_Strict):

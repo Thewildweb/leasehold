@@ -42,6 +42,7 @@ class SinkPlan:
     credential_path: str  # Nomad Variable with the sink user's password
     namespace: str
     schema: SinkSchema
+    consumers: int = 1
 
     @property
     def table(self) -> str:
@@ -73,6 +74,8 @@ class SinkPlan:
             credential_version,
             "2",  # bump when the generated SQL below changes
         ]
+        if self.consumers > 1:  # left out at 1, so existing pipelines aren't recreated
+            parts.append(f"consumers={self.consumers}")
         fp = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         return f"{MARK} sink={self.sink} pipeline={fp}"
 
@@ -92,6 +95,9 @@ class SinkPlan:
             "kafka_sasl_username": self.principal,
             "kafka_sasl_password": password,
         }
+        if self.consumers > 1:
+            settings["kafka_num_consumers"] = str(self.consumers)
+            settings["kafka_thread_per_consumer"] = "1"
         body = ",\n    ".join(f"{k} = {_quote(v)}" for k, v in settings.items())
         return (
             f"CREATE TABLE {self.kafka_table} (message String)\n"
@@ -184,6 +190,7 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
                     credential_path=naming.clickhouse_kafka_variable(spec.name),
                     namespace=naming.nomad_namespace(env),
                     schema=schema,
+                    consumers=sink.consumers,
                 )
             )
         databases.append(DatabasePlan(spec.name, db, tuple(sinks)))

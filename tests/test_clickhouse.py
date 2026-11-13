@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,16 @@ def test_pipeline_comment_changes_with_inputs(chplan):
     assert base == s.pipeline_comment("kafka:9092", "5")
     assert base != s.pipeline_comment("kafka:9092", "6")  # password rotated
     assert base != s.pipeline_comment("other:9092", "5")
+
+
+def test_consumers(chplan):
+    s = chplan.sinks()[0]
+    assert "kafka_num_consumers" not in s.create_kafka_sql("kafka:9092", "pw", "c")
+    more = dataclasses.replace(s, consumers=8)
+    kafka = more.create_kafka_sql("kafka:9092", "pw", "c")
+    assert "kafka_num_consumers = '8'" in kafka
+    assert "kafka_thread_per_consumer = '1'" in kafka
+    assert more.pipeline_comment("k", "1") != s.pipeline_comment("k", "1")
 
 
 class FakeCH:

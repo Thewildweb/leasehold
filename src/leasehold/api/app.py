@@ -259,8 +259,15 @@ def create_app(
     )
     frontier = Frontier(settings.env)
     metrics = Metrics(settings.env)
+    # jit off: the lease query runs as a prepared statement, and its generic plan's
+    # cost crosses jit_above_cost, so Postgres would JIT-compile it on every call
+    # (~400 ms of CPU for a query that runs in ~3 ms).
     pool = AsyncConnectionPool(
-        settings.dsn, open=False, min_size=2, max_size=20, kwargs={"autocommit": True}
+        settings.dsn,
+        open=False,
+        min_size=2,
+        max_size=20,
+        kwargs={"autocommit": True, "options": "-c jit=off"},
     )
 
     async def background(name: str, interval: float, fn) -> None:
