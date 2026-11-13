@@ -12,6 +12,8 @@ Per environment, ``plan`` produces:
 - the **cockpit** in a platform folder: one row per service with its instance count,
   its backlog and dead tasks, and its cockpit tiles;
 - per service its **alert rules** (``alerts.py``), in the service's folder;
+- the **alert inbox** in the platform folder (``inbox.py``): the control API's alerts
+  table, filterable by status, service and priority;
 - in prod only, the **fleet** dashboard in the platform folder (``fleet.py``): capacity,
   reservations and use across the whole Nomad cluster.
 
@@ -27,6 +29,7 @@ UIDs (Grafana's limit is 40 characters):
     own dashboard          lh-<env>-<service>--<file name>
     platform folder        lhf-<env>--platform
     cockpit                lh-<env>--cockpit
+    alert inbox            lh-<env>--alerts
     fleet                  lh--fleet (prod plan only)
 
 Service names can't contain ``--``, so these can't collide. Every dashboard is
@@ -715,6 +718,12 @@ def plan(
     cockpit = cockpit_dashboard(specs, env, ds)
     dashboards.append(
         DashboardPlan(cockpit["uid"], cockpit["title"], platform.uid, None, "cockpit", cockpit)
+    )
+    from leasehold.grafana.inbox import inbox_dashboard
+
+    inbox = inbox_dashboard(env, ds)
+    dashboards.append(
+        DashboardPlan(inbox["uid"], inbox["title"], platform.uid, None, "inbox", inbox)
     )
     if env == naming.PROD:
         # One Nomad cluster serves every environment; its dashboard is generated once.

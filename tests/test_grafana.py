@@ -42,6 +42,7 @@ def test_uids_titles_and_folders():
     prod = _by_uid(plan(_services(), "prod"))
     assert set(prod) == {
         "lh-prod--cockpit",
+        "lh-prod--alerts",
         "lh--fleet",
         "lh-prod-certwatch",
         "lh-prod-certwatch--logs",
@@ -279,3 +280,21 @@ def test_apply_only_reduces_the_plan():
     p = only(plan(_services(), "prod"), {"lh--fleet"})
     assert [d.uid for d in p.dashboards] == ["lh--fleet"]
     assert [f.uid for f in p.folders] == ["lhf-prod--platform"]
+
+
+def test_alert_inbox_dashboard():
+    p = _by_uid(plan(_services(), "dev"))
+    inbox = p["lh-dev--alerts"]
+    assert inbox.folder_uid == "lhf-dev--platform"
+    d = inbox.dashboard
+    assert d["title"] == "Alert inbox (dev)"
+    assert [v["name"] for v in d["templating"]["list"]] == ["status", "service", "priority"]
+    sql = [t["rawSql"] for panel in d["panels"] for t in panel.get("targets", [])]
+    assert sql and all("dev_leasehold.alerts" in q for q in sql)
+    assert all("${status:singlequote}" in q for q in sql)
+    assert (
+        _by_uid(plan(_services(), "prod"))["lh-prod--alerts"]
+        .dashboard["panels"][0]["targets"][0]["rawSql"]
+        .count("leasehold.alerts")
+        == 1
+    )

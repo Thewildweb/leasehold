@@ -61,7 +61,7 @@ def test_apply_idempotent_and_detects_edits(env):
     dashboards = [
         c.action for c in d.changes if "rule" not in c.action and c.action != "group-interval"
     ]
-    assert sorted(dashboards) == ["create"] * 4 + ["create-folder"] * 3
+    assert sorted(dashboards) == ["create"] * 5 + ["create-folder"] * 3
     apply(g, d)
     assert diff(g, p).empty
 
