@@ -15,12 +15,20 @@ from leasehold.runtime.events import EventProducer
 from leasehold.runtime.worker import Permanent, Retry, Worker
 
 
-def make_worker(handler, keys=("a", "b", "c"), concurrency=2, prefetch=None, fail_topics=(), **cfg):
+def make_worker(
+    handler,
+    keys=("a", "b", "c"),
+    concurrency=2,
+    prefetch=None,
+    fail_topics=(),
+    group_limit=None,
+    **cfg,
+):
     control = FakeControl(keys)
     kafka = FakeKafkaProducer(fail_topics)
     c = runtime_cfg("worker", **cfg)
     ctx = Context(c, client=control, producer=EventProducer(c, producer=kafka))
-    return Worker(ctx, handler, concurrency, prefetch), control, kafka
+    return Worker(ctx, handler, concurrency, prefetch, group_limit), control, kafka
 
 
 def run_until(worker, cond, timeout=5.0):
@@ -103,6 +111,24 @@ def test_concurrency_limit_and_prefetch():
     assert len(control.pending) == 5
     release.set()
     run_until(w, lambda: len(control.acked) == 10)
+
+
+def test_group_limit():
+    release = threading.Event()
+
+    def handle(task, ctx):
+        release.wait(5)
+
+    keys = [f"a:{i}" for i in range(10)] + ["b:0", "b:1", "b:2", "c:0"]
+    w, control, _ = make_worker(handle, keys=keys, concurrency=6, prefetch=0, group_limit=2)
+    w.step(wait=0.05)
+    assert w.held_per_group() == {"a": 2, "b": 2, "c": 1}
+    w.step(wait=0.05)
+    # The next lease reports what's held, so groups at their limit get nothing more.
+    assert control.lease_calls[-1]["held"] == {"a": 2, "b": 2, "c": 1}
+    assert w.held_per_group() == {"a": 2, "b": 2, "c": 1}
+    release.set()
+    run_until(w, lambda: len(control.acked) == len(keys))
 
 
 def test_lost_lease_drops_queued_and_flags_running():

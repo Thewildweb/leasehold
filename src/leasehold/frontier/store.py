@@ -52,6 +52,7 @@ class UpsertItem:
     due_at: datetime | None = None
     payload: Any = None
     country: str | None = None
+    group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,7 +97,7 @@ class Stats:
 
 def _dedupe(items: list[UpsertItem]) -> list[UpsertItem]:
     """Merge duplicate keys within one batch (Postgres can't update a row twice in one
-    statement): highest priority, earliest due time, last payload and country."""
+    statement): highest priority, earliest due time, last payload, country and group."""
     merged: dict[str, UpsertItem] = {}
     for it in items:
         prev = merged.get(it.key)
@@ -111,8 +112,69 @@ def _dedupe(items: list[UpsertItem]) -> list[UpsertItem]:
             due_at=min(dues) if dues else None,
             payload=it.payload if it.payload is not None else prev.payload,
             country=it.country if it.country is not None else prev.country,
+            group=it.group if it.group is not None else prev.group,
         )
     return list(merged.values())
+
+
+_PICK = """
+    picked AS (
+      SELECT t.task_type, t.key
+      FROM {s}.tasks t
+      WHERE t.task_type = ANY(%(types)s)
+        AND t.status = 'pending'
+        AND t.next_due_at <= now()
+      ORDER BY t.priority DESC, t.next_due_at
+      LIMIT %(limit)s
+      FOR UPDATE OF t SKIP LOCKED
+    )
+"""
+
+# The groups with pending tasks, per task type, by skip-scan on tasks_pending_group (a
+# few index probes per group, however many tasks there are); then each group's best
+# due tasks up to its room, and the best of those overall.
+_PICK_GROUPED = """
+    RECURSIVE groups AS (
+      SELECT tt.task_type,
+             (SELECT t.grp FROM {s}.tasks t
+              WHERE t.task_type = tt.task_type AND t.status = 'pending'
+              ORDER BY t.grp LIMIT 1) AS grp
+      FROM unnest(%(types)s::text[]) AS tt(task_type)
+      UNION ALL
+      SELECT g.task_type,
+             (SELECT t.grp FROM {s}.tasks t
+              WHERE t.task_type = g.task_type AND t.status = 'pending' AND t.grp > g.grp
+              ORDER BY t.grp LIMIT 1)
+      FROM groups g
+      WHERE g.grp IS NOT NULL
+    ),
+    room AS (
+      SELECT g.task_type, g.grp,
+             GREATEST(%(per_group)s - COALESCE((%(held)s::jsonb ->> g.grp)::int, 0), 0) AS n
+      FROM groups g
+      WHERE g.grp IS NOT NULL
+    ),
+    candidates AS (
+      SELECT c.task_type, c.key, c.priority, c.next_due_at
+      FROM room r
+      CROSS JOIN LATERAL (
+        SELECT t.task_type, t.key, t.priority, t.next_due_at
+        FROM {s}.tasks t
+        WHERE t.task_type = r.task_type AND t.grp = r.grp
+          AND t.status = 'pending'
+          AND t.next_due_at <= now()
+        ORDER BY t.priority DESC, t.next_due_at
+        LIMIT r.n
+        FOR UPDATE OF t SKIP LOCKED
+      ) c
+      WHERE r.n > 0
+    ),
+    picked AS (
+      SELECT task_type, key FROM candidates
+      ORDER BY priority DESC, next_due_at
+      LIMIT %(limit)s
+    )
+"""
 
 
 def _refs_json(refs: list[LeaseRef]) -> str:
@@ -225,15 +287,18 @@ class Frontier:
             due = f"CASE WHEN {reopening} THEN now() ELSE t.next_due_at END"
         stmt = f"""
             INSERT INTO {{s}}.tasks AS t
-              (task_type, key, priority, status, next_due_at, payload, country, created_by)
+              (task_type, key, priority, status, next_due_at, payload, country, grp, created_by)
             SELECT %(task_type)s, i.key, COALESCE(i.priority, %(default_priority)s), 'pending',
-                   COALESCE(i.due_at, now()), i.payload, i.country, %(created_by)s
+                   COALESCE(i.due_at, now()), i.payload, i.country, COALESCE(i.grp, ''),
+                   %(created_by)s
             FROM jsonb_to_recordset(%(items)s::jsonb)
-              AS i(key text, priority smallint, due_at timestamptz, payload jsonb, country text)
+              AS i(key text, priority smallint, due_at timestamptz, payload jsonb, country text,
+                   grp text)
             ON CONFLICT (task_type, key) DO UPDATE SET
               priority    = {priority},
               payload     = COALESCE(EXCLUDED.payload, t.payload),
               country     = COALESCE(EXCLUDED.country, t.country),
+              grp         = CASE WHEN EXCLUDED.grp <> '' THEN EXCLUDED.grp ELSE t.grp END,
               next_due_at = {due},
               attempts    = CASE WHEN {reopening} THEN 0 ELSE t.attempts END,
               last_error  = CASE WHEN {reopening} THEN NULL ELSE t.last_error END,
@@ -248,6 +313,7 @@ class Frontier:
                     "due_at": it.due_at.isoformat() if it.due_at else None,
                     "payload": it.payload,
                     "country": it.country,
+                    "grp": it.group,
                 }
                 for it in items
             ]
@@ -269,10 +335,20 @@ class Frontier:
     # --- leasing ------------------------------------------------------------------------------
 
     async def lease(
-        self, conn: AsyncConnection, task_types: list[str], limit: int, leased_by: str
+        self,
+        conn: AsyncConnection,
+        task_types: list[str],
+        limit: int,
+        leased_by: str,
+        per_group: int | None = None,
+        held: dict[str, int] | None = None,
     ) -> list[dict]:
         """Lease up to ``limit`` due tasks of the given types. Paused and undeclared task
-        types are skipped."""
+        types are skipped.
+
+        With ``per_group``, at most ``per_group - held[group]`` tasks of each group (the
+        caller already holds ``held[group]``), best first within each group; tasks without
+        a group count as group ''."""
         async with conn.transaction():
             cur = await conn.execute(
                 self._q(
@@ -284,20 +360,13 @@ class Frontier:
             active = [r[0] for r in await cur.fetchall()]
             if not active:
                 return []
+            picked = _PICK_GROUPED if per_group is not None else _PICK
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     self._q(
-                        """
-                        WITH picked AS (
-                          SELECT t.task_type, t.key
-                          FROM {s}.tasks t
-                          WHERE t.task_type = ANY(%(types)s)
-                            AND t.status = 'pending'
-                            AND t.next_due_at <= now()
-                          ORDER BY t.priority DESC, t.next_due_at
-                          LIMIT %(limit)s
-                          FOR UPDATE OF t SKIP LOCKED
-                        )
+                        "WITH "
+                        + picked
+                        + """
                         UPDATE {s}.tasks t
                         SET status = 'leased',
                             lease_id = gen_random_uuid(),
@@ -307,10 +376,16 @@ class Frontier:
                         WHERE t.task_type = picked.task_type AND t.key = picked.key
                           AND tt.name = t.task_type
                         RETURNING t.task_type, t.key, t.lease_id, t.lease_expires_at,
-                                  t.priority, t.attempts, t.payload, t.country
+                                  t.priority, t.attempts, t.payload, t.country, t.grp AS "group"
                         """
                     ),
-                    {"types": active, "limit": limit, "by": leased_by},
+                    {
+                        "types": active,
+                        "limit": limit,
+                        "by": leased_by,
+                        "per_group": per_group,
+                        "held": json.dumps(held or {}),
+                    },
                 )
                 rows = await cur.fetchall()
         rows.sort(key=lambda r: -r["priority"])

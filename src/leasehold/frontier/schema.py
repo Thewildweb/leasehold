@@ -88,6 +88,20 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "CREATE INDEX tasks_dead ON {s}.tasks (task_type) WHERE status = 'dead'",
         ],
     ),
+    (
+        2,
+        [
+            # A task's group (e.g. the server it talks to): workers can hold at most N
+            # tasks per group, so one group's backlog doesn't take every slot. '' is no group.
+            "ALTER TABLE {s}.tasks ADD COLUMN grp text NOT NULL DEFAULT ''",
+            # Leasing per group: distinct groups by skip-scan, then each group's best tasks.
+            """
+            CREATE INDEX tasks_pending_group
+              ON {s}.tasks (task_type, grp, priority DESC, next_due_at)
+              WHERE status = 'pending'
+            """,
+        ],
+    ),
 ]
 
 LATEST = MIGRATIONS[-1][0]

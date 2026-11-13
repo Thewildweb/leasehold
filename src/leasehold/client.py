@@ -85,6 +85,7 @@ class LeasedTask:
     attempts: int
     payload: Any = None
     country: str | None = None
+    group: str = ""
 
     @property
     def task_type(self) -> str:
@@ -102,6 +103,7 @@ class NewTask:
     due_at: datetime | None = None
     payload: Any = None
     country: str | None = None
+    group: str | None = None  # e.g. the server the task talks to (workers' per-group limit)
 
     def json(self) -> dict:
         d: dict[str, Any] = {"key": self.key}
@@ -113,6 +115,8 @@ class NewTask:
             d["payload"] = self.payload
         if self.country is not None:
             d["country"] = self.country
+        if self.group is not None:
+            d["group"] = self.group
         return d
 
 
@@ -228,13 +232,23 @@ class ControlClient:
     # --- tasks --------------------------------------------------------------------------------
 
     def lease(
-        self, max: int, task_types: list[str] | None = None, worker_id: str | None = None
+        self,
+        max: int,
+        task_types: list[str] | None = None,
+        worker_id: str | None = None,
+        per_group: int | None = None,
+        held: dict[str, int] | None = None,
     ) -> list[LeasedTask]:
+        """Lease up to ``max`` tasks; with ``per_group``, at most that many per group,
+        counting the ``held`` tasks (per group) the caller already has."""
         body: dict[str, Any] = {"max": max}
         if task_types is not None:
             body["task_types"] = task_types
         if worker_id:
             body["worker_id"] = worker_id
+        if per_group is not None:
+            body["per_group"] = per_group
+            body["held"] = {g: n for g, n in (held or {}).items() if n > 0}
         r = self._request("POST", "/v1/tasks/lease", body, repeatable=False)
         return [
             LeasedTask(
@@ -244,6 +258,7 @@ class ControlClient:
                 attempts=t["attempts"],
                 payload=t.get("payload"),
                 country=t.get("country"),
+                group=t.get("group") or "",
             )
             for t in r["tasks"]
         ]

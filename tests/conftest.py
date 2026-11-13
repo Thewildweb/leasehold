@@ -106,6 +106,7 @@ class FakeControl:
         self.task_type = task_type
         self.lease_s = lease_s
         self.pending = list(keys)
+        self.lease_calls: list[dict] = []
         self.leases: dict[LeaseRef, datetime] = {}
         self.acked: list = []
         self.failed: list = []
@@ -119,16 +120,27 @@ class FakeControl:
         if self.down:
             raise Unavailable("down")
 
-    def lease(self, max, task_types=None, worker_id=None):
+    def lease(self, max, task_types=None, worker_id=None, per_group=None, held=None):
+        """A key ``g:x`` is in group ``g``; other keys have no group."""
         self._check()
+        self.lease_calls.append({"max": max, "per_group": per_group, "held": dict(held or {})})
         with self.lock:
             out = []
-            while self.pending and len(out) < max:
-                key = self.pending.pop(0)
+            room = {}
+            for key in list(self.pending):
+                if len(out) >= max:
+                    break
+                group = key.split(":")[0] if ":" in key else ""
+                if per_group is not None:
+                    room.setdefault(group, per_group - (held or {}).get(group, 0))
+                    if room[group] <= 0:
+                        continue
+                    room[group] -= 1
+                self.pending.remove(key)
                 ref = LeaseRef(self.task_type, key, uuid.uuid4())
                 exp = datetime.now(UTC) + timedelta(seconds=self.lease_s)
                 self.leases[ref] = exp
-                out.append(LeasedTask(ref, exp, 50, 0, {"id": key}))
+                out.append(LeasedTask(ref, exp, 50, 0, {"id": key}, group=group))
             return out
 
     def renew(self, refs):

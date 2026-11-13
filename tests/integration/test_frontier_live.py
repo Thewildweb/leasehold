@@ -191,6 +191,32 @@ def test_lease_order_and_due(env):
     assert [t["key"] for t in leased] == ["low"]  # 'later' isn't due
 
 
+def test_lease_per_group(env):
+    f = Frontier(env)
+    # One big group listed first, two small ones, and tasks without a group.
+    items = [UpsertItem(f"a{i}", group="a") for i in range(20)]
+    items += [UpsertItem(f"b{i}", group="b") for i in range(3)]
+    items += [UpsertItem("c0", priority=90, group="c")]
+    items += [UpsertItem(f"n{i}") for i in range(2)]
+    run(lambda c: f.upsert(c, "jobs.once", items, "t"))
+
+    leased = run(lambda c: f.lease(c, ["jobs.once"], 50, "w", per_group=2))
+    groups = sorted(t["group"] for t in leased)
+    assert groups == ["", "", "a", "a", "b", "b", "c"]
+    assert leased[0]["key"] == "c0"  # the best task overall comes first
+
+    # Held tasks count against the group's room.
+    leased = run(lambda c: f.lease(c, ["jobs.once"], 50, "w", per_group=3, held={"a": 2, "b": 3}))
+    assert sorted(t["group"] for t in leased) == ["a"]
+
+    # The limit applies after the per-group pick.
+    assert len(run(lambda c: f.lease(c, ["jobs.once"], 2, "w", per_group=5))) == 2
+
+    # An upsert without a group keeps the task's group.
+    run(lambda c: f.upsert(c, "jobs.once", [UpsertItem("a19", priority=99)], "t"))
+    assert _sql(env, "SELECT grp FROM {s}.tasks WHERE key = 'a19'") == [("a",)]
+
+
 def test_concurrent_leases_never_overlap(env):
     f = Frontier(env)
     run(lambda c: f.upsert(c, "jobs.repeat", [UpsertItem(str(i)) for i in range(400)], "t"))

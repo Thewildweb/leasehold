@@ -84,6 +84,9 @@ class UpsertTask(_Model):
     due_at: datetime | None = Field(default=None, description="Timezone-aware")
     payload: Any = None
     country: str | None = Field(default=None, min_length=2, max_length=2)
+    group: str | None = Field(
+        default=None, max_length=100, description="e.g. the server the task talks to"
+    )
 
 
 class UpsertRequest(_Model):
@@ -105,6 +108,14 @@ class LeaseRequest(_Model):
     worker_id: str | None = Field(
         default=None, max_length=200, description="Instance ID, if the token doesn't say"
     )
+    per_group: int | None = Field(
+        default=None, ge=1, le=MAX_LEASE, description="At most this many tasks per group"
+    )
+    held: dict[str, int] = Field(
+        default_factory=dict,
+        max_length=1000,
+        description="Tasks per group the worker already holds; count against per_group",
+    )
 
 
 class Ref(_Model):
@@ -122,6 +133,7 @@ class LeasedTask(Ref):
     attempts: int
     payload: Any = None
     country: str | None = None
+    group: str = ""
 
 
 class LeaseResponse(_Model):
@@ -341,7 +353,12 @@ def create_app(
         registry.require_create(c, req.task_type)
         items = [
             UpsertItem(
-                t.key, t.priority, t.due_at, t.payload, t.country.upper() if t.country else None
+                t.key,
+                t.priority,
+                t.due_at,
+                t.payload,
+                t.country.upper() if t.country else None,
+                t.group,
             )
             for t in req.tasks
         ]
@@ -359,7 +376,9 @@ def create_app(
         registry.require_lease(c, types)
         instance = c.instance or req.worker_id or "unknown"
         async with pool.connection() as conn:
-            rows = await frontier.lease(conn, sorted(types), req.max, f"{c.name}:{instance}")
+            rows = await frontier.lease(
+                conn, sorted(types), req.max, f"{c.name}:{instance}", req.per_group, req.held
+            )
         for r in rows:
             count(r["task_type"], "leased")
         return LeaseResponse(tasks=[LeasedTask(**r) for r in rows])

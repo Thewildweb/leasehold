@@ -14,6 +14,9 @@ What the loop does:
 - Leases tasks of the component's ``consumes_tasks`` in batches, keeping up to
   ``concurrency + prefetch`` leases, and runs ``handle`` for up to ``concurrency``
   of them at a time in threads.
+- With ``group_limit``, holds at most that many tasks per task group (``NewTask.group``,
+  e.g. the server a task talks to), so one group's backlog can't take every slot while
+  other groups wait.
 - Renews all held leases before half their duration has passed.
 - After ``handle`` returns, waits until Kafka confirmed every event it emitted,
   then acks with the first event's ID. ``Retry`` fails the attempt (optionally
@@ -41,6 +44,7 @@ import queue
 import threading
 import time
 import uuid
+from collections import Counter as Tally
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -99,6 +103,7 @@ class Task:
     priority: int
     country: str | None
     ref: LeaseRef
+    group: str = ""
     lost: threading.Event = field(default_factory=threading.Event)
 
     @property
@@ -147,16 +152,24 @@ def _now() -> datetime:
 
 class Worker:
     def __init__(
-        self, ctx: Context, handler: Handler, concurrency: int = 4, prefetch: int | None = None
+        self,
+        ctx: Context,
+        handler: Handler,
+        concurrency: int = 4,
+        prefetch: int | None = None,
+        group_limit: int | None = None,
     ):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
+        if group_limit is not None and group_limit < 1:
+            raise ValueError("group_limit must be >= 1")
         comp = ctx.cfg.component_spec
         self.ctx = ctx
         self.client = ctx.client
         self.handler = handler
         self.concurrency = concurrency
         self.prefetch = concurrency if prefetch is None else prefetch
+        self.group_limit = group_limit
         self.task_types = sorted(comp.consumes_tasks)
         self.worker_id = ctx.cfg.instance
         self.queued: deque[_Held] = deque()
@@ -180,6 +193,7 @@ class Worker:
                     "task_types": self.task_types,
                     "concurrency": self.concurrency,
                     "prefetch": self.prefetch,
+                    "group_limit": self.group_limit,
                 }
             },
         )
@@ -244,7 +258,18 @@ class Worker:
         if want <= 0 or len(self.queued) >= self.concurrency or time.monotonic() < self.next_lease:
             return
         try:
-            leased = self.client.lease(want, task_types=self.task_types, worker_id=self.worker_id)
+            if self.group_limit is None:
+                leased = self.client.lease(
+                    want, task_types=self.task_types, worker_id=self.worker_id
+                )
+            else:
+                leased = self.client.lease(
+                    want,
+                    task_types=self.task_types,
+                    worker_id=self.worker_id,
+                    per_group=self.group_limit,
+                    held=self.held_per_group(),
+                )
         except (Unavailable, ClientError) as e:
             self._api_error("lease", e)
             self._idle()
@@ -261,10 +286,22 @@ class Worker:
                     expires=t.lease_expires_at,
                     duration=max(t.lease_expires_at - now, timedelta(seconds=10)),
                     task=Task(
-                        t.task_type, t.key, t.payload, t.attempts, t.priority, t.country, t.ref
+                        t.task_type,
+                        t.key,
+                        t.payload,
+                        t.attempts,
+                        t.priority,
+                        t.country,
+                        t.ref,
+                        t.group,
                     ),
                 )
             )
+
+    def held_per_group(self) -> dict[str, int]:
+        """Leases held now (queued and running), per task group."""
+        held = list(self.queued) + list(self.running.values())
+        return dict(Tally(h.task.group for h in held))
 
     def _idle(self) -> None:
         self.idle_delay = min(max(self.idle_delay * 2, 0.5), MAX_IDLE_DELAY)
@@ -400,13 +437,16 @@ def run_worker(
     *,
     concurrency: int = 4,
     prefetch: int | None = None,
+    group_limit: int | None = None,
     ctx: Context | None = None,
 ) -> int:
-    """Run a task-worker until SIGTERM. Returns the process exit code."""
+    """Run a task-worker until SIGTERM. Returns the process exit code.
+
+    ``group_limit``: hold at most this many tasks per task group (see the module doc)."""
     ctx = ctx or build("task-worker")
     ctx.install_signal_handlers()
     ctx.serve_http()
     try:
-        return Worker(ctx, handler, concurrency, prefetch).run()
+        return Worker(ctx, handler, concurrency, prefetch, group_limit).run()
     finally:
         ctx.close()
