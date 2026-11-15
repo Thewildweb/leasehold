@@ -1,7 +1,8 @@
-"""ClickHouse users for planners: read-only, with fixed limits, grants from ``reads``.
+"""ClickHouse users for planners and other scheduled readers: read-only, with fixed
+limits, grants from ``reads``.
 
-Per planner component, one user (``naming.planner_clickhouse_user``, e.g.
-``dev.dns.plan-new-nl``):
+Per planner component (or scheduled component with ``reads``), one user
+(``naming.planner_clickhouse_user``, e.g. ``dev.dns.plan-new-nl``):
 
 - in the settings profile ``leasehold_planner``: ``readonly = 2`` (reads only; the
   client may still set formats) and ``CONST`` limits on query time, memory and threads,
@@ -60,14 +61,18 @@ class PlannerUser:
     grants: frozenset[tuple[str, str]]
 
 
-def plan(specs: list[ServiceSpec], env: str) -> list[PlannerUser]:
+def plan(
+    specs: list[ServiceSpec], env: str, reads_from: dict[str, str] | None = None
+) -> list[PlannerUser]:
+    """``reads_from``: service -> environment whose tables readers of it are granted."""
+    reads_from = reads_from or {}
     databases = {s.name: s.clickhouse.database for s in specs if s.clickhouse}
     out = []
     for spec in specs:
-        for cname, planner in spec.planners().items():
+        for cname, reads in spec.clickhouse_readers().items():
             own = naming.clickhouse_database(env, databases[spec.name])
             grants = {(own, "*")}
-            for ref in planner.reads:
+            for ref in reads:
                 service, table = ref.split(".", 1)
                 if service == spec.name:
                     continue
@@ -76,7 +81,7 @@ def plan(specs: list[ServiceSpec], env: str) -> list[PlannerUser]:
                     raise ValueError(
                         f"{spec.name}.{cname} reads {ref}: service {service!r} isn't in the set"
                     )
-                grants.add((naming.clickhouse_database(env, db), table))
+                grants.add((naming.clickhouse_database(reads_from.get(service, env), db), table))
             out.append(
                 PlannerUser(
                     service=spec.name,

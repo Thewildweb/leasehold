@@ -28,6 +28,7 @@ secrets; it never holds a secret itself::
       host_network: tailscale           # optional: publish ports only on this host network
       node_classes: {services: processing}  # optional: spec node class -> class used here
     services: [certlog, dns]            # optional: apply only these services here
+    reads_from: {dns: prod}             # optional: readers here read dns's tables in prod
 
 A section may be left out when the steps that need it are skipped.
 
@@ -35,6 +36,11 @@ A section may be left out when the steps that need it are skipped.
 only once it is listed. Unset, every service is applied. A service taken off the
 list is treated like a deleted one: its resources show up as stale and are removed
 only with ``--prune``.
+
+``reads_from`` points this environment's readers (planners, scheduled components
+with ``reads``) at another environment's tables of a service, e.g. a dev planner
+selecting from prod's data instead of the small dev copy. Reads only: the read-only
+ClickHouse user of the reader gets ``SELECT`` on the other environment's table.
 """
 
 from __future__ import annotations
@@ -109,6 +115,7 @@ class Environment(_Model):
     grafana: Grafana | None = None
     jobs: Jobs | None = None
     services: list[str] | None = None
+    reads_from: dict[str, str] = {}  # service -> environment whose tables readers here use
 
 
 # Per step: the sections it needs.
@@ -127,6 +134,8 @@ def load(path: str | Path) -> Environment:
         data = yaml.safe_load(Path(path).read_text())
         e = Environment.model_validate(data)
         naming.check_env(e.env)
+        for other in e.reads_from.values():
+            naming.check_env(other)
     except (OSError, yaml.YAMLError, ValidationError, naming.NamingError) as err:
         raise EnvironmentFileError(f"{path}: {err}") from None
     return e

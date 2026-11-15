@@ -149,6 +149,7 @@ def clickhouse(
     nomad_token: str | None,
     accept_tables: set[str] = frozenset(),  # type: ignore[assignment]
     assume_passwords: set[str] = frozenset(),  # type: ignore[assignment]
+    reads_from: dict[str, str] | None = None,
     yes: bool,
     prune: bool,
 ) -> Result:
@@ -194,7 +195,7 @@ def clickhouse(
             out(f"sink     {c}")
         prunable = [n for n, e in d.stale if e in ("MaterializedView", "Kafka")]
 
-        planner_users = lh_users.plan([s for s, _ in services], env)
+        planner_users = lh_users.plan([s for s, _ in services], env, reads_from)
         ud = lh_users.diff(ch, nomad, planner_users, env, sorted(s.name for s, _ in services))
         if ud.profile_missing:
             out(f"create   settings profile {lh_users.PROFILE}")
@@ -280,6 +281,7 @@ def nomad(
     host_network: str | None = None,
     node_classes: dict[str, str] | None = None,
     clickhouse_url: str | None = None,
+    reads_from: dict[str, str] | None = None,
     only: set[str] | None = None,
     yes: bool,
     prune: bool,
@@ -296,6 +298,7 @@ def nomad(
         host_network=host_network,
         node_classes=node_classes or {},
         clickhouse_url=clickhouse_url,
+        reads_from=reads_from or {},
     )
     naming.image_ref(registry, "x", "x", sha)  # checks the SHA and registry
     p = lh_nomad.plan(specs, env, sha, platform)

@@ -220,6 +220,28 @@ class Scheduled(_ComponentBase):
     planner: Planner | None = Field(
         default=None, description="Makes this component a planner (`run_planner`)"
     )
+    reads: list[TableRefStr] = Field(
+        default_factory=list,
+        description="ClickHouse tables a job that is not a planner reads ('<service>.<table>'), "
+        "with the same read-only user a planner gets (`run.clickhouse` in `run_scheduled`). "
+        "A planner declares them in its planner block",
+    )
+
+    @model_validator(mode="after")
+    def _reads_in_one_place(self) -> Scheduled:
+        if self.reads and self.planner is not None:
+            raise ValueError("a planner declares its reads in planner.reads")
+        return self
+
+    @property
+    def clickhouse_reads(self) -> list[str]:
+        """Tables this job reads in ClickHouse."""
+        return list(self.planner.reads) if self.planner is not None else list(self.reads)
+
+    @property
+    def reads_clickhouse(self) -> bool:
+        """Gets a read-only ClickHouse user: every planner (plan log), and jobs with reads."""
+        return self.planner is not None or bool(self.reads)
 
     @field_validator("schedule")
     @classmethod
@@ -654,6 +676,11 @@ class ServiceSpec(_Strict):
                     yield f"{where}.scaling.metric: task-workers scale on 'eligible_tasks'"
             if isinstance(c, Scheduled) and c.planner is not None:
                 yield from self._check_planner(c.planner, f"{where}.planner")
+            elif isinstance(c, Scheduled) and c.reads:
+                if self.clickhouse is None:
+                    yield f"{where}.reads: needs a clickhouse section"
+                else:
+                    yield from self._check_reads(c.reads, f"{where}.reads")
             if isinstance(c, Processor):
                 for ref_str in c.consumes:
                     ref = naming.TopicRef.parse(ref_str)
@@ -744,6 +771,14 @@ class ServiceSpec(_Strict):
             if isinstance(c, Scheduled) and c.planner is not None
         }
 
+    def clickhouse_readers(self) -> dict[str, list[str]]:
+        """Scheduled components with a read-only ClickHouse user → the tables they read."""
+        return {
+            n: c.clickhouse_reads
+            for n, c in self.components.items()
+            if isinstance(c, Scheduled) and c.reads_clickhouse
+        }
+
     def plan_log_ref(self) -> naming.TopicRef | None:
         """The plan log topic, which apply creates when the service has a planner."""
         if not self.planners():
@@ -759,15 +794,16 @@ class ServiceSpec(_Strict):
         if self.clickhouse is None:
             yield f"{where}: a planner needs a clickhouse section (its plan log lives there)"
             return
+        yield from self._check_reads(planner.reads, f"{where}.reads")
+
+    def _check_reads(self, reads: list[str], where: str):
         own = self.clickhouse.tables() | naming.RESERVED_SINK_NAMES
-        for ref in planner.reads:
+        for ref in reads:
             service, table = ref.split(".", 1)
             if service == self.name and table not in own:
-                yield (
-                    f"{where}.reads: {ref!r}: this service has no sink or shared table {table!r}"
-                )
-        if len(set(planner.reads)) != len(planner.reads):
-            yield f"{where}.reads: a table is listed twice"
+                yield f"{where}: {ref!r}: this service has no sink or shared table {table!r}"
+        if len(set(reads)) != len(reads):
+            yield f"{where}: a table is listed twice"
 
     def _check_own_ref(self, ref: naming.TopicRef, where: str):
         topic = self.kafka.produces.get(ref.name)

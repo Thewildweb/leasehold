@@ -495,7 +495,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             user=e.clickhouse.user, password=secrets["clickhouse"],
             kafka_bootstrap=e.kafka.clients, nomad_url=e.nomad.url,
             nomad_token=secrets["nomad"], accept_tables=set(args.accept_table or []),
-            assume_passwords=new_passwords, **kw,
+            assume_passwords=new_passwords, reads_from=e.reads_from, **kw,
         ),
         "grafana": lambda: steps.grafana(
             print, dashboards(), e.env, url=e.grafana.url,
@@ -509,7 +509,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             kafka_bootstrap=e.kafka.clients, node_pool=e.jobs.node_pool,
             host_network=e.jobs.host_network, node_classes=e.jobs.node_classes,
             clickhouse_url=e.jobs.clickhouse_url or (e.clickhouse.url if e.clickhouse else None),
-            only=set(args.job) if args.job else None, **kw,
+            reads_from=e.reads_from, only=set(args.job) if args.job else None, **kw,
         ),
     }  # fmt: skip
 

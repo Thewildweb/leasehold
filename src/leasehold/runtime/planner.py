@@ -209,34 +209,55 @@ class PlannerRun:
     def table(self, ref: str) -> str:
         """The environment's name of a declared table: ``'certlog.base_domains'`` →
         ``dev_certlog.base_domains`` in dev. Own tables may be given without the service."""
-        if "." not in ref:
-            ref = f"{self._service}.{ref}"
-        service, table = ref.split(".", 1)
-        own = service == self._service
-        allowed = ref in self.planner.reads or (
-            own and table in (naming.PLAN_LOG_KEYS_SINK, naming.PLAN_LOG_RUNS_SINK)
+        return resolve_table(
+            ref,
+            service=self._service,
+            env=self._env,
+            database=self._database,
+            reads=self.planner.reads,
+            who=f"{self.name} (planner.reads)",
         )
-        if not allowed:
-            raise ConfigError(f"{self.name} doesn't declare {ref!r} in planner.reads")
-        if own:
-            return f"{self._database}.{table}"
-        # Other services' databases are named after the service's `clickhouse.database`,
-        # which may differ from the service name; reads name the service, so the planner
-        # gets the mapping from LEASEHOLD_PLANNER_DATABASES (set by the Nomad job).
-        db = _read_databases().get(service, service)
-        return f"{naming.clickhouse_database(self._env, db)}.{table}"
 
     def advance(self, watermark: str) -> None:
         """Where the next run starts. Set it to the last row the selection returned."""
         self._advanced = watermark
 
 
+def resolve_table(
+    ref: str, *, service: str, env: str, database: str, reads: Sequence[str], who: str
+) -> str:
+    """The environment's name of a table a component declared in its reads. Own tables
+    may be given without the service; the plan log's tables are always allowed."""
+    if "." not in ref:
+        ref = f"{service}.{ref}"
+    owner, table = ref.split(".", 1)
+    own = owner == service
+    allowed = ref in reads or (
+        own and table in (naming.PLAN_LOG_KEYS_SINK, naming.PLAN_LOG_RUNS_SINK)
+    )
+    if not allowed:
+        raise ConfigError(f"{who} doesn't declare {ref!r}")
+    if own:
+        return f"{database}.{table}"
+    # Other services' databases are named after the service's `clickhouse.database`,
+    # which may differ from the service name; reads name the service, so the job gets
+    # the mapping from LEASEHOLD_PLANNER_DATABASES (set by the Nomad job).
+    # LEASEHOLD_PLANNER_ENVS names services read in another environment (reads_from).
+    db = _read_databases().get(owner, owner)
+    read_env = _read_json("LEASEHOLD_PLANNER_ENVS").get(owner, env)
+    return f"{naming.clickhouse_database(read_env, db)}.{table}"
+
+
 def _read_databases() -> dict[str, str]:
-    raw = os.environ.get("LEASEHOLD_PLANNER_DATABASES") or "{}"
+    return _read_json("LEASEHOLD_PLANNER_DATABASES")
+
+
+def _read_json(var: str) -> dict[str, str]:
+    raw = os.environ.get(var) or "{}"
     try:
         return json.loads(raw)
     except ValueError as e:
-        raise ConfigError(f"LEASEHOLD_PLANNER_DATABASES is not JSON: {e}") from None
+        raise ConfigError(f"{var} is not JSON: {e}") from None
 
 
 def _short(e: BaseException) -> str:

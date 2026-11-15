@@ -81,6 +81,8 @@ class Platform:
     clickhouse_url: str | None = None
     # Service → its ClickHouse database (without environment prefix); ``plan`` fills it in.
     databases: dict[str, str] = field(default_factory=dict, hash=False)
+    # Service → environment whose tables this environment's readers use (``reads_from``).
+    reads_from: dict[str, str] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)
@@ -154,16 +156,19 @@ def _env(
         out["LEASEHOLD_EGRESS_IP"] = "${meta.egress_ip}"
     if isinstance(c, Scheduled):
         out["LEASEHOLD_TIMEOUT_S"] = str(int(c.timeout.total_seconds()))
-    if isinstance(c, Scheduled) and c.planner is not None:
+    if isinstance(c, Scheduled) and c.reads_clickhouse:
         if not platform.clickhouse_url:
-            raise ValueError(f"{spec.name}.{cname} is a planner; set the ClickHouse URL")
+            raise ValueError(f"{spec.name}.{cname} reads ClickHouse; set the ClickHouse URL")
         out["LEASEHOLD_CLICKHOUSE_URL"] = platform.clickhouse_url
         dbs = {
             s: platform.databases[s]
-            for s in sorted(c.planner.read_services() - {spec.name})
+            for s in sorted({r.split(".", 1)[0] for r in c.clickhouse_reads} - {spec.name})
             if s in platform.databases
         }
         out["LEASEHOLD_PLANNER_DATABASES"] = json.dumps(dbs, separators=(",", ":"))
+        envs = {s: platform.reads_from[s] for s in dbs if s in platform.reads_from}
+        if envs:
+            out["LEASEHOLD_PLANNER_ENVS"] = json.dumps(envs, separators=(",", ":"))
     # The spec's own env can't override the platform variables.
     clash = sorted(k for k in c.env if k in out)
     if clash:

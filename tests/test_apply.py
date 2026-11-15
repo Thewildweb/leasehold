@@ -190,3 +190,25 @@ def test_environment_services_limits_what_is_applied(tmp_path, secrets, monkeypa
     assert main(["apply", str(FIXTURES), "-e", str(p), "--sha", "abc1234"]) == 1
     assert "services not found: nope" in capsys.readouterr().err
     assert seen == {}
+
+
+def test_environment_reads_from_reaches_clickhouse_and_nomad(tmp_path, secrets, monkeypatch):
+    seen: dict[str, object] = {}
+
+    def make(name):
+        def step(out, specs, *args, **kw):
+            seen[name] = kw.get("reads_from")
+            return steps.Result()
+
+        return step
+
+    for name in steps.ORDER:
+        monkeypatch.setattr(steps, name, make(name))
+    p = tmp_path / "e.yml"
+    p.write_text(FULL + "reads_from: {certwatch: prod}\n")
+    assert main(["apply", str(FIXTURES), "-e", str(p), "--sha", "abc1234"]) == 0
+    assert seen["clickhouse"] == {"certwatch": "prod"}
+    assert seen["nomad"] == {"certwatch": "prod"}
+
+    p.write_text(FULL + "reads_from: {certwatch: Prod!}\n")
+    assert main(["apply", str(FIXTURES), "-e", str(p), "--sha", "abc1234"]) != 0

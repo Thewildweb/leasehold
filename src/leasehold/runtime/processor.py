@@ -249,15 +249,25 @@ def run_processor(
     batch_size: int = 500,
     batch_wait: float = 1.0,
     max_attempts: int = 5,
+    models: dict[str, type[BaseModel]] | None = None,
     ctx: Context | None = None,
 ) -> int:
-    """Run a processor until SIGTERM. Returns the process exit code."""
+    """Run a processor until SIGTERM. Returns the process exit code.
+
+    ``models``: per consumed topic reference, the payload model to validate with,
+    instead of the producer's model named in LEASEHOLD_PAYLOAD_MODELS (a reader of
+    several services' topics that validates them all with one shared model)."""
     ctx = ctx or build("processor")
     ctx.install_signal_handlers()
     ctx.serve_http()
     try:
         return Processor(
-            ctx, handler, batch_size=batch_size, batch_wait=batch_wait, max_attempts=max_attempts
+            ctx,
+            handler,
+            batch_size=batch_size,
+            batch_wait=batch_wait,
+            max_attempts=max_attempts,
+            models=models,
         ).run()
     except ProduceError:
         return 1

@@ -292,6 +292,43 @@ def test_planner_may_read_own_plan_log():
     ServiceSpec.model_validate(_resolver_with_planner(reads=["resolver.planned"]))
 
 
+def _resolver_with_reader(**component) -> dict:
+    data = _resolver_with_planner()
+    del data["components"]["plan-new"]
+    data["components"]["baseline"] = {
+        "kind": "scheduled",
+        "schedule": "17 * * * *",
+        "node_class": "services",
+        "resources": {"cpu": 200, "memory": 256},
+        "reads": ["resolver.known", "certwatch.domains"],
+        **component,
+    }
+    return data
+
+
+def test_scheduled_reads_without_a_planner():
+    spec = ServiceSpec.model_validate(_resolver_with_reader())
+    comp = spec.components["baseline"]
+    assert comp.reads_clickhouse and comp.planner is None
+    assert spec.clickhouse_readers() == {"baseline": ["resolver.known", "certwatch.domains"]}
+    assert spec.plan_log_ref() is None  # no planner, no plan log
+
+
+def test_scheduled_reads_checked_like_a_planners():
+    assert "this service has no sink or shared table 'nope'" in errors_of(
+        _resolver_with_reader(reads=["resolver.nope"])
+    )
+    data = _resolver_with_reader()
+    del data["clickhouse"]
+    assert "reads: needs a clickhouse section" in errors_of(data)
+
+
+def test_planner_reads_belong_in_the_planner_block():
+    data = _resolver_with_planner()
+    data["components"]["plan-new"]["reads"] = ["resolver.known"]
+    assert "a planner declares its reads in planner.reads" in errors_of(data)
+
+
 def test_reserved_plan_log_names(certwatch):
     certwatch["clickhouse"]["sinks"]["planned"] = {
         "topic": "entries",
@@ -320,3 +357,56 @@ def test_resource_names_planner():
     assert ("clickhouse user", "plan-new", "dev.resolver.plan-new") in rows
     assert ("topic", "planned", "dev.resolver.planned.v1") in rows
     assert ("clickhouse sink", "(plan log)", "dev_resolver.planner_runs") in rows
+
+
+def test_scheduled_reader_gets_a_clickhouse_user_and_job_env():
+    import dataclasses
+
+    from leasehold.clickhouse import users
+    from leasehold.nomad.render import render_job
+
+    reader = ServiceSpec.model_validate(_resolver_with_reader())
+    certwatch = load_spec(CERTWATCH)
+    (u,) = users.plan([reader, certwatch], "dev")
+    assert (u.component, u.user) == ("baseline", "dev.resolver.baseline")
+    assert ("dev_resolver", "*") in u.grants
+    assert any(table == "domains" for _, table in u.grants)
+    rows = resource_names(reader, "dev")
+    assert ("clickhouse user", "baseline", "dev.resolver.baseline") in rows
+
+    from test_nomad import PLATFORM, SHA
+
+    platform = dataclasses.replace(
+        PLATFORM, clickhouse_url="http://ch:8123", databases={"certwatch": "certwatch"}
+    )
+    job = render_job(reader, "baseline", "dev", SHA, platform).job
+    env = job["TaskGroups"][0]["Tasks"][0]["Env"]
+    assert env["LEASEHOLD_CLICKHOUSE_URL"] == "http://ch:8123"
+    assert env["LEASEHOLD_PLANNER_DATABASES"] == '{"certwatch":"certwatch"}'
+
+
+def test_reads_from_points_reader_grants_and_job_env_at_another_environment():
+    import dataclasses
+
+    from leasehold.clickhouse import users
+    from leasehold.nomad.render import render_job
+
+    reader = ServiceSpec.model_validate(_resolver_with_reader())
+    certwatch = load_spec(CERTWATCH)
+    (u,) = users.plan([reader, certwatch], "dev", {"certwatch": "prod"})
+    assert ("dev_resolver", "*") in u.grants  # own tables stay in dev
+    assert ("certwatch", "domains") in u.grants  # prod's database has no prefix
+    assert not any(db == "dev_certwatch" for db, _ in u.grants)
+
+    from test_nomad import PLATFORM, SHA
+
+    platform = dataclasses.replace(
+        PLATFORM,
+        clickhouse_url="http://ch:8123",
+        databases={"certwatch": "certwatch"},
+        reads_from={"certwatch": "prod"},
+    )
+    env = render_job(reader, "baseline", "dev", SHA, platform).job["TaskGroups"][0]["Tasks"][0][
+        "Env"
+    ]
+    assert env["LEASEHOLD_PLANNER_ENVS"] == '{"certwatch":"prod"}'

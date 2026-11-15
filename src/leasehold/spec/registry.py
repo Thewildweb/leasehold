@@ -40,21 +40,20 @@ def check_registry(specs: Iterable[ServiceSpec], *, partial: bool = False) -> li
 
     shared = {s.name: set(s.clickhouse.shared) if s.clickhouse else set() for s in specs}
     for s in specs:
-        for cname, planner in s.planners().items():
-            for ref in planner.reads:
+        for cname, reads in s.clickhouse_readers().items():
+            for ref in reads:
                 service, table = ref.split(".", 1)
                 if service == s.name:
                     continue  # checked in the spec itself
                 if service not in shared:
                     if not partial:
                         errors.append(
-                            f"{s.name}: planner {cname} reads {ref}, but there is no "
-                            f"service {service!r}"
+                            f"{s.name}: {cname} reads {ref}, but there is no service {service!r}"
                         )
                     continue
                 if table not in shared[service]:
                     errors.append(
-                        f"{s.name}: planner {cname} reads {ref}, which {service} doesn't "
+                        f"{s.name}: {cname} reads {ref}, which {service} doesn't "
                         "share (clickhouse.shared)"
                     )
 

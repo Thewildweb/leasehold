@@ -168,3 +168,67 @@ def test_component_without_planner_block():
     cfg = RuntimeConfig(env="dev", service="jobs", component="planner", spec=_spec())
     with pytest.raises(ConfigError, match="no planner block"):
         run_planner(lambda run: [], ctx=Context(cfg, client=Control()), clickhouse=FakeCH())
+
+
+def test_scheduled_reader_gets_clickhouse_and_table_names(monkeypatch):
+    from leasehold.runtime import run_scheduled
+
+    monkeypatch.setenv("LEASEHOLD_PLANNER_DATABASES", '{"other": "other_db"}')
+    data = copy.deepcopy(RUNTIME_SPEC)
+    data["components"]["baseline"] = {
+        "kind": "scheduled",
+        "schedule": "17 * * * *",
+        "node_class": "services",
+        "resources": {"cpu": 100, "memory": 64},
+        "produces": ["routed"],
+        "reads": ["other.domains"],
+    }
+    data["clickhouse"] = {"database": "jobs"}
+    spec = ServiceSpec.model_validate(data)
+    cfg = RuntimeConfig(env="dev", service="jobs", component="baseline", spec=spec)
+    ctx = Context(
+        cfg, client=FakeControl(), producer=EventProducer(cfg, producer=FakeKafkaProducer())
+    )
+    ch = FakeCH()
+    seen = {}
+
+    def job(run):
+        seen["other"] = run.table("other.domains")
+        seen["own_log"] = run.table("planner_runs")
+        with pytest.raises(ConfigError, match="doesn't declare 'other.nope'"):
+            run.table("other.nope")
+        run.clickhouse.query("SELECT 1")
+
+    assert run_scheduled(job, ctx=ctx, clickhouse=ch) == 0
+    assert seen == {"other": "dev_other_db.domains", "own_log": "dev_jobs.planner_runs"}
+    assert ch.queries == [("SELECT 1", {})]
+
+
+def test_scheduled_without_reads_has_no_clickhouse():
+    from leasehold.runtime import run_scheduled
+
+    spec = ServiceSpec.model_validate(copy.deepcopy(RUNTIME_SPEC))
+    cfg = RuntimeConfig(env="dev", service="jobs", component="planner", spec=spec)
+    ctx = Context(
+        cfg, client=FakeControl(), producer=EventProducer(cfg, producer=FakeKafkaProducer())
+    )
+
+    def job(run):
+        return run.clickhouse
+
+    assert run_scheduled(job, ctx=ctx) == 1
+
+
+def test_table_names_in_another_environment(monkeypatch):
+    monkeypatch.setenv("LEASEHOLD_PLANNER_DATABASES", '{"other": "other_db"}')
+    monkeypatch.setenv("LEASEHOLD_PLANNER_ENVS", '{"other": "prod"}')
+    out = {}
+
+    def select(run):
+        out["other"] = run.table("other.domains")
+        out["own"] = run.table("planned")
+        return []
+
+    assert _run(select)[0] == 0
+    assert out["other"] == "other_db.domains"
+    assert out["own"] == "dev_jobs.planned"

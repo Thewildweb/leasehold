@@ -19,7 +19,7 @@ def resource_names(spec: ServiceSpec, env: str) -> list[tuple[str, str, str]]:
         rows.append(("kafka principal", cname, naming.kafka_principal(env, spec.name, cname)))
         if isinstance(c, Processor):
             rows.append(("consumer group", cname, naming.consumer_group(env, spec.name, cname)))
-        if isinstance(c, Scheduled) and c.planner is not None:
+        if isinstance(c, Scheduled) and c.reads_clickhouse:
             rows.append(
                 ("clickhouse user", cname, naming.planner_clickhouse_user(env, spec.name, cname))
             )
