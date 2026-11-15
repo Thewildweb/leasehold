@@ -161,3 +161,32 @@ def test_single_step_command_reports_dry_run(secrets, fake_steps, capsys, monkey
     assert main(["kafka", "apply", str(FIXTURES), "--env", "dev", "--bootstrap", "x"]) == 0
     out = capsys.readouterr().out
     assert "3 changes" in out and "dry run; pass --yes" in out
+
+
+def test_environment_services_limits_what_is_applied(tmp_path, secrets, monkeypatch, capsys):
+    seen: dict[str, list[str]] = {}
+
+    def make(name):
+        def step(out, specs, *args, **kw):
+            if name in ("grafana", "clickhouse"):  # (spec, extra) pairs
+                seen[name] = [s.name for s, _ in specs]
+            else:
+                seen[name] = [s.name for s in specs]
+            return steps.Result()
+
+        return step
+
+    for name in steps.ORDER:
+        monkeypatch.setattr(steps, name, make(name))
+    p = tmp_path / "e.yml"
+    p.write_text(FULL + "services: [resolver]\n")
+    assert main(["apply", str(FIXTURES), "-e", str(p), "--sha", "abc1234"]) == 0
+    assert set(seen) == set(steps.ORDER)
+    assert all(names == ["resolver"] for names in seen.values()), seen
+    assert "not in this environment: certwatch" in capsys.readouterr().out
+
+    p.write_text(FULL + "services: [resolver, nope]\n")
+    seen.clear()
+    assert main(["apply", str(FIXTURES), "-e", str(p), "--sha", "abc1234"]) == 1
+    assert "services not found: nope" in capsys.readouterr().err
+    assert seen == {}

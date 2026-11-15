@@ -57,6 +57,39 @@ def test_handles_emits_and_acks_with_event_id():
     assert env["service"] == "jobs" and env["env"] == "dev" and env["schema_version"] == 1
     acked = {a.ref.key: str(a.event_id) for a in control.acked}
     assert acked["a"] == env["event_id"]
+    assert env["egress_ip"] is None
+
+
+def test_defer_gives_the_task_back_untried():
+    from leasehold.client import ReleaseItem
+    from leasehold.runtime import Defer
+
+    def handle(task, ctx):
+        if task.key == "b":
+            raise Defer("target cooling down", after=600)
+        ctx.emit("results", {"id": task.key, "n": 1})
+
+    w, control, kafka = make_worker(handle)
+    run_until(w, lambda: len(control.acked) == 2 and control.released)
+    assert not control.failed
+    (item,) = control.released
+    assert isinstance(item, ReleaseItem) and item.ref.key == "b"
+    assert item.after == timedelta(seconds=600)
+    assert item.json()["after_s"] == 600.0
+    assert {k.decode() for _, k, _ in kafka.messages} == {"a", "c"}
+
+
+def test_envelope_carries_the_configured_egress_ip():
+    def handle(task, ctx):
+        ctx.emit("results", {"id": task.key, "n": 1})
+        if task.key == "b":
+            ctx.emit("results", {"id": "b2", "n": 2}, egress_ip="198.51.100.9")
+
+    w, control, kafka = make_worker(handle, egress_ip="192.0.2.7")
+    run_until(w, lambda: len(control.acked) == 3)
+    by_key = {k.decode(): json.loads(v) for _, k, v in kafka.messages}
+    assert by_key["a"]["egress_ip"] == "192.0.2.7"
+    assert by_key["b2"]["egress_ip"] == "198.51.100.9"  # given per event: wins
 
 
 def test_retry_permanent_and_errors_fail_the_attempt():

@@ -17,6 +17,10 @@ LEASEHOLD_DRAIN_TIMEOUT_S how long to finish in-flight work after SIGTERM
 LEASEHOLD_TIMEOUT_S       scheduled components: kill the run after this long
 LEASEHOLD_PAYLOAD_MODELS  processors: JSON, consumed topic reference → payload model
                           of the service that produces it
+LEASEHOLD_EGRESS_IP       task workers: the address this machine's requests leave
+                          from, put in every event's envelope. Nomad fills it from
+                          the node's ``meta.egress_ip``; unset or not interpolated
+                          (``${meta.egress_ip}``, the node has no such meta): none.
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ class RuntimeConfig:
     run_timeout: float | None = None
     # Consumed topic reference (e.g. "certlog.entries.v1") → "module:Class".
     payload_models: dict[str, str] = field(default_factory=dict, hash=False)
+    egress_ip: str | None = None
 
     @property
     def component_spec(self) -> Component:
@@ -115,4 +120,11 @@ class RuntimeConfig:
             drain_timeout=float(e.get("LEASEHOLD_DRAIN_TIMEOUT_S", "25")),
             run_timeout=float(timeout) if timeout else None,
             payload_models=models,
+            egress_ip=_egress_ip(e.get("LEASEHOLD_EGRESS_IP")),
         )
+
+
+def _egress_ip(value: str | None) -> str | None:
+    """None when unset, or when Nomad left the interpolation as it was."""
+    value = (value or "").strip()
+    return value if value and not value.startswith("${") else None

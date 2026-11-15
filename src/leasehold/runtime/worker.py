@@ -20,13 +20,14 @@ What the loop does:
 - Renews all held leases before half their duration has passed.
 - After ``handle`` returns, waits until Kafka confirmed every event it emitted,
   then acks with the first event's ID. ``Retry`` fails the attempt (optionally
-  with a retry time), ``Permanent`` marks the task dead, any other exception
+  with a retry time), ``Defer`` gives the task back untried, due again after a
+  delay and with no attempt counted, ``Permanent`` marks the task dead, any other exception
   fails the attempt with the exception as reason. If a produce isn't
   confirmed, the attempt fails.
 - A lost lease (expired, task type paused, or the control API unreachable past
   the lease's expiry) is dropped if it hasn't started; if it's running,
   ``task.lost`` is set so long-running handlers can stop early.
-- Acks and fails are sent in batches and kept until the control API accepts
+- Acks, fails and deferrals are sent in batches and kept until the control API accepts
   them.
 - On SIGTERM: stop leasing, give back leases that haven't started, let running
   tasks finish for up to ``LEASEHOLD_DRAIN_TIMEOUT_S``, send the outcomes,
@@ -54,7 +55,15 @@ from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
 
-from leasehold.client import AckItem, ClientError, FailItem, LeasedTask, LeaseRef, Unavailable
+from leasehold.client import (
+    AckItem,
+    ClientError,
+    FailItem,
+    LeasedTask,
+    LeaseRef,
+    ReleaseItem,
+    Unavailable,
+)
 from leasehold.runtime import log as lh_log
 from leasehold.runtime.context import Context, build
 from leasehold.runtime.events import Delivery, ProduceError
@@ -83,6 +92,17 @@ class Retry(Exception):
     """Fail this attempt; try again later (after ``after`` seconds, if given)."""
 
     def __init__(self, reason: str, after: float | timedelta | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.after = timedelta(seconds=after) if isinstance(after, int | float) else after
+
+
+class Defer(Exception):
+    """Give this task back without trying it: no attempt is counted, and it is due
+    again after ``after``. For tasks the worker chose not to start, e.g. because
+    their target is cooling down; emit no event for them."""
+
+    def __init__(self, reason: str, after: float | timedelta):
         super().__init__(reason)
         self.reason = reason
         self.after = timedelta(seconds=after) if isinstance(after, int | float) else after
@@ -177,6 +197,7 @@ class Worker:
         self.done: queue.Queue[tuple[_Held, AckItem | FailItem, str]] = queue.Queue()
         self.acks: list[AckItem] = []
         self.fails: list[FailItem] = []
+        self.defers: list[ReleaseItem] = []
         self.wake = threading.Event()
         self.pool = ThreadPoolExecutor(concurrency, thread_name_prefix="leasehold-task")
         self.idle_delay = 0.0
@@ -232,13 +253,19 @@ class Worker:
             self.running.clear()
         for _ in range(3):
             self._send_outcomes()
-            if not self.acks and not self.fails:
+            if not self.acks and not self.fails and not self.defers:
                 break
             time.sleep(1)
-        if self.acks or self.fails:
+        if self.acks or self.fails or self.defers:
             log.error(
                 "outcomes not delivered at shutdown",
-                extra={"fields": {"acks": len(self.acks), "fails": len(self.fails)}},
+                extra={
+                    "fields": {
+                        "acks": len(self.acks),
+                        "fails": len(self.fails),
+                        "defers": len(self.defers),
+                    }
+                },
             )
         self.pool.shutdown(wait=False, cancel_futures=True)
         log.info("worker stopped")
@@ -323,13 +350,18 @@ class Worker:
         self.done.put((held, outcome, label))
         self.wake.set()
 
-    def _attempt(self, task: Task, tctx: TaskContext) -> tuple[AckItem | FailItem, str]:
+    def _attempt(
+        self, task: Task, tctx: TaskContext
+    ) -> tuple[AckItem | FailItem | ReleaseItem, str]:
         try:
             self.handler(task, tctx)
             for d in tctx.deliveries:
                 d.wait(PRODUCE_TIMEOUT)
             event_id = tctx.first_event_id or uuid.uuid4()
             return AckItem(task.ref, event_id), "acked"
+        except Defer as e:
+            self._confirm_quietly(tctx)
+            return ReleaseItem(task.ref, e.after), "deferred"
         except Retry as e:
             self._confirm_quietly(tctx)
             return FailItem(task.ref, e.reason, tctx.first_event_id, e.after), "retry"
@@ -364,6 +396,8 @@ class Worker:
             TASKS.labels(held.task.task_type, label).inc()
             if isinstance(outcome, AckItem):
                 self.acks.append(outcome)
+            elif isinstance(outcome, ReleaseItem):
+                self.defers.append(outcome)
             else:
                 self.fails.append(outcome)
 
@@ -385,6 +419,12 @@ class Worker:
                 self.fails = []
             except (Unavailable, ClientError) as e:
                 self._api_error("fail", e)
+        if self.defers:
+            try:
+                self.client.release(self.defers)
+                self.defers = []
+            except (Unavailable, ClientError) as e:
+                self._api_error("release", e)
 
     def _renew(self) -> None:
         held = list(self.queued) + list(self.running.values())

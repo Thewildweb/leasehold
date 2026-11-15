@@ -51,6 +51,24 @@ def test_config_from_env(tmp_path):
     assert conf["security.protocol"] == "SASL_PLAINTEXT"
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, None), ("", None), ("${meta.egress_ip}", None), (" 192.0.2.7 ", "192.0.2.7")],
+)
+def test_config_egress_ip(tmp_path, value, expected):
+    path = tmp_path / "service.yml"
+    path.write_text(yaml.safe_dump(RUNTIME_SPEC))
+    env = {
+        "LEASEHOLD_ENV": "dev",
+        "LEASEHOLD_SERVICE": "jobs",
+        "LEASEHOLD_COMPONENT": "worker",
+        "LEASEHOLD_SERVICE_FILE": str(path),
+    }
+    if value is not None:
+        env["LEASEHOLD_EGRESS_IP"] = value
+    assert RuntimeConfig.from_env(env).egress_ip == expected
+
+
 def test_config_without_dashboard_files(tmp_path):
     # An image has service.yml but not the dashboard files it names (dns, 2026-11-15).
     path = tmp_path / "service.yml"

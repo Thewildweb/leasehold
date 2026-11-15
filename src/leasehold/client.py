@@ -130,6 +130,18 @@ class AckItem:
 
 
 @dataclass(frozen=True)
+class ReleaseItem:
+    ref: LeaseRef
+    after: timedelta | None = None
+
+    def json(self) -> dict:
+        d = self.ref.json()
+        if self.after is not None:
+            d["after_s"] = max(0.0, self.after.total_seconds())
+        return d
+
+
+@dataclass(frozen=True)
 class FailItem:
     ref: LeaseRef
     reason: str
@@ -282,7 +294,9 @@ class ControlClient:
     def fail(self, items: Sequence[FailItem]) -> Applied:
         return self._applied("/v1/tasks/fail", "tasks", [i.json() for i in items])
 
-    def release(self, refs: Sequence[LeaseRef]) -> Applied:
+    def release(self, refs: Sequence[LeaseRef | ReleaseItem]) -> Applied:
+        """Give leases back without an attempt counted; a ``ReleaseItem`` with ``after``
+        also moves the task's due time that far ahead."""
         return self._applied("/v1/tasks/release", "leases", [r.json() for r in refs])
 
     def _applied(self, path: str, field_name: str, items: list[dict]) -> Applied:

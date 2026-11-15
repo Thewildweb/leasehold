@@ -365,7 +365,12 @@ def _with_dirs(specs: list[ServiceSpec], paths: list[str]):
     from pathlib import Path
 
     by_name = {s.name: s for s in specs}
-    return [(by_name[load_spec(p).name], Path(p).parent) for p in find_specs(paths)]
+    out = []
+    for p in find_specs(paths):
+        name = load_spec(p).name
+        if name in by_name:  # not when the environment leaves the service out
+            out.append((by_name[name], Path(p).parent))
+    return out
 
 
 def _clickhouse_plan(args: argparse.Namespace):
@@ -458,6 +463,20 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     specs = _load_all(args.paths)
     if specs is None:
         return 1
+    if e.services is not None:
+        unknown = sorted(set(e.services) - {s.name for s in specs})
+        if unknown:
+            print(f"{args.environment}: services not found: {', '.join(unknown)}", file=sys.stderr)
+            return 1
+        left_out = sorted(s.name for s in specs if s.name not in e.services)
+        specs = [s for s in specs if s.name in e.services]
+        if left_out:
+            print(f"# not in this environment: {', '.join(left_out)}")
+
+    def dashboards():
+        loaded = _load_with_dashboards(args.paths)
+        names = {s.name for s in specs}
+        return None if loaded is None else [(s, d) for s, d in loaded if s.name in names]
 
     kw = {"yes": args.yes, "prune": args.prune}
     calls = {
@@ -479,7 +498,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             assume_passwords=new_passwords, **kw,
         ),
         "grafana": lambda: steps.grafana(
-            print, _load_with_dashboards(args.paths), e.env, url=e.grafana.url,
+            print, dashboards(), e.env, url=e.grafana.url,
             token=secrets.get("grafana_token"), user=e.grafana.user,
             password=secrets.get("grafana_password"), prometheus_uid=e.grafana.prometheus_uid,
             clickhouse_uid=e.grafana.clickhouse_uid, **kw,

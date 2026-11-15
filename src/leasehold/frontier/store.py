@@ -548,10 +548,27 @@ class Frontier:
         return len(rows), [i.ref for i in items if i.ref not in ok]
 
     async def release(
-        self, conn: AsyncConnection, refs: list[LeaseRef]
+        self,
+        conn: AsyncConnection,
+        refs: list[LeaseRef],
+        after: dict[LeaseRef, float] | None = None,
     ) -> tuple[int, list[LeaseRef]]:
-        """Give leases back without counting an attempt (graceful shutdown). The due time
-        is unchanged, so the tasks can be leased again right away."""
+        """Give leases back without counting an attempt. Without ``after`` the due time
+        is unchanged, so the task can be leased again right away (graceful shutdown);
+        with it, the task is due ``after[ref]`` seconds from now (a worker deferring a
+        task it didn't try, e.g. because the target is cooling down)."""
+        after = after or {}
+        items = json.dumps(
+            [
+                {
+                    "task_type": r.task_type,
+                    "key": r.key,
+                    "lease_id": str(r.lease_id),
+                    "after_s": after.get(r),
+                }
+                for r in refs
+            ]
+        )
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
@@ -559,15 +576,18 @@ class Frontier:
                         """
                         UPDATE {s}.tasks t
                         SET status = 'pending', lease_id = NULL, leased_by = NULL,
-                            lease_expires_at = NULL
+                            lease_expires_at = NULL,
+                            next_due_at = COALESCE(
+                              now() + r.after_s * interval '1 second', t.next_due_at)
                         FROM jsonb_to_recordset(%(refs)s::jsonb)
-                               AS r(task_type text, key text, lease_id uuid)
+                               AS r(task_type text, key text, lease_id uuid,
+                                    after_s double precision)
                         WHERE t.task_type = r.task_type AND t.key = r.key
                           AND t.lease_id = r.lease_id AND t.status = 'leased'
                         RETURNING t.task_type, t.key, r.lease_id
                         """
                     ),
-                    {"refs": _refs_json(refs)},
+                    {"refs": items},
                 )
                 rows = await cur.fetchall()
         ok = {_ref(r) for r in rows}

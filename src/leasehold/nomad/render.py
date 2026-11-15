@@ -19,7 +19,8 @@ What each job gets:
 - The image ``<registry>/<service>-<component>:<git sha>``, never ``latest``.
 - Env: ``LEASEHOLD_ENV``, ``_SERVICE``, ``_COMPONENT``, ``_VERSION``, ``_API_URL``,
   ``_KAFKA_BOOTSTRAP`` (components that use Kafka), ``_DRAIN_TIMEOUT_S`` (5 s under
-  ``kill_timeout``), ``_TIMEOUT_S`` (scheduled), plus the spec's ``env``.
+  ``kill_timeout``), ``_TIMEOUT_S`` (scheduled), ``_EGRESS_IP`` (task workers:
+  the node's ``meta.egress_ip``), plus the spec's ``env``.
 - A workload identity ``leasehold`` (audience ``leasehold``) written to
   ``$NOMAD_SECRETS_DIR/nomad_leasehold.jwt``, which the control API client reads.
 - Secrets: components that use Kafka render the Nomad Variable ``nomad/jobs/<job>``
@@ -147,6 +148,10 @@ def _env(
             raise ValueError(f"{spec.name}.{cname} consumes {', '.join(missing)}: no producer")
         models = {r: platform.payload_models[r] for r in sorted(c.consumes)}
         out["LEASEHOLD_PAYLOAD_MODELS"] = json.dumps(models, separators=(",", ":"))
+    if isinstance(c, TaskWorker):
+        # Nomad interpolates the node's meta; a node without it leaves the text as is,
+        # which the runtime reads as no egress address.
+        out["LEASEHOLD_EGRESS_IP"] = "${meta.egress_ip}"
     if isinstance(c, Scheduled):
         out["LEASEHOLD_TIMEOUT_S"] = str(int(c.timeout.total_seconds()))
     if isinstance(c, Scheduled) and c.planner is not None:

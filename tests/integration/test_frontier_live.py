@@ -344,6 +344,18 @@ def test_release_keeps_due_time_and_attempts(env):
     assert len(run(lambda c: f.lease(c, ["jobs.once"], 1, "w"))) == 1
 
 
+def test_release_with_after_defers_without_an_attempt(env):
+    f = Frontier(env)
+    run(lambda c: f.upsert(c, "jobs.once", [UpsertItem("a"), UpsertItem("b")], "t"))
+    leased = {t["key"]: t for t in run(lambda c: f.lease(c, ["jobs.once"], 2, "w"))}
+    refs = {k: LeaseRef("jobs.once", k, t["lease_id"]) for k, t in leased.items()}
+    n, unknown = run(lambda c: f.release(c, list(refs.values()), after={refs["a"]: 3600}))
+    assert (n, unknown) == (2, [])
+    assert _row(env, "jobs.once", "a")[:3] == ("pending", 50, 0)  # no attempt counted
+    # a is due in an hour, b (no after) right away.
+    assert [t["key"] for t in run(lambda c: f.lease(c, ["jobs.once"], 2, "w"))] == ["b"]
+
+
 def test_stats(env):
     f = Frontier(env)
     run(lambda c: f.upsert(c, "jobs.repeat", [UpsertItem(str(i)) for i in range(30)], "t"))

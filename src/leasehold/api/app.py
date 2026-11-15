@@ -11,6 +11,7 @@ Endpoints (all under ``/v1`` need a bearer token):
     POST /v1/tasks/ack             record success
     POST /v1/tasks/fail            record a failed attempt
     POST /v1/tasks/release         give leases back without an attempt counted
+                                   (optionally due again only after ``after_s``)
     GET  /v1/task-types            settings and counts per task type
     POST /v1/task-types/{name}/pause   stop leasing; release current leases (admin)
     POST /v1/task-types/{name}/resume  (admin)
@@ -164,6 +165,19 @@ class AckTask(Ref):
 
 class AckRequest(_Model):
     tasks: list[AckTask] = Field(min_length=1, max_length=MAX_REFS)
+
+
+class ReleaseRef(Ref):
+    after_s: float | None = Field(
+        default=None,
+        ge=0,
+        le=30 * 86400,
+        description="Due again this many seconds from now; unset: due time unchanged",
+    )
+
+
+class ReleaseRequest(_Model):
+    leases: list[ReleaseRef] = Field(min_length=1, max_length=MAX_REFS)
 
 
 class FailTask(Ref):
@@ -499,10 +513,13 @@ def create_app(
         return AppliedResponse(applied=n, unknown=_refs(unknown))
 
     @app.post("/v1/tasks/release", response_model=AppliedResponse)
-    async def release(req: RefsRequest, c: CallerDep):
+    async def release(req: ReleaseRequest, c: CallerDep):
         _check_refs(c, req.leases)
+        after = {r.to_store(): r.after_s for r in req.leases if r.after_s is not None}
         async with pool.connection() as conn:
-            n, unknown = await frontier.release(conn, [r.to_store() for r in req.leases])
+            n, unknown = await frontier.release(
+                conn, [r.to_store() for r in req.leases], after=after
+            )
         _count_applied(req.leases, unknown, "released")
         return AppliedResponse(applied=n, unknown=_refs(unknown))
 

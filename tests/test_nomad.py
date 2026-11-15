@@ -64,6 +64,7 @@ def test_task_worker_job(spec):
     assert env["LEASEHOLD_KAFKA_BOOTSTRAP"] == "kafka:9092"
     assert env["LEASEHOLD_DRAIN_TIMEOUT_S"] == "25"
     assert "LEASEHOLD_TIMEOUT_S" not in env
+    assert env["LEASEHOLD_EGRESS_IP"] == "${meta.egress_ip}"  # task worker
     tmpl = task["Templates"][0]
     assert tmpl["Envvars"] is True
     assert 'nomadVar "nomad/jobs/certwatch-worker"' in tmpl["EmbeddedTmpl"]
@@ -357,5 +358,6 @@ def test_planner_job_env():
     env = job.job["TaskGroups"][0]["Tasks"][0]["Env"]
     assert env["LEASEHOLD_CLICKHOUSE_URL"] == "http://ch:8123"
     assert env["LEASEHOLD_PLANNER_DATABASES"] == "{}"  # reads only its own tables
+    assert "LEASEHOLD_EGRESS_IP" not in env  # only task workers send requests out
     # The job reads its Nomad Variable (Kafka for the plan log, ClickHouse password).
     assert job.job["TaskGroups"][0]["Tasks"][0]["Templates"]

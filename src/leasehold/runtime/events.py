@@ -176,7 +176,7 @@ class EventProducer:
             "task_type": task_type,
             "task_key": task_key,
             "target": target,
-            "egress_ip": egress_ip,
+            "egress_ip": egress_ip if egress_ip is not None else self.cfg.egress_ip,
             "ts": _ts(),
             "payload": body,
             "payload_ref": None,

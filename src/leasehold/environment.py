@@ -27,8 +27,14 @@ secrets; it never holds a secret itself::
       node_pool: dev                    # optional: run only on this Nomad node pool
       host_network: tailscale           # optional: publish ports only on this host network
       node_classes: {services: processing}  # optional: spec node class -> class used here
+    services: [certlog, dns]            # optional: apply only these services here
 
 A section may be left out when the steps that need it are skipped.
+
+``services`` makes promotion explicit: a new service.yml reaches this environment
+only once it is listed. Unset, every service is applied. A service taken off the
+list is treated like a deleted one: its resources show up as stale and are removed
+only with ``--prune``.
 """
 
 from __future__ import annotations
@@ -102,6 +108,7 @@ class Environment(_Model):
     clickhouse: ClickHouse | None = None
     grafana: Grafana | None = None
     jobs: Jobs | None = None
+    services: list[str] | None = None
 
 
 # Per step: the sections it needs.
