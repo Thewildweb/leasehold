@@ -117,16 +117,43 @@ def _dedupe(items: list[UpsertItem]) -> list[UpsertItem]:
     return list(merged.values())
 
 
+# The priorities with pending tasks, by skip-scan on tasks_pending (one index probe per
+# distinct priority), then each priority's due tasks in due order. One ORDER BY over
+# (priority DESC, next_due_at) would walk past every pending task of a higher priority
+# that isn't due yet (retries in backoff, tasks scheduled later) before reaching due
+# tasks of a lower one.
 _PICK = """
+    RECURSIVE prios AS (
+      SELECT (SELECT t.priority FROM {s}.tasks t
+              WHERE t.task_type = ANY(%(types)s) AND t.status = 'pending'
+              ORDER BY t.priority DESC LIMIT 1) AS p
+      UNION ALL
+      SELECT (SELECT t.priority FROM {s}.tasks t
+              WHERE t.task_type = ANY(%(types)s) AND t.status = 'pending'
+                AND t.priority < prios.p
+              ORDER BY t.priority DESC LIMIT 1)
+      FROM prios
+      WHERE prios.p IS NOT NULL
+    ),
+    candidates AS (
+      SELECT c.task_type, c.key, c.priority, c.next_due_at
+      FROM prios
+      CROSS JOIN LATERAL (
+        SELECT t.task_type, t.key, t.priority, t.next_due_at
+        FROM {s}.tasks t
+        WHERE t.task_type = ANY(%(types)s) AND t.status = 'pending'
+          AND t.priority = prios.p
+          AND t.next_due_at <= now()
+        ORDER BY t.next_due_at
+        LIMIT %(limit)s
+        FOR UPDATE OF t SKIP LOCKED
+      ) c
+      WHERE prios.p IS NOT NULL
+    ),
     picked AS (
-      SELECT t.task_type, t.key
-      FROM {s}.tasks t
-      WHERE t.task_type = ANY(%(types)s)
-        AND t.status = 'pending'
-        AND t.next_due_at <= now()
-      ORDER BY t.priority DESC, t.next_due_at
+      SELECT task_type, key FROM candidates
+      ORDER BY priority DESC, next_due_at
       LIMIT %(limit)s
-      FOR UPDATE OF t SKIP LOCKED
     )
 """
 
@@ -573,6 +600,40 @@ class Frontier:
                         FROM expired, {s}.task_types tt
                         WHERE t.task_type = expired.task_type AND t.key = expired.key
                           AND tt.name = t.task_type
+                        """
+                    ),
+                    {"batch": batch},
+                )
+                n = cur.rowcount
+            total += n
+            if n < batch:
+                return total
+
+    async def purge_done(self, conn: AsyncConnection, batch: int = 10_000) -> int:
+        """Delete done tasks older than their task type's ``keep_done``, in batches.
+        Returns the number deleted."""
+        total = 0
+        while True:
+            async with conn.transaction():
+                cur = await conn.execute(
+                    self._q(
+                        """
+                        WITH old AS (
+                          SELECT t.task_type, t.key
+                          FROM {s}.task_types tt
+                          CROSS JOIN LATERAL (
+                            SELECT task_type, key FROM {s}.tasks
+                            WHERE task_type = tt.name AND status = 'done'
+                              AND last_done_at < now() - tt.keep_done
+                            LIMIT %(batch)s
+                          ) t
+                          WHERE tt.keep_done IS NOT NULL
+                          LIMIT %(batch)s
+                        )
+                        DELETE FROM {s}.tasks t
+                        USING old
+                        WHERE t.task_type = old.task_type AND t.key = old.key
+                          AND t.status = 'done'
                         """
                     ),
                     {"batch": batch},

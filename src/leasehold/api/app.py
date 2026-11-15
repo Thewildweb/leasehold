@@ -321,6 +321,26 @@ def create_app(
             finally:
                 await conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))
 
+    async def purge_once() -> None:
+        async with pool.connection() as conn:
+            got = (
+                await (
+                    await conn.execute(
+                        "SELECT pg_try_advisory_lock(hashtext(%s))", (lock_key + ":purge",)
+                    )
+                ).fetchone()
+            )[0]
+            if not got:
+                return
+            try:
+                n = await frontier.purge_done(conn)
+                if n:
+                    log.info("deleted %d done tasks past keep_done", n)
+            finally:
+                await conn.execute(
+                    "SELECT pg_advisory_unlock(hashtext(%s))", (lock_key + ":purge",)
+                )
+
     async def stats_once() -> None:
         async with pool.connection() as conn:
             for s in await frontier.stats(conn):
@@ -344,6 +364,7 @@ def create_app(
         tasks = [
             asyncio.create_task(background("sweeper", settings.sweep_interval, sweep_once)),
             asyncio.create_task(background("stats", settings.stats_interval, stats_once)),
+            asyncio.create_task(background("purge", settings.purge_interval, purge_once)),
             asyncio.create_task(inbox_table()),
         ]
         try:
@@ -364,6 +385,7 @@ def create_app(
     app.state.metrics = metrics
     app.state.sweep_once = sweep_once
     app.state.stats_once = stats_once
+    app.state.purge_once = purge_once
     app.state.inbox = inbox
 
     @app.exception_handler(AuthError)

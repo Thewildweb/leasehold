@@ -291,6 +291,7 @@ def _nomad_plan(args: argparse.Namespace):
         kafka_bootstrap=args.kafka_bootstrap,
         node_pool=args.node_pool,
         host_network=args.host_network,
+        clickhouse_url=args.clickhouse_url,
     )
     try:
         naming.image_ref(args.registry, "x", "x", args.sha)
@@ -338,8 +339,8 @@ def _cmd_nomad_apply(args: argparse.Namespace) -> int:
         steps.nomad, specs, args.env, url=args.url, token=os.environ.get(args.token_env),
         sha=args.sha, registry=args.registry, api_url=args.api_url,
         kafka_bootstrap=args.kafka_bootstrap, node_pool=args.node_pool,
-        host_network=args.host_network, only=set(args.only or []) or None,
-        yes=args.yes, prune=args.prune,
+        host_network=args.host_network, clickhouse_url=args.clickhouse_url,
+        only=set(args.only or []) or None, yes=args.yes, prune=args.prune,
     )  # fmt: skip
 
 
@@ -487,7 +488,9 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             print, specs, e.env, url=e.nomad.url, token=secrets["nomad"], sha=args.sha,
             registry=e.jobs.registry, api_url=e.jobs.api_url,
             kafka_bootstrap=e.kafka.clients, node_pool=e.jobs.node_pool,
-            host_network=e.jobs.host_network, node_classes=e.jobs.node_classes, **kw,
+            host_network=e.jobs.host_network, node_classes=e.jobs.node_classes,
+            clickhouse_url=e.jobs.clickhouse_url or (e.clickhouse.url if e.clickhouse else None),
+            **kw,
         ),
     }  # fmt: skip
 
@@ -534,6 +537,18 @@ def _cmd_mock_ctlog(args: argparse.Namespace) -> int:
     from leasehold.mocks import ctlog
 
     return ctlog.main(args)
+
+
+def _cmd_suffix_list(args: argparse.Namespace) -> int:
+    from leasehold.keys import clickhouse_suffix_list
+
+    text = clickhouse_suffix_list()
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(text)
+    else:
+        sys.stdout.write(text)
+    return 0
 
 
 def _cmd_schema(args: argparse.Namespace) -> int:
@@ -655,6 +670,7 @@ def build_parser() -> argparse.ArgumentParser:
         x.add_argument("--kafka-bootstrap", help="needed when a component uses Kafka")
         x.add_argument("--node-pool", help="Nomad node pool for these jobs (default pool)")
         x.add_argument("--host-network", help="Nomad host network for the http port")
+        x.add_argument("--clickhouse-url", help="ClickHouse HTTP interface, for planners")
 
     nmp = nmsub.add_parser("plan", help="show the jobs for an environment")
     nomad_common(nmp)
@@ -764,6 +780,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="requests per second per client and operator; 0 = no limit")  # fmt: skip
     mct.add_argument("--max-entries", type=int, default=1000, help="entries per get-entries")
     mct.set_defaults(func=_cmd_mock_ctlog)
+
+    sl = sub.add_parser(
+        "suffix-list",
+        help="write the public suffix list normalize_domain uses, in ClickHouse's format",
+    )
+    sl.add_argument("out", nargs="?", help="file to write (default: stdout)")
+    sl.set_defaults(func=_cmd_suffix_list)
 
     a = sub.add_parser("api", help="the control API")
     asub = a.add_subparsers(dest="api_command", required=True)

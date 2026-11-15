@@ -1,0 +1,9 @@
+<!-- The Public Suffix List as a custom TLD list, for
+     cutToFirstSignificantSubdomainCustom(name, 'public_suffix_list'). Read at startup
+     only. The file is written by `leasehold suffix-list`. -->
+<clickhouse>
+    <top_level_domains_path>/etc/clickhouse-server/top_level_domains/</top_level_domains_path>
+    <top_level_domains_lists>
+        <public_suffix_list>public_suffix_list.dat</public_suffix_list>
+    </top_level_domains_lists>
+</clickhouse>

@@ -354,3 +354,33 @@ def test_stats(env):
     assert (s.eligible, s.eligible_capped, s.leased, s.dead) == (20, True, 5, 0)
     assert s.rows_estimate == 30
     assert stats["jobs.once"].eligible == 0
+
+
+def test_lease_skips_not_due_higher_priorities(env):
+    f = Frontier(env)
+    future = datetime.now(UTC) + timedelta(hours=1)
+    items = [UpsertItem(f"later{i}", priority=90, due_at=future) for i in range(50)]
+    items += [UpsertItem("due-mid", priority=50), UpsertItem("due-low", priority=10)]
+    run(lambda c: f.upsert(c, "jobs.once", items, "t"))
+    leased = run(lambda c: f.lease(c, ["jobs.once"], 10, "w"))
+    assert [t["key"] for t in leased] == ["due-mid", "due-low"]
+    assert run(lambda c: f.lease(c, ["jobs.once"], 10, "w")) == []
+
+
+def test_purge_done_only_past_keep_done(env):
+    f = Frontier(env)
+    run(lambda c: f.upsert(c, "jobs.once", [UpsertItem("old"), UpsertItem("new")], "t"))
+    for t in run(lambda c: f.lease(c, ["jobs.once"], 2, "w")):
+        ref = LeaseRef("jobs.once", t["key"], t["lease_id"])
+        run(lambda c, ref=ref: f.ack(c, [AckItem(ref, uuid.uuid4())]))
+    # Without keep_done nothing goes.
+    assert run(lambda c: f.purge_done(c)) == 0
+    _sql(env, "UPDATE {s}.task_types SET keep_done = '1 hour' WHERE name = 'jobs.once'")
+    _sql(
+        env,
+        "UPDATE {s}.tasks SET last_done_at = now() - interval '2 hours' "
+        "WHERE task_type = 'jobs.once' AND key = 'old'",
+    )
+    assert run(lambda c: f.purge_done(c, batch=1)) == 1
+    assert _row(env, "jobs.once", "old") is None
+    assert _row(env, "jobs.once", "new")[0] == "done"

@@ -141,3 +141,22 @@ def test_normalize_url_default_scheme():
 def test_normalize_url_rejects(value):
     with pytest.raises(InvalidKey):
         normalize_url(value)
+
+
+def test_clickhouse_suffix_list():
+    from leasehold.keys import clickhouse_suffix_list
+
+    rules = clickhouse_suffix_list().splitlines()
+    assert "us.cc" in rules and "*.kawasaki.jp" in rules and "!city.kawasaki.jp" in rules
+    assert "公司.cn" in rules and "xn--55qx5d.cn" in rules  # punycode next to Unicode
+
+
+def test_dev_stack_suffix_list_is_current():
+    # The dev ClickHouse mounts this file; regenerate it after a publicsuffixlist bump:
+    #   leasehold suffix-list dev/clickhouse/top_level_domains/public_suffix_list.dat
+    from pathlib import Path
+
+    from leasehold.keys import clickhouse_suffix_list
+
+    path = Path(__file__).parent.parent / "dev/clickhouse/top_level_domains/public_suffix_list.dat"
+    assert path.read_text(encoding="utf-8") == clickhouse_suffix_list()

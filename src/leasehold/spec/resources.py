@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from leasehold import naming
-from leasehold.spec.models import Processor, ServiceSpec
+from leasehold.spec.models import Processor, Scheduled, ServiceSpec
 
 FRONTIER_SCHEMA = "frontier"
 
@@ -19,7 +19,11 @@ def resource_names(spec: ServiceSpec, env: str) -> list[tuple[str, str, str]]:
         rows.append(("kafka principal", cname, naming.kafka_principal(env, spec.name, cname)))
         if isinstance(c, Processor):
             rows.append(("consumer group", cname, naming.consumer_group(env, spec.name, cname)))
-    for tname in spec.kafka.produces:
+        if isinstance(c, Scheduled) and c.planner is not None:
+            rows.append(
+                ("clickhouse user", cname, naming.planner_clickhouse_user(env, spec.name, cname))
+            )
+    for tname in spec.topics():
         rows.append(("topic", tname, naming.topic_for(env, spec.topic_ref(tname))))
     for ref in sorted(spec.consumed_topic_refs()):
         rows.append(("reads topic", str(ref), naming.topic_for(env, ref)))
@@ -30,5 +34,10 @@ def resource_names(spec: ServiceSpec, env: str) -> list[tuple[str, str, str]]:
         rows.append(("clickhouse database", spec.clickhouse.database, db))
         for sname in spec.clickhouse.sinks:
             rows.append(("clickhouse sink", sname, f"{db}.{sname}"))
+        if spec.plan_log_ref() is not None:
+            for sname in (naming.PLAN_LOG_KEYS_SINK, naming.PLAN_LOG_RUNS_SINK):
+                rows.append(("clickhouse sink", "(plan log)", f"{db}.{sname}"))
+        for name in spec.clickhouse.shared:
+            rows.append(("shared table", name, f"{db}.{name}"))
     rows.append(("object prefix", "-", naming.object_prefix(env, spec.name)))
     return rows

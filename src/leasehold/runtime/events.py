@@ -107,16 +107,16 @@ class EventProducer:
         """``models``: per topic name, instead of importing each ``payload_model``."""
         self.cfg = cfg
         spec = cfg.spec
-        self.allowed = set(cfg.component_spec.produces)
+        self.allowed = cfg.component_spec.topics_produced()
         self.topics = {
             name: (naming.topic_for(cfg.env, spec.topic_ref(name)), t)
-            for name, t in spec.kafka.produces.items()
+            for name, t in spec.topics().items()
         }
         self.models = (
             models
             if models is not None
             else payloads.load_models(
-                {name: spec.kafka.produces[name].payload_model for name in sorted(self.allowed)}
+                {name: self.topics[name][1].payload_model for name in sorted(self.allowed)}
             )
         )
         self._producer = producer or Producer(

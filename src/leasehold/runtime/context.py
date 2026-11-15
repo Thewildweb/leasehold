@@ -41,7 +41,7 @@ class Context:
 
     def upsert(self, task_type: str, tasks: Sequence[NewTask], reopen: bool = False):
         """Create tasks of one of this service's task types (in ``creates_tasks``)."""
-        if task_type not in self.cfg.component_spec.creates_tasks:
+        if task_type not in self.cfg.component_spec.task_types_created():
             raise ConfigError(
                 f"{self.cfg.name} may not create {task_type}; add it to creates_tasks"
             )
@@ -90,8 +90,8 @@ def build(
     if comp.kind != kind:
         raise ConfigError(f"{cfg.name} is a {comp.kind}, not a {kind}")
     logger = lh_log.setup(cfg.service, cfg.component, cfg.env, cfg.version, cfg.instance)
-    if client is None and (kind == "task-worker" or comp.creates_tasks):
+    if client is None and (kind == "task-worker" or comp.task_types_created()):
         client = ControlClient.from_env()
-    if producer is None and comp.produces:
+    if producer is None and comp.topics_produced():
         producer = EventProducer(cfg)
     return Context(cfg, client=client, producer=producer, logger=logger)

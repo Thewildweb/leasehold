@@ -158,6 +158,7 @@ def clickhouse(
     only used in a dry run, so the plan shows what the real run will do.
     """
     from leasehold import clickhouse as lh_clickhouse
+    from leasehold.clickhouse import users as lh_users
     from leasehold.clickhouse.apply import ClickHouse, apply, diff
     from leasehold.nomad.apply import Nomad
 
@@ -192,15 +193,30 @@ def clickhouse(
         for c in d.changes:
             out(f"sink     {c}")
         prunable = [n for n, e in d.stale if e in ("MaterializedView", "Kafka")]
+
+        planner_users = lh_users.plan([s for s, _ in services], env)
+        ud = lh_users.diff(ch, nomad, planner_users, env, sorted(s.name for s, _ in services))
+        if ud.profile_missing:
+            out(f"create   settings profile {lh_users.PROFILE}")
+        for c in ud.changes:
+            out(str(c))
+        for name in ud.stale:
+            _stale(out, f"clickhouse user {name}", prune, "drops")
+
         r = Result(
             changes=len(d.new_databases)
             + len(d.errors_tables)
             + len(d.changes)
-            + (len(prunable) if prune else 0),  # fmt: skip
+            + (len(prunable) if prune else 0)
+            + int(ud.profile_missing)
+            + len(ud.changes)
+            + (len(ud.stale) if prune else 0),  # fmt: skip
             skipped=list(d.skipped),
         )
         if yes and r.changes:
             apply(ch, d, kafka_bootstrap, passwords, prune=prune)
+            # After the sinks: the planners' own databases exist by now.
+            lh_users.apply(ch, nomad, ud, prune=prune)
             r.applied = True
     finally:
         ch.close()
@@ -263,6 +279,7 @@ def nomad(
     node_pool: str | None = None,
     host_network: str | None = None,
     node_classes: dict[str, str] | None = None,
+    clickhouse_url: str | None = None,
     only: set[str] | None = None,
     yes: bool,
     prune: bool,
@@ -278,6 +295,7 @@ def nomad(
         node_pool=node_pool,
         host_network=host_network,
         node_classes=node_classes or {},
+        clickhouse_url=clickhouse_url,
     )
     naming.image_ref(registry, "x", "x", sha)  # checks the SHA and registry
     p = lh_nomad.plan(specs, env, sha, platform)

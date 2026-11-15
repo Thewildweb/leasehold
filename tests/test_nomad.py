@@ -335,3 +335,27 @@ def test_node_classes(spec):
     unrelated = Platform(**{**PLATFORM.__dict__, "node_classes": {"nope": "other"}})
     job = render_job(spec, "worker", "dev", SHA, unrelated).job
     assert job["Constraints"][0]["RTarget"] == original
+
+
+def test_planner_job_env():
+    import dataclasses
+
+    from test_kafka_plan import _with_planner
+
+    from leasehold.nomad import plan as nomad_plan
+
+    s = _with_planner()
+    with pytest.raises(ValueError, match="ClickHouse URL"):
+        nomad_plan([s], "dev", SHA, PLATFORM)
+    p = nomad_plan(
+        [s],
+        "dev",
+        SHA,
+        dataclasses.replace(PLATFORM, clickhouse_url="http://ch:8123", databases={"x": "y"}),
+    )
+    (job,) = [j for j in p.jobs if j.component == "plan-recheck"]
+    env = job.job["TaskGroups"][0]["Tasks"][0]["Env"]
+    assert env["LEASEHOLD_CLICKHOUSE_URL"] == "http://ch:8123"
+    assert env["LEASEHOLD_PLANNER_DATABASES"] == "{}"  # reads only its own tables
+    # The job reads its Nomad Variable (Kafka for the plan log, ClickHouse password).
+    assert job.job["TaskGroups"][0]["Tasks"][0]["Templates"]

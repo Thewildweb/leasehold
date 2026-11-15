@@ -54,7 +54,7 @@ class KafkaPlan:
 
 
 def _topic_configs(spec: ServiceSpec, topic_name: str) -> tuple[tuple[str, str], ...]:
-    t = spec.kafka.produces[topic_name]
+    t = spec.topics()[topic_name]
     configs = {
         "cleanup.policy": "delete",
         "retention.ms": str(int(t.retention.total_seconds() * 1000)),
@@ -76,7 +76,7 @@ def plan(specs: Iterable[ServiceSpec], env: str) -> KafkaPlan:
             acls.add(AclPlan(f"User:{user}", resource_type, resource, op))
 
     for spec in specs:
-        for tname, t in spec.kafka.produces.items():
+        for tname, t in spec.topics().items():
             result.topics.append(
                 TopicPlan(
                     name=naming.topic_for(env, spec.topic_ref(tname)),
@@ -87,7 +87,7 @@ def plan(specs: Iterable[ServiceSpec], env: str) -> KafkaPlan:
 
         for cname, c in spec.components.items():
             user = naming.kafka_principal(env, spec.name, cname)
-            for tname in c.produces:
+            for tname in sorted(c.topics_produced()):
                 topic = naming.topic_for(env, spec.topic_ref(tname))
                 grant(user, "TOPIC", topic, "WRITE", "DESCRIBE")
             if isinstance(c, Processor):
@@ -99,7 +99,7 @@ def plan(specs: Iterable[ServiceSpec], env: str) -> KafkaPlan:
 
         if spec.clickhouse:
             user = naming.clickhouse_sink_principal(env, spec.name)
-            for sname, sink in spec.clickhouse.sinks.items():
+            for sname, sink in spec.sinks().items():
                 ref = spec.sink_topic_ref(sink.topic)
                 grant(user, "TOPIC", naming.topic_for(env, ref), "READ", "DESCRIBE")
                 grant(user, "GROUP", naming.clickhouse_sink_group(env, spec.name, sname), "READ")

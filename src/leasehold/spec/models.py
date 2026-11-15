@@ -24,7 +24,14 @@ import re
 from datetime import timedelta
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from leasehold import naming
 from leasehold.types import (
@@ -119,6 +126,21 @@ class _ComponentBase(_Strict):
         "keep their own rate limit per egress IP: instances on one machine share its IP",
     )
 
+    def topics_produced(self) -> set[str]:
+        """``produces``, plus the plan log for a planner."""
+        produced = set(self.produces)
+        if getattr(self, "planner", None) is not None:
+            produced.add(naming.PLAN_LOG_TOPIC)
+        return produced
+
+    def task_types_created(self) -> set[str]:
+        """``creates_tasks``, plus a planner's task type."""
+        created = set(self.creates_tasks)
+        planner = getattr(self, "planner", None)
+        if planner is not None:
+            created.add(planner.task_type)
+        return created
+
     @field_validator("env")
     @classmethod
     def _no_secrets_in_env(cls, value: dict[str, str]) -> dict[str, str]:
@@ -155,6 +177,38 @@ _CRON_FIELD = re.compile(r"^(\*|\d+(-\d+)?)(/\d+)?(,(\*|\d+(-\d+)?)(/\d+)?)*$")
 _CRON_MACROS = {"@hourly", "@daily", "@weekly", "@monthly"}
 
 
+TableRefStr = Annotated[
+    str, StringConstraints(pattern=rf"^{naming.KEBAB}\.{naming.SNAKE}$", max_length=100)
+]
+
+
+class Planner(_Strict):
+    """Tops up a task type's backlog in the frontier from a selection in ClickHouse.
+
+    ``run_planner`` reads the backlog (eligible + leased tasks of ``task_type``) and,
+    when it is below ``backlog_target``, asks the service's ``select`` for at most
+    ``min(batch_max, backlog_target - backlog)`` keys, upserts them with ``priority``
+    and records them in the service's plan log.
+    """
+
+    task_type: TaskTypeName = Field(description="One of this service's task types")
+    reads: list[TableRefStr] = Field(
+        default_factory=list,
+        description="ClickHouse tables the selection reads, as '<service>.<table>': this "
+        "service's own sinks and shared tables, or another service's shared tables",
+    )
+    backlog_target: int = Field(gt=0, description="Waiting + leased tasks to keep in the frontier")
+    batch_max: int = Field(default=50_000, gt=0, description="Most keys queued in one run")
+    priority: int = Field(ge=0, le=100, description="Priority of the tasks this planner queues")
+    exclude_planned_for: Duration | None = Field(
+        default=None,
+        description="Skip keys this planner queued less than this long ago (from the plan log)",
+    )
+
+    def read_services(self) -> set[str]:
+        return {r.split(".", 1)[0] for r in self.reads}
+
+
 class Scheduled(_ComponentBase):
     """A periodic job (Nomad periodic batch), e.g. a planner that creates tasks."""
 
@@ -162,6 +216,9 @@ class Scheduled(_ComponentBase):
     schedule: str = Field(description="Cron expression (5 fields) or @hourly/@daily/…")
     timeout: Duration = Field(
         default=timedelta(minutes=10), description="A run longer than this is killed"
+    )
+    planner: Planner | None = Field(
+        default=None, description="Makes this component a planner (`run_planner`)"
     )
 
     @field_validator("schedule")
@@ -205,6 +262,25 @@ class KafkaTopic(_Strict):
     key: str | None = Field(default=None, description="Payload field used as partition key")
 
 
+PLAN_LOG = KafkaTopic(
+    payload_model="leasehold.runtime.planner:PlanLogEntry",
+    version=naming.PLAN_LOG_VERSION,
+    partitions=3,
+    retention=timedelta(days=7),
+    key="planner",
+)
+
+
+def plan_log_sinks() -> dict[str, Sink]:
+    from pathlib import Path
+
+    here = Path(__file__).resolve().parent.parent / "clickhouse" / "plan_log"
+    return {
+        name: Sink(topic=naming.PLAN_LOG_TOPIC, schema_file=str(here / f"{name}.sql"))
+        for name in (naming.PLAN_LOG_KEYS_SINK, naming.PLAN_LOG_RUNS_SINK)
+    }
+
+
 class KafkaSection(_Strict):
     produces: dict[TopicName, KafkaTopic] = Field(default_factory=dict)
 
@@ -242,6 +318,12 @@ class TaskType(_Strict):
         "table is created; use more than 1 for task types with tens of millions of rows",
     )
     payload_model: str | None = None
+    keep_done: Duration | None = Field(
+        default=None,
+        description="Delete done tasks this long after they were done. For one-shot task "
+        "types fed by a planner, whose memory of what was done is in ClickHouse. "
+        "None = keep them (the frontier itself remembers what was done)",
+    )
 
     @model_validator(mode="after")
     def _limits(self) -> TaskType:
@@ -249,6 +331,8 @@ class TaskType(_Strict):
             raise ValueError("retry_backoff_max must be >= retry_backoff")
         if self.lease_duration < timedelta(seconds=10):
             raise ValueError("lease_duration must be at least 10s")
+        if self.keep_done is not None and self.recrawl_interval is not None:
+            raise ValueError("keep_done is for one-shot task types; recurring tasks are never done")
         return self
 
 
@@ -273,9 +357,24 @@ class Sink(_Strict):
     )
 
 
+class SharedTable(_Strict):
+    """One of this service's sinks that other services' planners may read. Its columns
+    are the contract. (Views come later, when a service must hide columns: they need a
+    definer user per service, so readers don't need grants on the tables underneath.)"""
+
+    description: str = Field(min_length=1)
+
+
 class ClickHouseSection(_Strict):
     database: SnakeName
     sinks: dict[SnakeName, Sink] = Field(default_factory=dict)
+    shared: dict[SnakeName, SharedTable] = Field(
+        default_factory=dict, description="Sinks other services' planners may read"
+    )
+
+    def tables(self) -> set[str]:
+        """Names of this service's own tables (its sinks)."""
+        return set(self.sinks)
 
 
 # --- Destinations (non-target rate budgets) ---------------------------------------------------
@@ -478,12 +577,20 @@ class ServiceSpec(_Strict):
     alerts: Alerts = Field(default_factory=Alerts)
     dashboards: DashboardsSection = Field(default_factory=DashboardsSection)
 
+    def topics(self) -> dict[str, KafkaTopic]:
+        """This service's topics: those in ``kafka.produces``, and the plan log when the
+        service has a planner."""
+        topics = dict(self.kafka.produces)
+        if self.planners():
+            topics[naming.PLAN_LOG_TOPIC] = PLAN_LOG
+        return topics
+
     def topic_ref(self, topic_name: str) -> naming.TopicRef:
         """Reference to one of this service's own topics."""
-        return naming.TopicRef(self.name, topic_name, self.kafka.produces[topic_name].version)
+        return naming.TopicRef(self.name, topic_name, self.topics()[topic_name].version)
 
     def own_topic_refs(self) -> set[naming.TopicRef]:
-        return {self.topic_ref(t) for t in self.kafka.produces}
+        return {self.topic_ref(t) for t in self.topics()}
 
     def consumed_topic_refs(self) -> set[naming.TopicRef]:
         """Topics read by this service's processors and ClickHouse sinks (any service)."""
@@ -491,9 +598,8 @@ class ServiceSpec(_Strict):
         for c in self.components.values():
             if isinstance(c, Processor):
                 refs.update(naming.TopicRef.parse(r) for r in c.consumes)
-        if self.clickhouse:
-            for sink in self.clickhouse.sinks.values():
-                refs.add(self.sink_topic_ref(sink.topic))
+        for sink in self.sinks().values():
+            refs.add(self.sink_topic_ref(sink.topic))
         return refs
 
     def sink_topic_ref(self, topic: str) -> naming.TopicRef:
@@ -530,7 +636,7 @@ class ServiceSpec(_Strict):
                 if t not in own_topics:
                     yield f"{where}.produces: unknown topic {t!r}; declare it under kafka.produces"
                 produced.add(t)
-            for tt in c.creates_tasks:
+            for tt in c.task_types_created():
                 if tt not in own_tasks:
                     yield (
                         f"{where}.creates_tasks: {tt!r} is not one of this service's task types; "
@@ -546,6 +652,8 @@ class ServiceSpec(_Strict):
                     consumed_tasks.add(tt)
                 if c.scaling and c.scaling.metric != "eligible_tasks":
                     yield f"{where}.scaling.metric: task-workers scale on 'eligible_tasks'"
+            if isinstance(c, Scheduled) and c.planner is not None:
+                yield from self._check_planner(c.planner, f"{where}.planner")
             if isinstance(c, Processor):
                 for ref_str in c.consumes:
                     ref = naming.TopicRef.parse(ref_str)
@@ -575,6 +683,19 @@ class ServiceSpec(_Strict):
                 elif sink.topic not in own_topics:
                     yield f"{where}: unknown topic {sink.topic!r}; declare it under kafka.produces"
 
+        for t in sorted(set(own_topics) & naming.RESERVED_TOPIC_NAMES):
+            yield f"kafka.produces.{t}: the topic name {t!r} is reserved (the plan log)"
+        if self.clickhouse:
+            reserved = naming.RESERVED_SINK_NAMES
+            for name in sorted(self.clickhouse.tables() & reserved):
+                yield f"clickhouse: the table name {name!r} is reserved (the plan log)"
+            for name in self.clickhouse.shared:
+                if name not in self.clickhouse.sinks:
+                    yield (
+                        f"clickhouse.shared.{name}: not a sink of this service; "
+                        "only sinks can be shared"
+                    )
+
         for exp in self.expects:
             where = f"expects.{exp.name}.sql"
             if self.clickhouse is None:
@@ -603,6 +724,50 @@ class ServiceSpec(_Strict):
         for rule in self.alerts.rules:
             if rule.component is not None and rule.component not in self.components:
                 yield f"alerts.rules.{rule.name}.component: unknown component {rule.component!r}"
+
+    def sinks(self) -> dict[str, Sink]:
+        """``clickhouse.sinks``, plus the plan log's two sinks when the service has a planner.
+
+        The plan log's schema files ship with leasehold; their paths are absolute.
+        """
+        if self.clickhouse is None:
+            return {}
+        sinks = dict(self.clickhouse.sinks)
+        if self.planners():
+            sinks |= plan_log_sinks()
+        return sinks
+
+    def planners(self) -> dict[str, Planner]:
+        return {
+            n: c.planner
+            for n, c in self.components.items()
+            if isinstance(c, Scheduled) and c.planner is not None
+        }
+
+    def plan_log_ref(self) -> naming.TopicRef | None:
+        """The plan log topic, which apply creates when the service has a planner."""
+        if not self.planners():
+            return None
+        return self.topic_ref(naming.PLAN_LOG_TOPIC)
+
+    def _check_planner(self, planner: Planner, where: str):
+        if planner.task_type not in self.frontier.task_types:
+            yield (
+                f"{where}.task_type: {planner.task_type!r} is not one of this service's task "
+                "types; a planner only queues its own service's work"
+            )
+        if self.clickhouse is None:
+            yield f"{where}: a planner needs a clickhouse section (its plan log lives there)"
+            return
+        own = self.clickhouse.tables() | naming.RESERVED_SINK_NAMES
+        for ref in planner.reads:
+            service, table = ref.split(".", 1)
+            if service == self.name and table not in own:
+                yield (
+                    f"{where}.reads: {ref!r}: this service has no sink or shared table {table!r}"
+                )
+        if len(set(planner.reads)) != len(planner.reads):
+            yield f"{where}.reads: a table is listed twice"
 
     def _check_own_ref(self, ref: naming.TopicRef, where: str):
         topic = self.kafka.produces.get(ref.name)

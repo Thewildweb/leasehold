@@ -91,6 +91,7 @@ class Jobs(_Model):
     node_pool: str | None = None  # Nomad node pool; unset: the default pool
     host_network: str | None = None  # Nomad host network for the http port, e.g. tailscale
     node_classes: dict[str, str] = {}  # spec node class -> node class in this environment
+    clickhouse_url: str | None = None  # ClickHouse HTTP interface for planners
 
 
 class Environment(_Model):

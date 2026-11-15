@@ -220,3 +220,17 @@ def test_stale_and_prune(chplan):
         "DROP TABLE IF EXISTS dev_certwatch.old_mv SYNC",
         "DROP TABLE IF EXISTS dev_certwatch.old_kafka SYNC",
     ]
+
+
+def test_plan_log_sinks_parse_and_are_planned():
+    from test_kafka_plan import _with_planner
+
+    from leasehold.spec.models import plan_log_sinks
+
+    for sink in plan_log_sinks().values():
+        parse(Path(sink.schema_file).read_text())
+    p = clickhouse.plan([(_with_planner(), FIXTURES / "certwatch")], "dev")
+    names = {s.table for s in p.sinks()}
+    assert {"dev_certwatch.planned", "dev_certwatch.planner_runs"} <= names
+    (s,) = [s for s in p.sinks() if s.sink == "planned"]
+    assert s.topic == "dev.certwatch.planned.v1"

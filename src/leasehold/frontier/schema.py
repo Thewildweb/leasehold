@@ -102,6 +102,15 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        3,
+        [
+            # Done rows older than this are deleted (NULL: kept). For task types whose
+            # memory of what was done lives elsewhere (planners select from ClickHouse).
+            "ALTER TABLE {s}.task_types ADD COLUMN keep_done interval",
+            "CREATE INDEX tasks_done ON {s}.tasks (last_done_at) WHERE status = 'done'",
+        ],
+    ),
 ]
 
 LATEST = MIGRATIONS[-1][0]
@@ -175,6 +184,7 @@ _SETTINGS = (
     "lease_duration",
     "default_priority",
     "capabilities",
+    "keep_done",
 )
 
 
@@ -189,6 +199,7 @@ def _desired_row(service: str, tt: TaskType) -> dict:
         "lease_duration": tt.lease_duration,
         "default_priority": tt.default_priority,
         "capabilities": list(tt.capabilities),
+        "keep_done": tt.keep_done,
         "hash_partitions": tt.hash_partitions,
     }
 

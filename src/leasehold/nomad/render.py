@@ -76,6 +76,10 @@ class Platform:
     node_classes: dict[str, str] = field(default_factory=dict, hash=False)
     # Topic reference → payload model, for every topic; ``plan`` fills it in.
     payload_models: dict[str, str] = field(default_factory=dict, hash=False)
+    # ClickHouse HTTP interface, for planners.
+    clickhouse_url: str | None = None
+    # Service → its ClickHouse database (without environment prefix); ``plan`` fills it in.
+    databases: dict[str, str] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)
@@ -101,7 +105,7 @@ class NomadPlan:
 
 
 def uses_kafka(c: Component) -> bool:
-    return bool(c.produces) or isinstance(c, Processor)
+    return bool(c.topics_produced()) or isinstance(c, Processor)
 
 
 def job_variable_path(job_id: str) -> str:
@@ -145,6 +149,16 @@ def _env(
         out["LEASEHOLD_PAYLOAD_MODELS"] = json.dumps(models, separators=(",", ":"))
     if isinstance(c, Scheduled):
         out["LEASEHOLD_TIMEOUT_S"] = str(int(c.timeout.total_seconds()))
+    if isinstance(c, Scheduled) and c.planner is not None:
+        if not platform.clickhouse_url:
+            raise ValueError(f"{spec.name}.{cname} is a planner; set the ClickHouse URL")
+        out["LEASEHOLD_CLICKHOUSE_URL"] = platform.clickhouse_url
+        dbs = {
+            s: platform.databases[s]
+            for s in sorted(c.planner.read_services() - {spec.name})
+            if s in platform.databases
+        }
+        out["LEASEHOLD_PLANNER_DATABASES"] = json.dumps(dbs, separators=(",", ":"))
     # The spec's own env can't override the platform variables.
     clash = sorted(k for k in c.env if k in out)
     if clash:
@@ -301,11 +315,11 @@ def plan(specs: list[ServiceSpec], env: str, version: str, platform: Platform) -
     platform = replace(
         platform,
         payload_models={
-            str(s.topic_ref(name)): t.payload_model
-            for s in specs
-            for name, t in s.kafka.produces.items()
+            str(s.topic_ref(name)): t.payload_model for s in specs for name, t in s.topics().items()
         }
         | platform.payload_models,
+        databases={s.name: s.clickhouse.database for s in specs if s.clickhouse}
+        | platform.databases,
     )
     jobs = [
         render_job(spec, cname, env, version, platform)

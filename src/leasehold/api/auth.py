@@ -83,7 +83,7 @@ class Registry:
         if caller.admin:
             return set(self.task_types)
         c = self.component(caller)
-        return set(c.creates_tasks) if c else set()
+        return c.task_types_created() if c else set()
 
     def require_lease(self, caller: Caller, task_types: set[str]) -> None:
         allowed = self.leasable(caller)

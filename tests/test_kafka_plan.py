@@ -84,3 +84,37 @@ def test_component_name_clickhouse_is_reserved():
     data["components"]["clickhouse"] = data["components"].pop("planner")
     with pytest.raises(ValidationError, match="reserved"):
         ServiceSpec.model_validate(data)
+
+
+def _with_planner() -> ServiceSpec:
+    data = yaml.safe_load((FIXTURES / "certwatch" / "service.yml").read_text())
+    data["frontier"]["task_types"]["certwatch.recheck"] = {"key": "domain"}
+    data["components"]["worker"]["consumes_tasks"].append("certwatch.recheck")
+    data["components"]["plan-recheck"] = {
+        "kind": "scheduled",
+        "schedule": "@hourly",
+        "node_class": "services",
+        "resources": {"cpu": 100, "memory": 64},
+        "planner": {
+            "task_type": "certwatch.recheck",
+            "reads": ["certwatch.domains"],
+            "backlog_target": 10,
+            "priority": 50,
+        },
+    }
+    return ServiceSpec.model_validate(data)
+
+
+def test_plan_log_topic_and_acls():
+    p = kafka.plan([_with_planner()], "dev")
+    assert "dev.certwatch.planned.v1" in {t.name for t in p.topics}
+    planner = "User:dev.certwatch.plan-recheck"
+    sink = "User:dev.certwatch.clickhouse"
+    assert AclPlan(planner, "TOPIC", "dev.certwatch.planned.v1", "WRITE") in p.acls
+    assert AclPlan(sink, "TOPIC", "dev.certwatch.planned.v1", "READ") in p.acls
+    for group in ("planned", "planner_runs"):
+        assert AclPlan(sink, "GROUP", f"dev.certwatch.clickhouse.{group}", "READ") in p.acls
+    # Other components don't get the plan log.
+    assert not any(
+        a.principal == "User:dev.certwatch.worker" and "planned" in a.resource_name for a in p.acls
+    )

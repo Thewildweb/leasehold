@@ -138,6 +138,26 @@ def clickhouse_kafka_variable(service: str) -> str:
 
 RESERVED_COMPONENT_NAMES = frozenset({"clickhouse"})
 
+# The plan log: a topic per service with a planner, and its two sinks in the service's
+# database (one row per queued key, one per run). apply creates them; a service can't
+# declare these names itself.
+PLAN_LOG_TOPIC = "planned"
+PLAN_LOG_VERSION = 1
+PLAN_LOG_KEYS_SINK = "planned"
+PLAN_LOG_RUNS_SINK = "planner_runs"
+RESERVED_TOPIC_NAMES = frozenset({PLAN_LOG_TOPIC})
+RESERVED_SINK_NAMES = frozenset({PLAN_LOG_KEYS_SINK, PLAN_LOG_RUNS_SINK})
+
+
+def planner_clickhouse_user(env: str, service: str, component: str) -> str:
+    """Read-only ClickHouse user of one planner component, e.g. ``dev.dns.plan-new-nl``."""
+    return kafka_principal(env, service, component)
+
+
+def planner_clickhouse_variable(service: str, component: str) -> str:
+    """Nomad Variable path holding a planner's ClickHouse password (the job's own path)."""
+    return f"nomad/jobs/{nomad_job(service, component)}"
+
 
 def nomad_namespace(env: str) -> str:
     return "default" if check_env(env) == PROD else env

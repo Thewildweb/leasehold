@@ -16,6 +16,7 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 
 import idna
+import publicsuffixlist
 from publicsuffixlist import PublicSuffixList
 
 VERSION = 1
@@ -73,6 +74,50 @@ def _psl() -> PublicSuffixList:
     # The list ships inside the package (no network). Unknown TLDs are rejected.
     # The private section is included, so foo.github.io is its own domain.
     return PublicSuffixList(accept_unknown=False)
+
+
+# The name ClickHouse knows the list by (``top_level_domains_lists``), for
+# ``cutToFirstSignificantSubdomainCustom(name, 'public_suffix_list')``.
+CLICKHOUSE_SUFFIX_LIST = "public_suffix_list"
+
+
+def clickhouse_suffix_list() -> str:
+    """The suffix list ``normalize_domain`` uses, in the file format ClickHouse loads.
+
+    ClickHouse's built-in ``cutToFirstSignificantSubdomain`` doesn't follow the Public
+    Suffix List: it cuts ``shop.us.cc`` to ``us.cc`` and ``a.city.kawasaki.jp`` to
+    ``kawasaki.jp``. Loaded as a custom list, the same file gives the same base domain
+    as ``normalize_domain``. Rules with non-ASCII labels are added again as punycode,
+    because certificate names are punycode and ClickHouse compares bytes.
+    """
+    lines = [
+        f"// Public Suffix List from publicsuffixlist {_psl_version()}, "
+        "written by leasehold.keys.clickhouse_suffix_list.",
+        "// Rules with non-ASCII labels are repeated as punycode.",
+    ]
+    with open(publicsuffixlist.PSLFILE, encoding="utf-8") as f:
+        for line in f:
+            rule = line.split()[0] if line.strip() and not line.startswith("//") else ""
+            if not rule:
+                continue
+            lines.append(rule)
+            if not rule.isascii():
+                lines.append(_ascii_rule(rule))
+    return "\n".join(lines) + "\n"
+
+
+def _ascii_rule(rule: str) -> str:
+    prefix = "!" if rule.startswith("!") else ""
+    labels = rule.removeprefix("!").split(".")
+    return prefix + ".".join(
+        lbl if lbl == "*" else idna.encode(lbl, uts46=True).decode("ascii") for lbl in labels
+    )
+
+
+def _psl_version() -> str:
+    from importlib.metadata import version
+
+    return version("publicsuffixlist")
 
 
 def normalize_host(value: str) -> str:

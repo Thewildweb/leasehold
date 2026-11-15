@@ -230,3 +230,93 @@ def test_expect_sql_renders_per_environment():
 def test_expects_need_clickhouse(certwatch):
     del certwatch["clickhouse"]
     assert "no clickhouse section" in errors_of(certwatch)
+
+
+# --- planners and shared tables --------------------------------------------------------------
+
+
+def _resolver_with_planner(**planner) -> dict:
+    data = yaml.safe_load(RESOLVER.read_text())
+    data["components"]["plan-new"] = {
+        "kind": "scheduled",
+        "schedule": "*/5 * * * *",
+        "node_class": "services",
+        "resources": {"cpu": 200, "memory": 256},
+        "planner": {
+            "task_type": "resolver.a_record",
+            "reads": ["certwatch.domains", "resolver.known"],
+            "backlog_target": 20000,
+            "priority": 60,
+            **planner,
+        },
+    }
+    data["clickhouse"] = {
+        "database": "resolver",
+        "sinks": {"known": {"topic": "results", "schema_file": "schema/known.sql"}},
+    }
+    return data
+
+
+def _certwatch_sharing(certwatch: dict, **shared) -> ServiceSpec:
+    certwatch["clickhouse"]["shared"] = shared or {"domains": {"description": "One row per domain"}}
+    return ServiceSpec.model_validate(certwatch)
+
+
+def test_planner_valid_and_creates_its_task_type():
+    spec = ServiceSpec.model_validate(_resolver_with_planner())
+    comp = spec.components["plan-new"]
+    assert comp.planner.batch_max == 50_000
+    assert comp.task_types_created() == {"resolver.a_record"}
+    assert spec.plan_log_ref() is not None and str(spec.plan_log_ref()) == "resolver.planned.v1"
+
+
+def test_planner_task_type_must_be_own():
+    assert "a planner only queues its own service's work" in errors_of(
+        _resolver_with_planner(task_type="certwatch.chunk")
+    )
+
+
+def test_planner_needs_clickhouse():
+    data = _resolver_with_planner(reads=[])
+    del data["clickhouse"]
+    assert "a planner needs a clickhouse section" in errors_of(data)
+
+
+def test_planner_reads_unknown_own_table():
+    assert "this service has no sink or shared table 'nope'" in errors_of(
+        _resolver_with_planner(reads=["resolver.nope"])
+    )
+
+
+def test_planner_may_read_own_plan_log():
+    ServiceSpec.model_validate(_resolver_with_planner(reads=["resolver.planned"]))
+
+
+def test_reserved_plan_log_names(certwatch):
+    certwatch["clickhouse"]["sinks"]["planned"] = {
+        "topic": "entries",
+        "schema_file": "schema/domains.sql",
+    }
+    assert "the table name 'planned' is reserved" in errors_of(certwatch)
+
+
+def test_shared_must_be_a_sink(certwatch):
+    certwatch["clickhouse"]["shared"] = {"nope": {"description": "x"}}
+    assert "only sinks can be shared" in errors_of(certwatch)
+
+
+def test_registry_planner_reads_shared(certwatch):
+    resolver = ServiceSpec.model_validate(_resolver_with_planner())
+    errors = check_registry([ServiceSpec.model_validate(certwatch), resolver])
+    assert any("which certwatch doesn't share" in e for e in errors)
+    assert check_registry([_certwatch_sharing(copy.deepcopy(certwatch)), resolver]) == []
+    # Without certwatch in the set: an error, unless partial.
+    assert any("no service 'certwatch'" in e for e in check_registry([resolver]))
+    assert not any("planner" in e for e in check_registry([resolver], partial=True))
+
+
+def test_resource_names_planner():
+    rows = resource_names(ServiceSpec.model_validate(_resolver_with_planner()), "dev")
+    assert ("clickhouse user", "plan-new", "dev.resolver.plan-new") in rows
+    assert ("topic", "planned", "dev.resolver.planned.v1") in rows
+    assert ("clickhouse sink", "(plan log)", "dev_resolver.planner_runs") in rows

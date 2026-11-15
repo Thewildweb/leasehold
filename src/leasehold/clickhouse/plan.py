@@ -173,11 +173,11 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
     naming.check_env(env)
     databases = []
     for spec, base in sorted(services, key=lambda x: x[0].name):
-        if spec.clickhouse is None or not spec.clickhouse.sinks:
+        if spec.clickhouse is None or not spec.sinks():
             continue
         db = naming.clickhouse_database(env, spec.clickhouse.database)
         sinks = []
-        for sname, sink in sorted(spec.clickhouse.sinks.items()):
+        for sname, sink in sorted(spec.sinks().items()):
             schema = parse((base / sink.schema_file).read_text())
             sinks.append(
                 SinkPlan(

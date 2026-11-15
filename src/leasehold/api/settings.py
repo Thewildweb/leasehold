@@ -49,6 +49,7 @@ class Settings:
     tokens_file: Path | None = None
     sweep_interval: float = 15.0
     stats_interval: float = 30.0
+    purge_interval: float = 300.0
     clickhouse_url: str | None = None
     clickhouse_user: str = "leasehold"
     clickhouse_password: str = ""
@@ -75,6 +76,7 @@ class Settings:
             else None,
             sweep_interval=float(e.get("LEASEHOLD_SWEEP_INTERVAL", "15")),
             stats_interval=float(e.get("LEASEHOLD_STATS_INTERVAL", "30")),
+            purge_interval=float(e.get("LEASEHOLD_PURGE_INTERVAL", "300")),
             clickhouse_url=e.get("LEASEHOLD_CLICKHOUSE_URL") or None,
             clickhouse_user=e.get("LEASEHOLD_CLICKHOUSE_USER") or "leasehold",
             clickhouse_password=e.get("LEASEHOLD_CLICKHOUSE_PASSWORD", ""),
