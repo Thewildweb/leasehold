@@ -87,7 +87,9 @@ class RuntimeConfig:
             raise ConfigError(f"missing environment variables: {', '.join(missing)}")
         env = naming.check_env(e["LEASEHOLD_ENV"])
         if spec is None:
-            spec = load_spec(Path(e.get("LEASEHOLD_SERVICE_FILE", "/app/service.yml")))
+            spec = load_spec(
+                Path(e.get("LEASEHOLD_SERVICE_FILE", "/app/service.yml")), dashboards=False
+            )
         service, component = e["LEASEHOLD_SERVICE"], e["LEASEHOLD_COMPONENT"]
         if spec.name != service:
             raise ConfigError(f"service.yml is for {spec.name!r}, not {service!r}")

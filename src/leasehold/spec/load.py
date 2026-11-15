@@ -32,7 +32,12 @@ def _format(exc: ValidationError) -> list[str]:
     return out
 
 
-def load_spec(path: str | Path) -> ServiceSpec:
+def load_spec(path: str | Path, *, dashboards: bool = True) -> ServiceSpec:
+    """Load and check ``service.yml``, including the schema and dashboard files it names.
+
+    ``dashboards=False`` skips the dashboard files: components at runtime don't use them,
+    and their images need not contain them.
+    """
     path = Path(path)
     try:
         data = yaml.safe_load(path.read_text())
@@ -46,7 +51,8 @@ def load_spec(path: str | Path) -> ServiceSpec:
         spec = ServiceSpec.model_validate(data)
     except ValidationError as e:
         raise SpecError(path, _format(e)) from e
-    errors = [m for f in spec.dashboards.files if (m := _check_dashboard_file(path.parent / f))]
+    files = spec.dashboards.files if dashboards else []
+    errors = [m for f in files if (m := _check_dashboard_file(path.parent / f))]
     if spec.clickhouse:
         for sname, sink in spec.clickhouse.sinks.items():
             if m := _check_schema_file(path.parent / sink.schema_file):

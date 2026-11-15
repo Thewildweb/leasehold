@@ -51,6 +51,19 @@ def test_config_from_env(tmp_path):
     assert conf["security.protocol"] == "SASL_PLAINTEXT"
 
 
+def test_config_without_dashboard_files(tmp_path):
+    # An image has service.yml but not the dashboard files it names (dns, 2026-11-15).
+    path = tmp_path / "service.yml"
+    path.write_text(yaml.safe_dump({**RUNTIME_SPEC, "dashboards": {"files": ["d/x.json"]}}))
+    env = {
+        "LEASEHOLD_ENV": "dev",
+        "LEASEHOLD_SERVICE": "jobs",
+        "LEASEHOLD_COMPONENT": "worker",
+        "LEASEHOLD_SERVICE_FILE": str(path),
+    }
+    assert RuntimeConfig.from_env(env).component_spec.kind == "task-worker"
+
+
 @pytest.mark.parametrize(
     ("env", "message"),
     [

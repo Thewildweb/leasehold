@@ -490,7 +490,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             kafka_bootstrap=e.kafka.clients, node_pool=e.jobs.node_pool,
             host_network=e.jobs.host_network, node_classes=e.jobs.node_classes,
             clickhouse_url=e.jobs.clickhouse_url or (e.clickhouse.url if e.clickhouse else None),
-            **kw,
+            only=set(args.job) if args.job else None, **kw,
         ),
     }  # fmt: skip
 
@@ -754,6 +754,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="run only this step; repeatable")  # fmt: skip
     ap.add_argument("--skip", action="append", default=[], choices=steps.ORDER, metavar="STEP",
                     help="leave out this step; repeatable")  # fmt: skip
+    ap.add_argument("--job", action="append", metavar="JOB",
+                    help="nomad step: apply only this job; repeatable")  # fmt: skip
     ap.add_argument("--accept-table", action="append", metavar="DATABASE.TABLE",
                     help="clickhouse: record a table changed by hand; repeatable")  # fmt: skip
     ap.add_argument("--yes", action="store_true", help="apply the changes")
