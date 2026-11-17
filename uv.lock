@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 
 [[package]]
@@ -350,7 +350,7 @@ requires-dist = [
     { name = "idna", specifier = ">=3.7" },
     { name = "prometheus-client", specifier = ">=0.20" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'server'", specifier = ">=3.2" },
-    { name = "publicsuffixlist", specifier = ">=1.0" },
+    { name = "publicsuffixlist", specifier = ">=1.1.2.20261113" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'server'", specifier = ">=2.9" },
     { name = "pyyaml", specifier = ">=6.0" },
@@ -490,11 +490,11 @@ wheels = [
 
 [[package]]
 name = "publicsuffixlist"
-version = "1.1.2.20261109"
+version = "1.1.2.20261113"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a6/96/d0b67e464e06d6e25449feeb915fbcdeaf9e51a3b33a9e5a909751854aa6/publicsuffixlist-1.1.2.20261109.tar.gz", hash = "sha256:72da161a2381e991a789abea4947b2014806b05a29d2539de3fdc1f9d5dda152", size = 106752, upload-time = "2026-11-09T11:20:26.278Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fb/62/1cde468a0c78ae179c19fbf68c258a01ebc1764e02c743469744564b1a9e/publicsuffixlist-1.1.2.20261113.tar.gz", hash = "sha256:e35920e29b42f6c716d29814658b60ee2673bf02309cac375455b561e1d11da4", size = 107018, upload-time = "2026-11-13T10:50:34.205Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3c/f0/97649835b043122e827f204bf64d9470f9369be7cebd9bd67191f83d1b76/publicsuffixlist-1.1.2.20261109-py3-none-any.whl", hash = "sha256:0167843033f5732a084ff703bad9e6f1e20615bfd2ea8c4c8193d04ea1307404", size = 109517, upload-time = "2026-11-09T11:20:25.061Z" },
+    { url = "https://files.pythonhosted.org/packages/97/96/8eff034d02051ed5bd30f0f694ab2a272272c6ad72636ea464f16fa569b9/publicsuffixlist-1.1.2.20261113-py3-none-any.whl", hash = "sha256:837494f6dcb18ccb90b104b1741b25688c07a0d34a05baa9062d74cefc0c0b6e", size = 109784, upload-time = "2026-11-13T10:50:32.941Z" },
 ]
 
 [[package]]
