@@ -31,7 +31,7 @@ leasehold = "leasehold.cli:main"
 dev = [
     "leasehold[server]",
     "pytest>=8",
-    "ruff>=0.6",
+    "ruff>=0.17.5",
 ]
 
 [build-system]
