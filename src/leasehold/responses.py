@@ -84,7 +84,14 @@ class Hop(BaseModel):
         default_factory=list,
         description="Response headers in the order received, duplicates kept (one "
         "Set-Cookie per cookie). Names as sent: HTTP/1 name case is a server-stack signal, "
-        "readers lower-case them. Values cut at 2048 characters",
+        "readers lower-case them. Values cut at 2048 characters. A line is decoded as "
+        "UTF-8, or as Latin-1 when it isn't valid UTF-8 (latin1_headers)",
+    )
+    latin1_headers: list[str] = Field(
+        default_factory=list,
+        description="Names of the headers decoded as Latin-1 because they weren't valid "
+        "UTF-8 (':status' for the status line); value.encode('latin-1') gives the bytes "
+        "sent. Every other header's bytes are value.encode('utf-8')",
     )
     location: str = Field(default="", description="Location header, resolved to an absolute URL")
 
@@ -167,15 +174,28 @@ class Response(BaseModel):
     # Body of the last hop
     body: str = Field(
         default="",
-        description="Decoded text (not base64) of the first body_bytes bytes (charset from "
-        "Content-Type, then <meta charset>, then UTF-8 with replacement)",
+        description="Decoded text of the first body_bytes bytes. Charset as browsers pick "
+        "it: byte order mark, Content-Type charset, <meta charset>; nothing declared: "
+        "UTF-8 if valid, else windows-1252. Undecodable bytes are replaced (U+FFFD)",
     )
     body_bytes: int = Field(default=0, description="Bytes received, after content decoding")
     body_truncated: bool = Field(default=False, description="Cut off at the size limit")
-    body_charset: str = ""
+    body_charset: str = Field(default="", description="Python codec name used for body")
     body_decode_errors: int = Field(
-        default=0, description="Characters replaced while decoding body (binary or wrong charset)"
+        default=0,
+        description="Characters replaced while decoding body (binary, or bytes invalid in "
+        "the declared charset)",
     )
     body_sha256: str = Field(default="", description="Of the body_bytes bytes, hex")
+    body_b64: str = Field(
+        default="",
+        description="The body_bytes bytes as received (after content decoding), base64: "
+        "for readers that decode the body themselves",
+    )
+    body_text_dropped: bool = Field(
+        default=False,
+        description="body left empty because the event would exceed the size limit; "
+        "body_b64 has the bytes",
+    )
 
     hops: list[Hop] = Field(default_factory=list)
