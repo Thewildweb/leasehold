@@ -14,6 +14,10 @@
   Archive sinks write their bucket and read the claims of the topic they archive.
 - The user's keys go into the job's Nomad Variable (``nomad/jobs/<job>``) as
   ``LEASEHOLD_S3_ACCESS_KEY`` / ``LEASEHOLD_S3_SECRET_KEY``.
+- A service with ``snapshots`` also gets a user for ClickHouse
+  (``naming.clickhouse_storage_user``), read-only on its snapshot buckets. Its keys go
+  into ``leasehold/<service>/clickhouse-storage``, a variable no job reads; the
+  ClickHouse step puts them into the datasets' named collections.
 """
 
 from __future__ import annotations
@@ -162,6 +166,21 @@ def plan(specs: list[ServiceSpec], env: str) -> StoragePlan:
                     variable=job_variable_path(naming.nomad_job(spec.name, cname)),
                     read=frozenset(naming.bucket_for(env, r) for r in read),
                     write=frozenset(naming.bucket_for(env, r) for r in write),
+                )
+            )
+
+        snapshot_buckets = {d.bucket for d in spec.snapshots.values()}
+        if snapshot_buckets:
+            result.users.append(
+                UserPlan(
+                    service=spec.name,
+                    component="clickhouse",
+                    user=naming.clickhouse_storage_user(env, spec.name),
+                    policy=naming.storage_policy(env, spec.name, "clickhouse"),
+                    namespace=naming.nomad_namespace(env),
+                    variable=naming.clickhouse_storage_variable(spec.name),
+                    read=frozenset(naming.bucket(env, spec.name, b) for b in snapshot_buckets),
+                    write=frozenset(),
                 )
             )
 

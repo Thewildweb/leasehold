@@ -137,7 +137,7 @@ def clickhouse_kafka_variable(service: str) -> str:
     return f"leasehold/{service}/clickhouse-kafka"
 
 
-RESERVED_COMPONENT_NAMES = frozenset({"clickhouse", "archive"})
+RESERVED_COMPONENT_NAMES = frozenset({"clickhouse", "archive", "load"})
 
 # The plan log: a topic per service with a planner, and its two sinks in the service's
 # database (one row per queued key, one per run). apply creates them; a service can't
@@ -266,3 +266,96 @@ CLAIMS_PREFIX = "claims/"
 def claims_prefix(ref: TopicRef) -> str:
     """Key prefix of one topic's claimed payloads, e.g. ``claims/certlog.entries.v1/``."""
     return f"{CLAIMS_PREFIX}{ref}/"
+
+
+# Snapshots: datasets a service publishes as files in one of its buckets, which ClickHouse
+# loads. Each dataset's loader runs as the platform component ``load-<dataset>``.
+SNAPSHOT_LOADER_PREFIX = "load-"
+SNAPSHOT_TABLE_SUFFIX = "__snapshots"
+SNAPSHOT_STAGING_PREFIX = "_staging_"
+SNAPSHOT_LOADS_TABLE = "snapshot_loads"
+SNAPSHOT_CURRENT_VIEW = "snapshot_current"
+RESERVED_SNAPSHOT_TABLES = frozenset({SNAPSHOT_LOADS_TABLE, SNAPSHOT_CURRENT_VIEW})
+SNAPSHOT_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,39}$")
+
+
+def snapshot_loader_component(dataset: str) -> str:
+    """Component name of a dataset's loader, e.g. ``load-bag``."""
+    _check(dataset, SERVICE_RE, "snapshot dataset name")
+    return f"{SNAPSHOT_LOADER_PREFIX}{dataset}"
+
+
+def snapshot_table(table: str) -> str:
+    """The table holding every kept snapshot of a snapshot table (one partition each),
+    e.g. ``adressen__snapshots``. Readers use the view named ``table``."""
+    _check(table, SNAPSHOT_TABLE_NAME_RE, "snapshot table name")
+    return f"{table}{SNAPSHOT_TABLE_SUFFIX}"
+
+
+SNAPSHOT_TABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+
+
+def check_snapshot_id(snapshot: str) -> str:
+    """A snapshot's id (manifest ``snapshot``, the partition value), e.g. ``2026-11-08``."""
+    if not SNAPSHOT_ID_RE.match(snapshot):
+        raise NamingError(
+            f"invalid snapshot id {snapshot!r}: letters, digits, '.', '_' and '-', "
+            "at most 40 characters"
+        )
+    return snapshot
+
+
+def snapshot_staging_table(table: str, snapshot: str) -> str:
+    """Where one snapshot of a table is loaded before it is attached, e.g.
+    ``_staging_adressen_2026_11_08``. The loader's grants cover only this prefix."""
+    _check(table, SNAPSHOT_TABLE_NAME_RE, "snapshot table name")
+    sid = re.sub(r"[^0-9A-Za-z]", "_", check_snapshot_id(snapshot))
+    return f"{SNAPSHOT_STAGING_PREFIX}{table}_{sid}"
+
+
+def snapshot_manifest_key(dataset: str, snapshot: str) -> str:
+    """Object key of a snapshot's manifest: ``<dataset>/<snapshot>/manifest.json``. It is
+    written last; a snapshot without it is incomplete."""
+    _check(dataset, SERVICE_RE, "snapshot dataset name")
+    return f"{dataset}/{check_snapshot_id(snapshot)}/manifest.json"
+
+
+def snapshot_file_prefix(dataset: str, snapshot: str, table: str) -> str:
+    """Key prefix of one table's files in a snapshot: ``<dataset>/<snapshot>/<table>/``."""
+    _check(dataset, SERVICE_RE, "snapshot dataset name")
+    _check(table, SNAPSHOT_TABLE_NAME_RE, "snapshot table name")
+    return f"{dataset}/{check_snapshot_id(snapshot)}/{table}/"
+
+
+def snapshot_loader_user(env: str, service: str, dataset: str) -> str:
+    """ClickHouse user of a dataset's loader, e.g. ``dev.bag.load-bag``."""
+    return kafka_principal(env, service, snapshot_loader_component(dataset))
+
+
+def clickhouse_definer_user(env: str, service: str) -> str:
+    """ClickHouse user a service's views run as (``SQL SECURITY DEFINER``), e.g.
+    ``dev.bag.definer``. It can't log in; readers need grants on the views only."""
+    return f"{kafka_principal(env, service, 'clickhouse')}.definer"
+
+
+def clickhouse_storage_user(env: str, service: str) -> str:
+    """Object storage user ClickHouse reads a service's snapshot buckets with, e.g.
+    ``dev.bag.clickhouse`` (the component name ``clickhouse`` is reserved)."""
+    return storage_user(env, service, "clickhouse")
+
+
+def clickhouse_storage_variable(service: str) -> str:
+    """Nomad Variable with the keys of ``clickhouse_storage_user`` (no job can read it;
+    apply puts the keys into a ClickHouse named collection)."""
+    _check(service, SERVICE_RE, "service name")
+    return f"leasehold/{service}/clickhouse-storage"
+
+
+def snapshot_collection(env: str, service: str, bucket_name: str) -> str:
+    """ClickHouse named collection for one snapshot bucket: its URL and the read-only
+    keys, e.g. ``leasehold_dev_bag_snapshots``."""
+    _check(service, SERVICE_RE, "service name")
+    _check(bucket_name, BUCKET_NAME_RE, "bucket name")
+    parts = ["leasehold"] + ([] if check_env(env) == PROD else [env])
+    parts += [service.replace("-", "_"), bucket_name.replace("-", "_")]
+    return "_".join(parts)

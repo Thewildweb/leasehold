@@ -73,6 +73,9 @@ Identifier = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]*$", max
 SecretPath = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9/_.-]*$", max_length=120)]
 EnvVarName = Annotated[str, StringConstraints(pattern=r"^[A-Z][A-Z0-9_]*$", max_length=80)]
 BucketName = Annotated[str, StringConstraints(pattern=naming.BUCKET_NAME_RE.pattern, max_length=30)]
+SnapshotTableName = Annotated[
+    str, StringConstraints(pattern=naming.SNAPSHOT_TABLE_NAME_RE.pattern, max_length=40)
+]
 BucketRefStr = Annotated[
     str, StringConstraints(pattern=naming.BUCKET_REF_RE.pattern, max_length=72)
 ]

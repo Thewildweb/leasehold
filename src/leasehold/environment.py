@@ -20,7 +20,8 @@ secrets; it never holds a secret itself::
       password_env: LEASEHOLD_CLICKHOUSE_PASSWORD
     storage:
       endpoint: http://localhost:19000  # where leasehold reaches MinIO as admin
-      client_endpoint: http://minio:9000  # what jobs and ClickHouse use (default: endpoint)
+      client_endpoint: http://minio:9000  # what jobs use (default: endpoint)
+      clickhouse_endpoint: http://minio:9000  # what ClickHouse uses (default: client_endpoint)
       access_key: admin
       secret_key_env: LEASEHOLD_S3_SECRET_KEY
       region: ""                        # optional
@@ -34,6 +35,11 @@ secrets; it never holds a secret itself::
       host_network: tailscale           # optional: publish ports only on this host network
       node_classes: {services: processing}  # optional: spec node class -> class used here
       archive_image: ghcr.io/example/leasehold-archive:<sha>  # needed for archive sinks
+      snapshot_image: ghcr.io/example/leasehold-base:<sha>  # needed for snapshot loaders
+    snapshots:                          # optional: when snapshot loaders may load
+      window: {start: "05:00", end: "09:00", timezone: Europe/Amsterdam, skip_first_sunday: true}
+      busy_query: SELECT count() FROM ops.heavy_jobs WHERE ...  # > 0: don't load now
+      busy_tables: [ops.heavy_jobs]     # what the busy query reads (granted to loaders)
     services: [certlog, dns]            # optional: apply only these services here
     reads_from: {dns: prod}             # optional: readers here read dns's tables in prod
 
@@ -44,6 +50,10 @@ only once it is listed. Unset, every service is applied. A service taken off the
 list is treated like a deleted one: its resources show up as stale and are removed
 only with ``--prune``.
 
+``snapshots`` says when snapshot loaders load (default: any time, no busy check). A
+loader runs every 20 minutes inside the window and loads only when the busy query
+returns 0, so heavy loads stay out of the way of backups and other heavy jobs.
+
 ``reads_from`` points this environment's readers (planners, scheduled components
 with ``reads``) at another environment's tables of a service, e.g. a dev planner
 selecting from prod's data instead of the small dev copy. Reads only: the read-only
@@ -53,10 +63,12 @@ ClickHouse user of the reader gets ``SELECT`` on the other environment's table.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
 from leasehold import naming
 
@@ -98,6 +110,7 @@ class ClickHouse(_Model):
 class Storage(_Model):
     endpoint: str
     client_endpoint: str | None = None
+    clickhouse_endpoint: str | None = None
     access_key: str = "admin"
     secret_key_env: str = "LEASEHOLD_S3_SECRET_KEY"
     region: str = ""
@@ -105,6 +118,48 @@ class Storage(_Model):
     @property
     def clients(self) -> str:
         return self.client_endpoint or self.endpoint
+
+    @property
+    def for_clickhouse(self) -> str:
+        return self.clickhouse_endpoint or self.clients
+
+
+class Window(_Model):
+    start: str = "00:00"
+    end: str = "24:00"
+    timezone: str = "UTC"
+    skip_first_sunday: bool = False
+
+    @field_validator("start", "end")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        if not re.match(r"^([01][0-9]|2[0-3]):[0-5][0-9]$|^24:00$", v):
+            raise ValueError(f"{v!r}: expected HH:MM")
+        return v
+
+    @model_validator(mode="after")
+    def _ordered(self) -> Window:
+        if self.end <= self.start:
+            raise ValueError("the window must end after it starts (no window across midnight)")
+        try:
+            ZoneInfo(self.timezone)
+        except Exception:  # noqa: BLE001 - any lookup failure is a bad name
+            raise ValueError(f"unknown timezone {self.timezone!r}") from None
+        return self
+
+
+class Snapshots(_Model):
+    window: Window = Window()
+    busy_query: str | None = None
+    busy_tables: list[str] = []
+
+    @field_validator("busy_tables")
+    @classmethod
+    def _tables(cls, v: list[str]) -> list[str]:
+        for t in v:
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*\.([A-Za-z_][A-Za-z0-9_]*|\*)$", t):
+                raise ValueError(f"{t!r}: expected <database>.<table>")
+        return v
 
 
 class Grafana(_Model):
@@ -125,6 +180,7 @@ class Jobs(_Model):
     clickhouse_url: str | None = None  # ClickHouse HTTP interface for planners
     agent_volume: str | None = None  # Nomad host volume with the egress agents' sockets
     archive_image: str | None = None  # image the archive sinks run (leasehold's archive target)
+    snapshot_image: str | None = None  # image the snapshot loaders run (leasehold's base image)
 
 
 class Environment(_Model):
@@ -136,6 +192,7 @@ class Environment(_Model):
     storage: Storage | None = None
     grafana: Grafana | None = None
     jobs: Jobs | None = None
+    snapshots: Snapshots = Snapshots()
     services: list[str] | None = None
     reads_from: dict[str, str] = {}  # service -> environment whose tables readers here use
 
