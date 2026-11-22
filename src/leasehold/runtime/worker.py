@@ -36,6 +36,25 @@ What the loop does:
 Every attempt should emit one event, also when it fails: emit it before raising
 ``Retry`` or ``Permanent``. An attempt that emitted nothing is acked with a
 generated event ID.
+
+Task types with ``target_leases`` (tasks that talk to sites) lease with the machine's
+egress (``LEASEHOLD_EGRESS_IP``; without it the worker doesn't start) and get an
+exclusive lease on each task's target (``leasehold.egress.dispatch``). Per target the
+worker runs one task at a time, at most one per the lease's interval, and starts none
+after a safety margin before the lease expires (on its own monotonic clock). Target
+leases are renewed with the task leases and given back when their tasks are done; a
+lost one (expired, revoked, cooling down) stops its target at once: queued tasks go
+back untried, running ones get ``task.lost``. ``Retry(..., cooldown=True)`` and
+``Defer(..., cooldown=True)`` report pushback: the target cools down for every egress
+for ``after``.
+
+With the machine's egress agent (``LEASEHOLD_AGENT_SOCKET``; ``leasehold.agent``), the
+worker talks only to the agent: it holds the target leases for every worker on the
+machine, and the worker asks it for a token before each task's first request. Requests
+after the first inside one task (a retry, a fallback, a page load costing N) call
+``ctx.token(cost)``, which waits for the agent's leave; a lost target raises
+``TargetLost`` (the task goes back untried). If the agent can't be reached the worker
+waits and tries again; it never falls back to the control API.
 """
 
 from __future__ import annotations
@@ -62,9 +81,11 @@ from leasehold.client import (
     LeasedTask,
     LeaseRef,
     ReleaseItem,
+    TargetLease,
     Unavailable,
 )
 from leasehold.runtime import log as lh_log
+from leasehold.runtime.config import ConfigError
 from leasehold.runtime.context import Context, build
 from leasehold.runtime.events import Delivery, ProduceError
 
@@ -91,10 +112,13 @@ MAX_IDLE_DELAY = 10.0
 class Retry(Exception):
     """Fail this attempt; try again later (after ``after`` seconds, if given)."""
 
-    def __init__(self, reason: str, after: float | timedelta | None = None):
+    def __init__(
+        self, reason: str, after: float | timedelta | None = None, *, cooldown: bool = False
+    ):
         super().__init__(reason)
         self.reason = reason
         self.after = timedelta(seconds=after) if isinstance(after, int | float) else after
+        self.cooldown = cooldown  # the target pushed back: cool it fleet-wide for ``after``
 
 
 class Defer(Exception):
@@ -102,10 +126,19 @@ class Defer(Exception):
     again after ``after``. For tasks the worker chose not to start, e.g. because
     their target is cooling down; emit no event for them."""
 
-    def __init__(self, reason: str, after: float | timedelta):
+    def __init__(self, reason: str, after: float | timedelta, *, cooldown: bool = False):
         super().__init__(reason)
         self.reason = reason
         self.after = timedelta(seconds=after) if isinstance(after, int | float) else after
+        self.cooldown = cooldown  # the target pushed back: cool it fleet-wide for ``after``
+
+
+class TargetLost(Defer):
+    """The task's target may not be contacted any more (lease lost, revoked, cooling
+    down): the task goes back untried and is due again at once."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"target lost: {reason}", after=0)
 
 
 class Permanent(Exception):
@@ -124,6 +157,8 @@ class Task:
     country: str | None
     ref: LeaseRef
     group: str = ""
+    provider: str = ""
+    target: str = ""  # with target leases: the target this task's requests go to
     lost: threading.Event = field(default_factory=threading.Event)
 
     @property
@@ -134,11 +169,20 @@ class Task:
 class TaskContext:
     """Passed to the handler: emit events about this task, log with its context."""
 
-    def __init__(self, ctx: Context, task: Task):
+    def __init__(self, ctx: Context, task: Task, token_fn: Callable[[int], None] | None = None):
         self._ctx = ctx
         self.task = task
         self.log = ctx.log
         self.deliveries: list[Delivery] = []
+        self._token_fn = token_fn
+
+    def token(self, cost: int = 1) -> None:
+        """Wait for leave to send one more request to this task's target (after the first,
+        which the lease covers). ``cost``: tokens it uses, e.g. N for a browser page load.
+        Raises ``TargetLost`` when the target may not be contacted any more. Without
+        target leases it returns at once."""
+        if self._token_fn is not None:
+            self._token_fn(cost)
 
     def emit(self, topic: str, payload: Any, **kw) -> uuid.UUID:
         kw.setdefault("task_type", self.task.task_type)
@@ -166,6 +210,25 @@ class _Held:
     task: Task
 
 
+TARGET_MARGIN_S = 5.0  # stop starting tasks on a target this long before its lease expires
+EXTRA_TOKEN_TIMEOUT_S = 300.0  # ctx.token() gives up (TargetLost) after waiting this long
+
+
+@dataclass
+class _Target:
+    lease: TargetLease
+    expires: datetime
+    duration: timedelta
+    stop_at: float  # monotonic: no task on this target starts after this
+    next_start: float = 0.0  # monotonic: the next task may start then
+    busy: bool = False
+    lost: str | None = None
+
+
+def _stop_at(expires: datetime, now: datetime) -> float:
+    return time.monotonic() + (expires - now).total_seconds() - TARGET_MARGIN_S
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -191,6 +254,17 @@ class Worker:
         self.prefetch = concurrency if prefetch is None else prefetch
         self.group_limit = group_limit
         self.task_types = sorted(comp.consumes_tasks)
+        own = ctx.cfg.spec.frontier.task_types
+        self.targeted = {t for t in self.task_types if t in own and own[t].target_leases}
+        self.egress = ctx.cfg.egress_ip
+        self.via_agent = bool(getattr(self.client, "via_agent", False))
+        if self.targeted and not self.egress and not self.via_agent:
+            raise ConfigError(
+                f"{', '.join(sorted(self.targeted))} use target leases: set LEASEHOLD_EGRESS_IP "
+                "(the node's meta.egress_ip)"
+            )
+        self.targets: dict[uuid.UUID, _Target] = {}
+        self.release_targets: set[uuid.UUID] = set()
         self.worker_id = ctx.cfg.instance
         self.queued: deque[_Held] = deque()
         self.running: dict[LeaseRef, _Held] = {}
@@ -229,9 +303,11 @@ class Worker:
         self._collect()
         self._send_outcomes()
         self._renew()
+        self._renew_targets()
         if not self.ctx.stopping.is_set():
             self._lease()
             self._start()
+        self._tidy_targets()
         QUEUED.set(len(self.queued))
         RUNNING.set(len(self.running))
         self.wake.wait(wait)
@@ -256,6 +332,9 @@ class Worker:
             if not self.acks and not self.fails and not self.defers:
                 break
             time.sleep(1)
+        if self.targets:
+            self.release_targets |= {i for i, t in self.targets.items() if not t.lost}
+            self._renew_targets()
         if self.acks or self.fails or self.defers:
             log.error(
                 "outcomes not delivered at shutdown",
@@ -284,8 +363,18 @@ class Worker:
         want = self.concurrency + self.prefetch - len(self.queued) - len(self.running)
         if want <= 0 or len(self.queued) >= self.concurrency or time.monotonic() < self.next_lease:
             return
+        targets: list[TargetLease] = []
         try:
-            if self.group_limit is None:
+            if self.targeted:
+                leased, targets = self.client.lease_with_targets(
+                    want,
+                    task_types=self.task_types,
+                    worker_id=self.worker_id,
+                    per_group=self.group_limit,
+                    held=self.held_per_group() if self.group_limit else None,
+                    egress=self.egress,
+                )
+            elif self.group_limit is None:
                 leased = self.client.lease(
                     want, task_types=self.task_types, worker_id=self.worker_id
                 )
@@ -306,6 +395,18 @@ class Worker:
             return
         self.idle_delay = 0.0
         now = _now()
+        for tl in targets:
+            have = self.targets.get(tl.lease_id)
+            if have is None:
+                self.targets[tl.lease_id] = _Target(
+                    lease=tl,
+                    expires=tl.expires_at,
+                    duration=max(tl.expires_at - now, timedelta(seconds=10)),
+                    stop_at=_stop_at(tl.expires_at, now),
+                )
+            elif not have.lost:
+                have.expires = max(have.expires, tl.expires_at)
+                have.stop_at = _stop_at(have.expires, now)
         for t in leased:
             self.queued.append(
                 _Held(
@@ -321,6 +422,8 @@ class Worker:
                         t.country,
                         t.ref,
                         t.group,
+                        t.provider,
+                        t.target,
                     ),
                 )
             )
@@ -335,14 +438,100 @@ class Worker:
         self.next_lease = time.monotonic() + self.idle_delay
 
     def _start(self) -> None:
-        while self.queued and len(self.running) < self.concurrency:
+        if not self.targets:
+            while self.queued and len(self.running) < self.concurrency:
+                self._launch(self.queued.popleft())
+            return
+        now = time.monotonic()
+        kept: deque[_Held] = deque()
+        while self.queued:
             held = self.queued.popleft()
-            self.running[held.leased.ref] = held
-            self.pool.submit(self._run_one, held)
+            tid = held.leased.target_lease_id
+            if tid is None:
+                if len(self.running) < self.concurrency:
+                    self._launch(held)
+                else:
+                    kept.append(held)
+                continue
+            t = self.targets.get(tid)
+            if t is None or t.lost or now >= t.stop_at:
+                # Not started, and the target may not be contacted: back untried.
+                self.defers.append(ReleaseItem(held.leased.ref))
+                TASKS.labels(held.task.task_type, "target_lost").inc()
+                continue
+            if len(self.running) >= self.concurrency or t.busy or now < t.next_start:
+                kept.append(held)
+                continue
+            if self.via_agent:
+                # The agent paces the target for every worker on the machine.
+                try:
+                    r = self.client.agent_token(tid, held.task.task_type, first=True)
+                except (Unavailable, ClientError) as e:
+                    self._api_error("agent_token", e)
+                    kept.append(held)
+                    t.next_start = now + 1.0
+                    continue
+                if r.get("lost"):
+                    self._target_lost(tid, r["lost"])
+                    self.defers.append(ReleaseItem(held.leased.ref))
+                    TASKS.labels(held.task.task_type, "target_lost").inc()
+                    continue
+                if not r.get("granted"):
+                    t.next_start = now + float(r.get("wait_s") or 0.5)
+                    kept.append(held)
+                    continue
+                t.busy = True
+                self._launch(held)
+                continue
+            t.busy = True
+            t.next_start = now + t.lease.interval_s
+            self._launch(held)
+        self.queued = kept
+
+    def _extra_token(self, held: _Held, cost: int) -> None:
+        """Runs in the handler's thread: wait for leave to send another request."""
+        tid = held.leased.target_lease_id
+        deadline = time.monotonic() + EXTRA_TOKEN_TIMEOUT_S
+        while True:
+            if held.task.lost.is_set():
+                raise TargetLost("lease lost")
+            t = self.targets.get(tid)  # type: ignore[arg-type]
+            if t is None or t.lost:
+                raise TargetLost(t.lost if t else "unknown target lease")
+            if self.via_agent:
+                try:
+                    r = self.client.agent_token(tid, held.task.task_type, cost=cost)
+                except (Unavailable, ClientError) as e:
+                    self._api_error("agent_token", e)
+                    r = {"granted": False, "wait_s": 1.0}
+                if r.get("lost"):
+                    raise TargetLost(r["lost"])
+                if r.get("granted"):
+                    return
+                wait = float(r.get("wait_s") or 0.5)
+            else:
+                now = time.monotonic()
+                if now >= t.stop_at:
+                    raise TargetLost("target lease ends")
+                if now >= t.next_start:
+                    t.next_start = now + t.lease.interval_s
+                    return
+                wait = t.next_start - now
+            if time.monotonic() + wait > deadline:
+                raise TargetLost("no leave to send within the time limit")
+            if self.ctx.stopping.wait(min(wait, 5.0)):
+                raise TargetLost("worker stopping")
+
+    def _launch(self, held: _Held) -> None:
+        self.running[held.leased.ref] = held
+        self.pool.submit(self._run_one, held)
 
     def _run_one(self, held: _Held) -> None:
         task = held.task
-        tctx = TaskContext(self.ctx, task)
+        token_fn = None
+        if held.leased.target_lease_id is not None:
+            token_fn = lambda cost: self._extra_token(held, cost)  # noqa: E731
+        tctx = TaskContext(self.ctx, task, token_fn)
         t0 = time.monotonic()
         with lh_log.scope(task_type=task.task_type, task_key=task.key):
             outcome, label = self._attempt(task, tctx)
@@ -361,10 +550,12 @@ class Worker:
             return AckItem(task.ref, event_id), "acked"
         except Defer as e:
             self._confirm_quietly(tctx)
-            return ReleaseItem(task.ref, e.after), "deferred"
+            return ReleaseItem(task.ref, e.after, e.cooldown, e.reason), "deferred"
         except Retry as e:
             self._confirm_quietly(tctx)
-            return FailItem(task.ref, e.reason, tctx.first_event_id, e.after), "retry"
+            return FailItem(
+                task.ref, e.reason, tctx.first_event_id, e.after, cooldown=e.cooldown
+            ), "retry"
         except Permanent as e:
             self._confirm_quietly(tctx)
             return FailItem(
@@ -394,6 +585,13 @@ class Worker:
                 return
             self.running.pop(held.leased.ref, None)
             TASKS.labels(held.task.task_type, label).inc()
+            tid = held.leased.target_lease_id
+            if tid is not None and tid in self.targets:
+                t = self.targets[tid]
+                t.busy = False
+                if getattr(outcome, "cooldown", False) and not t.lost:
+                    # Stop here at once; the API cools the target for every egress.
+                    self._target_lost(tid, "pushback")
             if isinstance(outcome, AckItem):
                 self.acks.append(outcome)
             elif isinstance(outcome, ReleaseItem):
@@ -415,13 +613,13 @@ class Worker:
                 self._api_error("ack", e)
         if self.fails:
             try:
-                self.client.fail(self.fails)
+                self.client.fail(self.fails, **self._egress_kw())
                 self.fails = []
             except (Unavailable, ClientError) as e:
                 self._api_error("fail", e)
         if self.defers:
             try:
-                self.client.release(self.defers)
+                self.client.release(self.defers, **self._egress_kw())
                 self.defers = []
             except (Unavailable, ClientError) as e:
                 self._api_error("release", e)
@@ -444,6 +642,74 @@ class Worker:
             if h.leased.ref in renewed:
                 h.expires = renewed[h.leased.ref]
         self._mark_lost(lost)
+
+    def _egress_kw(self) -> dict:
+        return {"egress": self.egress} if self.targeted else {}
+
+    def _renew_targets(self) -> None:
+        if not self.targets or self.egress is None or self.via_agent:
+            return  # with an agent, the agent renews and gives back target leases
+        now = _now()
+        active = {
+            i: t for i, t in self.targets.items() if not t.lost and i not in self.release_targets
+        }
+        due = any(t.expires - now <= t.duration / 2 for t in active.values())
+        if not due and not self.release_targets:
+            return
+        release = sorted(self.release_targets)
+        try:
+            renewed, lost = self.client.renew_targets(
+                self.egress, sorted(active), release, worker_id=self.worker_id
+            )
+        except (Unavailable, ClientError) as e:
+            self._api_error("renew_targets", e)
+            # Fail closed: past the stop time a target is not contacted, whatever comes later.
+            mono = time.monotonic()
+            for i, t in active.items():
+                if mono >= t.stop_at:
+                    self._target_lost(i, "not renewed in time")
+            return
+        for i in release:
+            self.targets.pop(i, None)
+        self.release_targets.difference_update(release)
+        for i, expires in renewed.items():
+            t = self.targets.get(i)
+            if t is not None and not t.lost:
+                t.expires = expires
+                t.stop_at = _stop_at(expires, now)
+        for i, why in lost.items():
+            self._target_lost(i, why)
+
+    def _target_lost(self, lease_id: uuid.UUID, why: str) -> None:
+        t = self.targets.get(lease_id)
+        if t is None or t.lost:
+            return
+        t.lost = why
+        for h in self.running.values():
+            if h.leased.target_lease_id == lease_id and not h.task.lost.is_set():
+                h.task.lost.set()
+                LOST.labels(h.task.task_type).inc()
+        log.info(
+            "target lease lost",
+            extra={"fields": {"target": t.lease.target, "reason": why}},
+        )
+
+    def _tidy_targets(self) -> None:
+        """Give back target leases whose tasks are all done; forget lost ones."""
+        if not self.targets:
+            return
+        busy = {
+            h.leased.target_lease_id
+            for h in list(self.queued) + list(self.running.values())
+            if h.leased.target_lease_id is not None
+        }
+        for i, t in list(self.targets.items()):
+            if i in busy:
+                continue
+            if t.lost or self.via_agent:
+                del self.targets[i]
+            else:
+                self.release_targets.add(i)
 
     def _mark_lost(self, refs: list[LeaseRef]) -> None:
         if not refs:

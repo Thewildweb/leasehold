@@ -11,8 +11,11 @@ Per sink:
   consumer group's offsets stay in Kafka, so the new Kafka table continues where the
   old one stopped; messages produced in between are read afterwards.
 
-Stale objects (marked ``leasehold:`` in a planned database, for a sink the plan no
-longer has) are reported. ``prune`` drops their Kafka tables and views; target tables
+Per derived table, the same for its target table; its refresh view (no data) is
+recreated when its SELECT or interval changed, or when it is missing.
+
+Stale objects (marked ``leasehold:`` in a planned database, for a sink or derived table
+the plan no longer has) are reported. ``prune`` drops their Kafka tables and views; target tables
 are never dropped by ``apply``.
 """
 
@@ -22,7 +25,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from leasehold.clickhouse.plan import MARK, ClickHousePlan, DatabasePlan, SinkPlan
+from leasehold.clickhouse.plan import MARK, ClickHousePlan, DatabasePlan, DerivedPlan, SinkPlan
 
 
 class ClickHouseError(RuntimeError):
@@ -87,25 +90,46 @@ class SinkChange:
 
 
 @dataclass
+class DerivedChange:
+    derived: DerivedPlan
+    create_table: bool = False
+    accept_table: bool = False
+    recreate_view: bool = False
+
+    def __str__(self) -> str:
+        what = []
+        if self.create_table:
+            what.append(f"create table {self.derived.table}")
+        if self.accept_table:
+            what.append(f"record table version {self.derived.table}")
+        if self.recreate_view:
+            what.append(f"(re)create {self.derived.view}")
+        return "; ".join(what)
+
+
+@dataclass
 class ClickHouseDiff:
     new_databases: list[DatabasePlan] = field(default_factory=list)
     errors_tables: list[DatabasePlan] = field(default_factory=list)
     changes: list[SinkChange] = field(default_factory=list)
+    derived: list[DerivedChange] = field(default_factory=list)
     stale: list[tuple[str, str]] = field(default_factory=list)  # (full name, engine)
     warnings: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)  # sinks left as they are, see warnings
 
     @property
     def empty(self) -> bool:
-        return not (self.new_databases or self.errors_tables or self.changes)
+        return not (self.new_databases or self.errors_tables or self.changes or self.derived)
 
 
-def _sink_of(comment: str) -> str | None:
+def _owner_of(comment: str) -> str | None:
+    """``sink:<name>`` or ``derived:<name>`` for an object leasehold made for one."""
     if not comment.startswith(MARK):
         return None
     for part in comment.split():
-        if part.startswith("sink="):
-            return part[5:]
+        for kind in ("sink", "derived"):
+            if part.startswith(f"{kind}="):
+                return f"{kind}:{part[len(kind) + 1 :]}"
     return None
 
 
@@ -179,11 +203,48 @@ def diff(
             if ch_change.create_table or ch_change.accept_table or ch_change.recreate_pipeline:
                 d.changes.append(ch_change)
 
+        planned = {f"sink:{s}" for s in planned_sinks}
+        for dp in db.derived:
+            planned.add(f"derived:{dp.name}")
+            change = _derived_change(dp, tables, accept_tables, d)
+            if change is not None:
+                d.derived.append(change)
         for name, (engine, comment) in sorted(tables.items()):
-            sink = _sink_of(comment)
-            if sink is not None and sink not in planned_sinks:
+            owner = _owner_of(comment)
+            if owner is not None and owner not in planned:
                 d.stale.append((f"{db.name}.{name}", engine))
     return d
+
+
+def _derived_change(
+    dp: DerivedPlan, tables: dict, accept_tables: set[str], d: ClickHouseDiff
+) -> DerivedChange | None:
+    c = DerivedChange(dp)
+    current = tables.get(dp.name)
+    if current is None:
+        c.create_table = True
+    else:
+        _, comment = current
+        if not comment.startswith(MARK):
+            d.warnings.append(f"{dp.table} exists and wasn't created by leasehold; skipped")
+            d.skipped.append(dp.table)
+            return None
+        if comment != dp.table_comment():
+            if dp.table in accept_tables:
+                c.accept_table = True
+            else:
+                d.warnings.append(
+                    f"{dp.table}: the schema file's CREATE TABLE changed. ALTER the table to "
+                    f"match, then run with --accept-table {dp.table}; skipped"
+                )
+                d.skipped.append(dp.table)
+                return None
+    view = tables.get(dp.view.split(".", 1)[1])
+    if view is None or view[1] != dp.view_comment():
+        c.recreate_view = True
+    if c.create_table or c.accept_table or c.recreate_view:
+        return c
+    return None
 
 
 def apply(
@@ -214,6 +275,15 @@ def apply(
             )
             ch.execute(s.create_mv_sql(c._pipeline_comment))
             ch.execute(s.create_errors_mv_sql(c._pipeline_comment))
+    for c in d.derived:
+        dp = c.derived
+        if c.create_table:
+            ch.execute(dp.create_table_sql())
+        if c.accept_table:
+            ch.execute(f"ALTER TABLE {dp.table} MODIFY COMMENT '{dp.table_comment()}'")
+        if c.recreate_view:
+            ch.execute(f"DROP TABLE IF EXISTS {dp.view} SYNC")
+            ch.execute(dp.create_view_sql())
     if prune:
         # Views before Kafka tables; target tables are never dropped here.
         stale = sorted(d.stale, key=lambda x: (x[1] != "MaterializedView", x[0]))

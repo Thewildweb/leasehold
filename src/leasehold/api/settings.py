@@ -16,6 +16,12 @@ API the same for ``dev``.
     LEASEHOLD_TOKENS_FILE     JSON file with static tokens (admins, CI, dev)
     LEASEHOLD_SWEEP_INTERVAL  seconds between sweeps of expired leases (default: 15)
     LEASEHOLD_STATS_INTERVAL  seconds between frontier metric updates (default: 30)
+    LEASEHOLD_EGRESS_SCHEMA   the egress schema shared by all environments (default: egress)
+    LEASEHOLD_EGRESS_OWNER    1: this API owns the egress schema (prod): it runs the budget
+                              planner and sweeps expired rows. Other environments' APIs
+                              read it, publish their demand and write target leases.
+    LEASEHOLD_EGRESS_PLAN_INTERVAL  seconds between demand updates and planning checks
+                              (default: 15; the planner plans each window once)
 
 The alert inbox (``leasehold.api.alerts``), off when LEASEHOLD_CLICKHOUSE_URL is unset:
 
@@ -54,6 +60,9 @@ class Settings:
     clickhouse_user: str = "leasehold"
     clickhouse_password: str = ""
     alerts_database: str | None = None
+    egress_schema: str = "egress"
+    egress_owner: bool = False
+    plan_interval: float = 15.0
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
@@ -81,4 +90,7 @@ class Settings:
             clickhouse_user=e.get("LEASEHOLD_CLICKHOUSE_USER") or "leasehold",
             clickhouse_password=e.get("LEASEHOLD_CLICKHOUSE_PASSWORD", ""),
             alerts_database=e.get("LEASEHOLD_ALERTS_DATABASE") or None,
+            egress_schema=e.get("LEASEHOLD_EGRESS_SCHEMA") or "egress",
+            egress_owner=e.get("LEASEHOLD_EGRESS_OWNER", "") in ("1", "true", "yes"),
+            plan_interval=float(e.get("LEASEHOLD_EGRESS_PLAN_INTERVAL", "15")),
         )

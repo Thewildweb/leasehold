@@ -10,7 +10,15 @@ from leasehold.runtime.events import Event, ProduceError
 from leasehold.runtime.planner import PlannerRun, run_planner
 from leasehold.runtime.processor import run_processor
 from leasehold.runtime.scheduled import run_scheduled
-from leasehold.runtime.worker import Defer, Permanent, Retry, Task, TaskContext, run_worker
+from leasehold.runtime.worker import (
+    Defer,
+    Permanent,
+    Retry,
+    TargetLost,
+    Task,
+    TaskContext,
+    run_worker,
+)
 
 __all__ = [
     "Defer",
@@ -19,6 +27,7 @@ __all__ = [
     "PlannerRun",
     "ProduceError",
     "Retry",
+    "TargetLost",
     "Task",
     "TaskContext",
     "run_planner",

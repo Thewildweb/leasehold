@@ -86,6 +86,9 @@ class LeasedTask:
     payload: Any = None
     country: str | None = None
     group: str = ""
+    provider: str = ""
+    target: str = ""  # with target leases: what the target lease is keyed on
+    target_lease_id: UUID | None = None
 
     @property
     def task_type(self) -> str:
@@ -104,6 +107,7 @@ class NewTask:
     payload: Any = None
     country: str | None = None
     group: str | None = None  # e.g. the server the task talks to (workers' per-group limit)
+    provider: str | None = None  # provider of the target ('' for none); leasehold.egress
 
     def json(self) -> dict:
         d: dict[str, Any] = {"key": self.key}
@@ -117,7 +121,23 @@ class NewTask:
             d["country"] = self.country
         if self.group is not None:
             d["group"] = self.group
+        if self.provider is not None:
+            d["provider"] = self.provider
         return d
+
+
+@dataclass(frozen=True)
+class TargetLease:
+    """An exclusive lease on a target (leasehold.egress.dispatch): send at most one
+    request per ``interval_s`` to it, and nothing after ``expires_at``."""
+
+    target: str
+    lease_id: UUID
+    expires_at: datetime
+    interval_s: float
+    provider: str = ""
+    cap: int = 0
+    granted: int = 0
 
 
 @dataclass(frozen=True)
@@ -133,11 +153,17 @@ class AckItem:
 class ReleaseItem:
     ref: LeaseRef
     after: timedelta | None = None
+    cooldown: bool = False  # the target pushed back: cool it fleet-wide for ``after``
+    reason: str | None = None
 
     def json(self) -> dict:
         d = self.ref.json()
         if self.after is not None:
             d["after_s"] = max(0.0, self.after.total_seconds())
+        if self.cooldown:
+            d["cooldown"] = True
+        if self.reason:
+            d["reason"] = self.reason[:500]
         return d
 
 
@@ -148,9 +174,12 @@ class FailItem:
     event_id: UUID | None = None
     retry_after: timedelta | None = None
     permanent: bool = False
+    cooldown: bool = False  # the target pushed back: cool it fleet-wide for ``retry_after``
 
     def json(self) -> dict:
         d = self.ref.json() | {"reason": self.reason[:1000] or "failed"}
+        if self.cooldown:
+            d["cooldown"] = True
         if self.event_id is not None:
             d["event_id"] = str(self.event_id)
         if self.retry_after is not None:
@@ -191,19 +220,34 @@ class ControlClient:
         self.token = token
         self.identity_file = Path(identity_file) if identity_file else None
         self.retries = retries
+        self.via_agent = False
         self.http = httpx.Client(base_url=url.rstrip("/"), timeout=timeout, transport=transport)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> ControlClient:
+        """From ``LEASEHOLD_API_URL``, or, when ``LEASEHOLD_AGENT_SOCKET`` is set, from the
+        machine's egress agent on that Unix socket only: a worker configured for the
+        agent never talks to the control API itself, also not when the agent is down."""
         e = os.environ if environ is None else environ
-        url = e.get("LEASEHOLD_API_URL")
-        if not url:
-            raise ValueError("set LEASEHOLD_API_URL")
         token = e.get("LEASEHOLD_TOKEN") or None
         identity = e.get("LEASEHOLD_IDENTITY_FILE")
         if not identity and e.get("NOMAD_SECRETS_DIR"):
             identity = str(Path(e["NOMAD_SECRETS_DIR"]) / "nomad_leasehold.jwt")
-        return cls(url, token=token, identity_file=identity if not token else None)
+        identity = identity if not token else None
+        socket = e.get("LEASEHOLD_AGENT_SOCKET")
+        if socket:
+            c = cls(
+                "http://agent",
+                token=token,
+                identity_file=identity,
+                transport=httpx.HTTPTransport(uds=socket),
+            )
+            c.via_agent = True
+            return c
+        url = e.get("LEASEHOLD_API_URL")
+        if not url:
+            raise ValueError("set LEASEHOLD_API_URL (or LEASEHOLD_AGENT_SOCKET)")
+        return cls(url, token=token, identity_file=identity)
 
     def close(self) -> None:
         self.http.close()
@@ -253,7 +297,22 @@ class ControlClient:
     ) -> list[LeasedTask]:
         """Lease up to ``max`` tasks; with ``per_group``, at most that many per group,
         counting the ``held`` tasks (per group) the caller already has."""
+        return self.lease_with_targets(max, task_types, worker_id, per_group, held)[0]
+
+    def lease_with_targets(
+        self,
+        max: int,
+        task_types: list[str] | None = None,
+        worker_id: str | None = None,
+        per_group: int | None = None,
+        held: dict[str, int] | None = None,
+        egress: str | None = None,
+    ) -> tuple[list[LeasedTask], list[TargetLease]]:
+        """``lease``, plus the target leases granted with the tasks. Task types with
+        target leases need ``egress``, the address the requests leave from."""
         body: dict[str, Any] = {"max": max}
+        if egress:
+            body["egress"] = egress
         if task_types is not None:
             body["task_types"] = task_types
         if worker_id:
@@ -262,7 +321,7 @@ class ControlClient:
             body["per_group"] = per_group
             body["held"] = {g: n for g, n in (held or {}).items() if n > 0}
         r = self._request("POST", "/v1/tasks/lease", body, repeatable=False)
-        return [
+        tasks = [
             LeasedTask(
                 ref=LeaseRef.parse(t),
                 lease_expires_at=_parse_time(t["lease_expires_at"]),
@@ -271,9 +330,46 @@ class ControlClient:
                 payload=t.get("payload"),
                 country=t.get("country"),
                 group=t.get("group") or "",
+                provider=t.get("provider") or "",
+                target=t.get("target") or "",
+                target_lease_id=UUID(t["target_lease_id"]) if t.get("target_lease_id") else None,
             )
             for t in r["tasks"]
         ]
+        targets = [
+            TargetLease(
+                target=x["target"],
+                lease_id=UUID(x["lease_id"]),
+                expires_at=_parse_time(x["expires_at"]),
+                interval_s=float(x["interval_s"]),
+                provider=x.get("provider") or "",
+                cap=int(x.get("cap") or 0),
+                granted=int(x.get("granted") or 0),
+            )
+            for x in r.get("targets", [])
+        ]
+        return tasks, targets
+
+    def renew_targets(
+        self,
+        egress: str,
+        leases: Sequence[UUID],
+        release: Sequence[UUID] = (),
+        worker_id: str | None = None,
+    ) -> tuple[dict[UUID, datetime], dict[UUID, str]]:
+        """Extend target leases and give back ``release``. Returns (new expiry per renewed
+        lease, lost lease → reason); stop sending to a lost target at once."""
+        body: dict[str, Any] = {
+            "egress": egress,
+            "leases": [str(i) for i in leases],
+            "release": [str(i) for i in release],
+        }
+        if worker_id:
+            body["worker_id"] = worker_id
+        r = self._request("POST", "/v1/targets/renew", body, repeatable=True)
+        renewed = {UUID(x["lease_id"]): _parse_time(x["expires_at"]) for x in r["renewed"]}
+        lost = {UUID(x["lease_id"]): x["reason"] for x in r["lost"]}
+        return renewed, lost
 
     def renew(self, refs: Sequence[LeaseRef]) -> tuple[dict[LeaseRef, datetime], list[LeaseRef]]:
         """Returns (new expiry per renewed lease, lost leases)."""
@@ -291,18 +387,21 @@ class ControlClient:
     def ack(self, items: Sequence[AckItem]) -> Applied:
         return self._applied("/v1/tasks/ack", "tasks", [i.json() for i in items])
 
-    def fail(self, items: Sequence[FailItem]) -> Applied:
-        return self._applied("/v1/tasks/fail", "tasks", [i.json() for i in items])
+    def fail(self, items: Sequence[FailItem], egress: str | None = None) -> Applied:
+        return self._applied("/v1/tasks/fail", "tasks", [i.json() for i in items], egress)
 
-    def release(self, refs: Sequence[LeaseRef | ReleaseItem]) -> Applied:
+    def release(self, refs: Sequence[LeaseRef | ReleaseItem], egress: str | None = None) -> Applied:
         """Give leases back without an attempt counted; a ``ReleaseItem`` with ``after``
         also moves the task's due time that far ahead."""
-        return self._applied("/v1/tasks/release", "leases", [r.json() for r in refs])
+        return self._applied("/v1/tasks/release", "leases", [r.json() for r in refs], egress)
 
-    def _applied(self, path: str, field_name: str, items: list[dict]) -> Applied:
+    def _applied(
+        self, path: str, field_name: str, items: list[dict], egress: str | None = None
+    ) -> Applied:
         out = Applied(0)
+        extra = {"egress": egress} if egress else {}
         for chunk in _chunks(items, MAX_REFS):
-            r = self._request("POST", path, {field_name: list(chunk)}, repeatable=True)
+            r = self._request("POST", path, {field_name: list(chunk), **extra}, repeatable=True)
             out.applied += r["applied"]
             out.unknown.extend(LeaseRef.parse(x) for x in r["unknown"])
         return out
@@ -327,6 +426,24 @@ class ControlClient:
 
     def task_types(self) -> list[dict]:
         return self._request("GET", "/v1/task-types", repeatable=True)["task_types"]
+
+    def agent_token(
+        self, target_lease_id: UUID, task_type: str, cost: int = 1, first: bool = False
+    ) -> dict:
+        """Ask the machine's agent for leave to send a request to a target: ``first`` for a
+        task's first request (its budget was spent at grant), else ``cost`` tokens.
+        Returns ``{"granted": bool, "wait_s": float, "lost": str | None, "reason": ...}``."""
+        body = {
+            "target_lease_id": str(target_lease_id),
+            "task_type": task_type,
+            "cost": cost,
+            "first": first,
+        }
+        return self._request("POST", "/v1/agent/token", body, repeatable=False)
+
+    def egress_providers(self) -> dict:
+        """Provider rules and the shared-IP setting (``leasehold.egress.tagging``)."""
+        return self._request("GET", "/v1/egress/providers", repeatable=True)
 
 
 def _error(resp: httpx.Response) -> ClientError:

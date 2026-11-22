@@ -193,6 +193,8 @@ def clickhouse(
             out(f"create   table {db.name}.sink_errors")
         for c in d.changes:
             out(f"sink     {c}")
+        for c in d.derived:
+            out(f"derived  {c}")
         prunable = [n for n, e in d.stale if e in ("MaterializedView", "Kafka")]
 
         planner_users = lh_users.plan([s for s, _ in services], env, reads_from)
@@ -282,6 +284,7 @@ def nomad(
     node_classes: dict[str, str] | None = None,
     clickhouse_url: str | None = None,
     reads_from: dict[str, str] | None = None,
+    agent_volume: str | None = None,
     only: set[str] | None = None,
     yes: bool,
     prune: bool,
@@ -299,6 +302,7 @@ def nomad(
         node_classes=node_classes or {},
         clickhouse_url=clickhouse_url,
         reads_from=reads_from or {},
+        agent_volume=agent_volume,
     )
     naming.image_ref(registry, "x", "x", sha)  # checks the SHA and registry
     p = lh_nomad.plan(specs, env, sha, platform)
