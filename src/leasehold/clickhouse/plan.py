@@ -11,6 +11,10 @@ Per service with a ``clickhouse`` section, in database ``<env prefix><database>`
     into ``<sink>``;
   - ``<sink>_errors_mv``: materialized view, invalid messages into ``sink_errors``;
 - ``sink_errors``: invalid messages of all sinks in the database, kept 30 days.
+- per derived table ``<name>``:
+  - ``<name>``: the target table, from the schema file (as for sinks, never dropped);
+  - ``<name>_refresh``: a refreshable materialized view that recomputes it every
+    ``refresh`` from the schema file's SELECT and replaces its contents.
 
 Every object carries a comment starting with ``leasehold:``; ``apply`` uses it to
 find what it manages and to see what changed.
@@ -23,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from leasehold import naming
-from leasehold.clickhouse.schema import SOURCE, TABLE, SinkSchema, parse
+from leasehold.clickhouse.schema import DATABASE, SOURCE, TABLE, SinkSchema, parse, parse_derived
 from leasehold.spec.models import ServiceSpec
 
 MARK = "leasehold:"
@@ -127,10 +131,48 @@ class SinkPlan:
 
 
 @dataclass(frozen=True)
+class DerivedPlan:
+    service: str
+    name: str
+    database: str
+    schema: SinkSchema
+    refresh_seconds: int
+
+    @property
+    def table(self) -> str:
+        return f"{self.database}.{self.name}"
+
+    @property
+    def view(self) -> str:
+        return f"{self.database}.{self.name}_refresh"
+
+    def table_comment(self) -> str:
+        return f"{MARK} derived={self.name} table={self.schema.table_hash()}"
+
+    def view_comment(self) -> str:
+        parts = [self.schema.select_hash(), str(self.refresh_seconds), "1"]
+        fp = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        return f"{MARK} derived={self.name} view={fp}"
+
+    def create_table_sql(self) -> str:
+        sql = self.schema.create_table.replace(TABLE, self.table, 1)
+        return f"{sql}\nCOMMENT {_quote(self.table_comment())}"
+
+    def create_view_sql(self) -> str:
+        select = self.schema.select.replace(DATABASE, self.database)
+        return (
+            f"CREATE MATERIALIZED VIEW {self.view}\n"
+            f"REFRESH EVERY {self.refresh_seconds} SECOND TO {self.table}\n"
+            f"COMMENT {_quote(self.view_comment())}\nAS {select}"
+        )
+
+
+@dataclass(frozen=True)
 class DatabasePlan:
     service: str
     name: str
     sinks: tuple[SinkPlan, ...]
+    derived: tuple[DerivedPlan, ...] = ()
 
     def comment(self) -> str:
         return f"{MARK} service={self.service}"
@@ -173,7 +215,7 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
     naming.check_env(env)
     databases = []
     for spec, base in sorted(services, key=lambda x: x[0].name):
-        if spec.clickhouse is None or not spec.sinks():
+        if spec.clickhouse is None or not (spec.sinks() or spec.clickhouse.derived):
             continue
         db = naming.clickhouse_database(env, spec.clickhouse.database)
         sinks = []
@@ -193,5 +235,15 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
                     consumers=sink.consumers,
                 )
             )
-        databases.append(DatabasePlan(spec.name, db, tuple(sinks)))
+        derived = tuple(
+            DerivedPlan(
+                service=spec.name,
+                name=dname,
+                database=db,
+                schema=parse_derived((base / d.schema_file).read_text()),
+                refresh_seconds=int(d.refresh.total_seconds()),
+            )
+            for dname, d in sorted(spec.clickhouse.derived.items())
+        )
+        databases.append(DatabasePlan(spec.name, db, tuple(sinks), derived))
     return ClickHousePlan(env, tuple(databases))

@@ -25,6 +25,8 @@ Upsert rules, for a key that already exists:
   time is left alone, so rediscovering a task doesn't reset its backoff or its
   recrawl schedule.
 - ``done`` and ``dead`` tasks stay as they are, unless ``reopen`` is set.
+- ``group`` replaces the old group when it isn't empty; ``provider`` replaces the old
+  provider whenever it is given, also when it is '' (no provider).
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ class UpsertItem:
     payload: Any = None
     country: str | None = None
     group: str | None = None
+    provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,7 +100,8 @@ class Stats:
 
 def _dedupe(items: list[UpsertItem]) -> list[UpsertItem]:
     """Merge duplicate keys within one batch (Postgres can't update a row twice in one
-    statement): highest priority, earliest due time, last payload, country and group."""
+    statement): highest priority, earliest due time, last payload, country, group and
+    provider."""
     merged: dict[str, UpsertItem] = {}
     for it in items:
         prev = merged.get(it.key)
@@ -113,6 +117,7 @@ def _dedupe(items: list[UpsertItem]) -> list[UpsertItem]:
             payload=it.payload if it.payload is not None else prev.payload,
             country=it.country if it.country is not None else prev.country,
             group=it.group if it.group is not None else prev.group,
+            provider=it.provider if it.provider is not None else prev.provider,
         )
     return list(merged.values())
 
@@ -281,10 +286,11 @@ class Frontier:
                 raise UnknownTaskType(task_type)
             default_priority = row[0]
             # Group by which fields were given: each group needs a different ON CONFLICT.
-            groups: dict[tuple[bool, bool], list[UpsertItem]] = {}
+            groups: dict[tuple[bool, bool, bool], list[UpsertItem]] = {}
             for it in items:
-                groups.setdefault((it.priority is not None, it.due_at is not None), []).append(it)
-            for (has_prio, has_due), group in sorted(groups.items()):
+                k = (it.priority is not None, it.due_at is not None, it.provider is not None)
+                groups.setdefault(k, []).append(it)
+            for (has_prio, has_due, has_provider), group in sorted(groups.items()):
                 ins, upd = await self._upsert_group(
                     conn,
                     task_type,
@@ -294,16 +300,29 @@ class Frontier:
                     default_priority,
                     has_prio,
                     has_due,
+                    has_provider,
                 )
                 inserted += ins
                 updated += upd
         return UpsertResult(inserted, updated)
 
     async def _upsert_group(
-        self, conn, task_type, items, created_by, reopen, default_priority, has_prio, has_due
+        self,
+        conn,
+        task_type,
+        items,
+        created_by,
+        reopen,
+        default_priority,
+        has_prio,
+        has_due,
+        has_provider,
     ) -> tuple[int, int]:
         reopening = "(%(reopen)s AND t.status IN ('done', 'dead'))"
         priority = "GREATEST(t.priority, EXCLUDED.priority)" if has_prio else "t.priority"
+        # A given provider replaces the old one, '' included (a target that left its
+        # provider); without one it's left alone.
+        provider = "EXCLUDED.provider" if has_provider else "t.provider"
         if has_due:
             due = (
                 f"CASE WHEN {reopening} THEN EXCLUDED.next_due_at "
@@ -314,18 +333,20 @@ class Frontier:
             due = f"CASE WHEN {reopening} THEN now() ELSE t.next_due_at END"
         stmt = f"""
             INSERT INTO {{s}}.tasks AS t
-              (task_type, key, priority, status, next_due_at, payload, country, grp, created_by)
+              (task_type, key, priority, status, next_due_at, payload, country, grp, provider,
+               created_by)
             SELECT %(task_type)s, i.key, COALESCE(i.priority, %(default_priority)s), 'pending',
                    COALESCE(i.due_at, now()), i.payload, i.country, COALESCE(i.grp, ''),
-                   %(created_by)s
+                   COALESCE(i.provider, ''), %(created_by)s
             FROM jsonb_to_recordset(%(items)s::jsonb)
               AS i(key text, priority smallint, due_at timestamptz, payload jsonb, country text,
-                   grp text)
+                   grp text, provider text)
             ON CONFLICT (task_type, key) DO UPDATE SET
               priority    = {priority},
               payload     = COALESCE(EXCLUDED.payload, t.payload),
               country     = COALESCE(EXCLUDED.country, t.country),
               grp         = CASE WHEN EXCLUDED.grp <> '' THEN EXCLUDED.grp ELSE t.grp END,
+              provider    = {provider},
               next_due_at = {due},
               attempts    = CASE WHEN {reopening} THEN 0 ELSE t.attempts END,
               last_error  = CASE WHEN {reopening} THEN NULL ELSE t.last_error END,
@@ -341,6 +362,7 @@ class Frontier:
                     "payload": it.payload,
                     "country": it.country,
                     "grp": it.group,
+                    "provider": it.provider,
                 }
                 for it in items
             ]
@@ -403,7 +425,8 @@ class Frontier:
                         WHERE t.task_type = picked.task_type AND t.key = picked.key
                           AND tt.name = t.task_type
                         RETURNING t.task_type, t.key, t.lease_id, t.lease_expires_at,
-                                  t.priority, t.attempts, t.payload, t.country, t.grp AS "group"
+                                  t.priority, t.attempts, t.payload, t.country, t.grp AS "group",
+                                  t.provider
                         """
                     ),
                     {

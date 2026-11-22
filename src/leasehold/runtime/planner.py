@@ -63,6 +63,8 @@ from pydantic import BaseModel, Field
 
 from leasehold import naming
 from leasehold.client import NewTask
+from leasehold.egress.config import ProviderRules
+from leasehold.egress.tagging import Tagger
 from leasehold.runtime.config import ConfigError
 from leasehold.runtime.context import Context, build
 from leasehold.runtime.scheduled import run_scheduled
@@ -170,6 +172,7 @@ class PlannerRun:
         full: bool,
         now: datetime,
         log: logging.Logger,
+        client: Any = None,
     ):
         self.name = name
         self.planner = planner
@@ -183,6 +186,37 @@ class PlannerRun:
         self._service = service
         self._database = database
         self._advanced: str | None = None
+        self._client = client
+        self._taggers: dict[str | None, Tagger] = {}
+
+    def tagger(self, shared_ips: str | None = None) -> Tagger:
+        """Tags targets with their provider (``leasehold.egress.tagging``), with the rules
+        from the control API. ``shared_ips``: a declared table with columns ``ip`` and
+        ``domains`` (domains per target IP); IPs at or above the shared-IP setting's
+        ``min_domains`` count as one server behind many domains. Fetched once per run."""
+        if shared_ips in self._taggers:
+            return self._taggers[shared_ips]
+        if self._client is None:
+            raise ConfigError("no control API client for the provider rules")
+        data = self._client.egress_providers()
+        rules = ProviderRules(
+            cnames=data["cnames"],
+            ranges=data["ranges"],
+            providers={name: p["kind"] for name, p in data["providers"].items()},
+        )
+        setting = data.get("shared_ip")
+        ips: list[str] = []
+        min_domains = None
+        if shared_ips is not None and setting:
+            min_domains = int(setting["min_domains"])
+            rows = self.clickhouse.query(
+                f"SELECT ip FROM {self.table(shared_ips)} WHERE domains >= {{n:UInt32}}",
+                n=min_domains,
+            )
+            ips = [r["ip"] for r in rows]
+        tagger = Tagger(rules, ips, min_domains)
+        self._taggers[shared_ips] = tagger
+        return tagger
 
     @property
     def exclude_since(self) -> datetime | None:
@@ -293,6 +327,7 @@ def _as_tasks(items: Iterable[str | NewTask], priority: int) -> list[NewTask]:
                     priority=priority,
                     payload=item.payload,
                     group=item.group,
+                    provider=item.provider,
                     country=item.country,
                 )
             )
@@ -362,6 +397,7 @@ def run_planner(
                 full=full,
                 now=datetime.now(UTC),
                 log=ctx.log,
+                client=ctx.client,
             )
             tasks = _as_tasks(select(run), planner.priority)
             if len(tasks) > run.limit:

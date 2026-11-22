@@ -9,7 +9,7 @@ import pytest
 
 from leasehold import clickhouse
 from leasehold.clickhouse.apply import apply, diff
-from leasehold.clickhouse.schema import SchemaFileError, parse, split_statements
+from leasehold.clickhouse.schema import SchemaFileError, parse, parse_derived, split_statements
 from leasehold.spec import SpecError, load_spec
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -234,3 +234,88 @@ def test_plan_log_sinks_parse_and_are_planned():
     assert {"dev_certwatch.planned", "dev_certwatch.planner_runs"} <= names
     (s,) = [s for s in p.sinks() if s.sink == "planned"]
     assert s.topic == "dev.certwatch.planned.v1"
+
+
+# --- derived tables ---------------------------------------------------------------------------
+
+DERIVED = """
+CREATE TABLE {table} (ip String, domains UInt32) ENGINE = MergeTree ORDER BY ip;
+SELECT ip, toUInt32(count()) AS domains FROM {database}.domains GROUP BY ip;
+"""
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        ("CREATE TABLE {table} (a String) ENGINE = Log; SELECT 1 FROM {source}", "not {source}"),
+        ("CREATE TABLE {table} (a String) ENGINE = Log; SELECT 1 FROM t", "{database}"),
+        ("CREATE TABLE x (a String) ENGINE = Log; SELECT 1 FROM {database}.t", "first statement"),
+    ],
+)
+def test_parse_derived_rejects(sql, message):
+    with pytest.raises(SchemaFileError, match=message):
+        parse_derived(sql)
+
+
+@pytest.fixture
+def derived_spec(tmp_path):
+    src = FIXTURES / "certwatch"
+    for f in ("service.yml",):
+        (tmp_path / f).write_text((src / f).read_text())
+    (tmp_path / "schema").mkdir()
+    for f in (src / "schema").iterdir():
+        (tmp_path / "schema" / f.name).write_text(f.read_text())
+    (tmp_path / "schema" / "counts.sql").write_text(DERIVED)
+    (tmp_path / "dashboards").symlink_to(src / "dashboards")
+    text = (tmp_path / "service.yml").read_text()
+    text = text.replace(
+        "\nclickhouse:\n",
+        "\nclickhouse:\n  derived:\n    counts: { schema_file: schema/counts.sql, refresh: 1h }\n",
+        1,
+    )
+    (tmp_path / "service.yml").write_text(text)
+    return tmp_path
+
+
+def test_derived_plan_and_diff(derived_spec):
+    spec = load_spec(derived_spec / "service.yml")
+    assert "counts" in spec.clickhouse.tables()
+    (db,) = clickhouse.plan([(spec, derived_spec)], "dev").databases
+    (dp,) = db.derived
+    view = dp.create_view_sql()
+    assert view.startswith(
+        "CREATE MATERIALIZED VIEW dev_certwatch.counts_refresh\n"
+        "REFRESH EVERY 3600 SECOND TO dev_certwatch.counts\n"
+    )
+    assert "FROM dev_certwatch.domains GROUP BY ip" in view
+
+    ch = FakeCH()
+    d = diff(ch, clickhouse.plan([(spec, derived_spec)], "dev"), "kafka:9092", VERSIONS)
+    (c,) = d.derived
+    assert c.create_table and c.recreate_view
+    apply(ch, d, "kafka:9092", {"dev.certwatch.clickhouse": "pw"})
+    assert ch.executed[-2:] == ["DROP TABLE IF EXISTS dev_certwatch.counts_refresh SYNC", view]
+
+    # Unchanged: nothing to do. A new interval recreates only the view.
+    p = clickhouse.plan([(spec, derived_spec)], "dev")
+    live = {
+        "dev_certwatch": {
+            "counts": ("MergeTree", dp.table_comment()),
+            "counts_refresh": ("MaterializedView", dp.view_comment()),
+        }
+    }
+    assert not diff(FakeCH(live), p, "kafka:9092", VERSIONS).derived
+    faster = dataclasses.replace(dp, refresh_seconds=600)
+    assert faster.view_comment() != dp.view_comment()
+
+    # A derived table the plan no longer has is stale.
+    live["dev_certwatch"]["gone"] = ("MergeTree", "leasehold: derived=gone table=x")
+    d = diff(FakeCH(live), p, "kafka:9092", VERSIONS)
+    assert ("dev_certwatch.gone", "MergeTree") in d.stale
+
+
+def test_derived_schema_file_is_checked(derived_spec):
+    (derived_spec / "schema" / "counts.sql").write_text("SELECT 1")
+    with pytest.raises(SpecError) as e:
+        load_spec(derived_spec / "service.yml")
+    assert any("clickhouse.derived.counts.schema_file" in m for m in e.value.messages)

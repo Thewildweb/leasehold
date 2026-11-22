@@ -241,6 +241,8 @@ def clickhouse(
             out(f"create   table {db.name}.sink_errors")
         for c in d.changes:
             out(f"sink     {c}")
+        for c in d.derived:
+            out(f"derived  {c}")
         prunable = [n for n, e in d.stale if e in ("MaterializedView", "Kafka")]
 
         planner_users = lh_users.plan([s for s, _ in services], env, reads_from)
@@ -330,6 +332,7 @@ def nomad(
     node_classes: dict[str, str] | None = None,
     clickhouse_url: str | None = None,
     reads_from: dict[str, str] | None = None,
+    agent_volume: str | None = None,
     s3_endpoint: str | None = None,
     s3_region: str = "",
     archive_image: str | None = None,
@@ -350,6 +353,7 @@ def nomad(
         node_classes=node_classes or {},
         clickhouse_url=clickhouse_url,
         reads_from=reads_from or {},
+        agent_volume=agent_volume,
         s3_endpoint=s3_endpoint,
         s3_region=s3_region,
         archive_image=archive_image,

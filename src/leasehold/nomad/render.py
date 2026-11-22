@@ -21,6 +21,10 @@ What each job gets:
   ``_KAFKA_BOOTSTRAP`` (components that use Kafka), ``_DRAIN_TIMEOUT_S`` (5 s under
   ``kill_timeout``), ``_TIMEOUT_S`` (scheduled), ``_EGRESS_IP`` (task workers:
   the node's ``meta.egress_ip``), plus the spec's ``env``.
+- Task workers of task types with target leases, when the environment names the agent's
+  host volume (``Platform.agent_volume``): that volume mounted at ``/run/leasehold-agent``
+  and ``LEASEHOLD_AGENT_SOCKET`` set to ``<env>.sock`` in it, so they talk to the
+  machine's egress agent (``leasehold.agent``) instead of the control API.
 - A workload identity ``leasehold`` (audience ``leasehold``) written to
   ``$NOMAD_SECRETS_DIR/nomad_leasehold.jwt``, which the control API client reads.
 - Components that read or write buckets: ``LEASEHOLD_S3_ENDPOINT`` (and
@@ -69,6 +73,14 @@ IDENTITY_AUDIENCE = "leasehold"
 HTTP_PORT = "http"
 MANAGED_META = "leasehold_service"
 DRAIN_MARGIN = timedelta(seconds=5)
+AGENT_DIR = "/run/leasehold-agent"
+AGENT_VOLUME = "leasehold-agent"
+
+
+def agent_socket(env: str) -> str:
+    """Where the environment's egress agent listens, inside the host volume."""
+    return f"{AGENT_DIR}/{naming.check_env(env)}.sock"
+
 
 _S = 1_000_000_000  # Nomad API durations are nanoseconds
 
@@ -99,6 +111,9 @@ class Platform:
     databases: dict[str, str] = field(default_factory=dict, hash=False)
     # Service → environment whose tables this environment's readers use (``reads_from``).
     reads_from: dict[str, str] = field(default_factory=dict, hash=False)
+    # Nomad host volume with the egress agents' sockets, on every machine that runs
+    # target-leasing workers. Unset: those workers lease from the control API directly.
+    agent_volume: str | None = None
     # S3 endpoint as jobs reach it (e.g. http://minio.service:9000), for bucket users.
     s3_endpoint: str | None = None
     s3_region: str = ""
@@ -225,6 +240,8 @@ def _env(
         # Nomad interpolates the node's meta; a node without it leaves the text as is,
         # which the runtime reads as no egress address.
         out["LEASEHOLD_EGRESS_IP"] = "${meta.egress_ip}"
+        if _uses_agent(spec, c, platform):
+            out["LEASEHOLD_AGENT_SOCKET"] = agent_socket(env)
     if isinstance(c, Scheduled):
         out["LEASEHOLD_TIMEOUT_S"] = str(int(c.timeout.total_seconds()))
     if isinstance(c, Scheduled) and c.reads_clickhouse:
@@ -245,6 +262,13 @@ def _env(
     if clash:
         raise ValueError(f"{spec.name}.{cname}: env may not set {', '.join(clash)}")
     return out | dict(c.env)
+
+
+def _uses_agent(spec: ServiceSpec, c: Component, platform: Platform) -> bool:
+    if not platform.agent_volume or not isinstance(c, TaskWorker):
+        return False
+    types = spec.frontier.task_types
+    return any(t in types and types[t].target_leases for t in c.consumes_tasks)
 
 
 def _task(
@@ -287,7 +311,13 @@ def _task(
     if c.resources.memory_max:
         resources["MemoryMaxMB"] = c.resources.memory_max
 
-    return {
+    task: dict[str, Any] = {}
+    if _uses_agent(spec, c, platform):
+        task["VolumeMounts"] = [
+            {"Volume": AGENT_VOLUME, "Destination": AGENT_DIR, "ReadOnly": False}
+        ]
+
+    return task | {
         "Name": cname,
         "Driver": "docker",
         "Config": config,
@@ -334,6 +364,10 @@ def render_job(
     namespace = naming.nomad_namespace(env)
     task = _task(spec, cname, c, env, version, platform)
     group: dict[str, Any] = {"Name": cname, "Tasks": [task]}
+    if _uses_agent(spec, c, platform):
+        group["Volumes"] = {
+            AGENT_VOLUME: {"Name": AGENT_VOLUME, "Type": "host", "Source": platform.agent_volume}
+        }
     if isinstance(c, ArchiveComponent):
         group["EphemeralDisk"] = {"SizeMB": archive_disk_mb(spec, c, platform)}
     if c.max_per_node is not None:

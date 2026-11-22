@@ -81,14 +81,20 @@ class FakeKafkaProducer:
         self.messages = []
         self._pending = []
         self.lock = threading.Lock()
+        self._produced = threading.Condition(self.lock)
 
     def produce(self, topic, value=None, key=None, on_delivery=None):
         with self.lock:
             self.messages.append((topic, key, value))
             self._pending.append((topic, on_delivery))
+            self._produced.notify_all()
 
     def poll(self, timeout=0):
+        # Blocks up to ``timeout`` like the real one: the producer's poll thread would
+        # otherwise spin and slow every test that runs after one that left it running.
         with self.lock:
+            if not self._pending and timeout:
+                self._produced.wait(timeout)
             pending, self._pending = self._pending, []
         for topic, cb in pending:
             cb("broker said no" if topic in self.fail_topics else None, None)

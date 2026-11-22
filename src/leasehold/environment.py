@@ -123,6 +123,7 @@ class Jobs(_Model):
     host_network: str | None = None  # Nomad host network for the http port, e.g. tailscale
     node_classes: dict[str, str] = {}  # spec node class -> node class in this environment
     clickhouse_url: str | None = None  # ClickHouse HTTP interface for planners
+    agent_volume: str | None = None  # Nomad host volume with the egress agents' sockets
     archive_image: str | None = None  # image the archive sinks run (leasehold's archive target)
 
 

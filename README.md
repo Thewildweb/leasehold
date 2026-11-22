@@ -30,6 +30,8 @@ Stack: Python 3.12, Postgres, Kafka, ClickHouse, Grafana, Nomad, MinIO.
 | `src/leasehold/runtime` | `run_worker`, `run_processor`, `run_scheduled`: the process a component runs in |
 | `src/leasehold/api` | the control API: leases, task upserts, the alert inbox |
 | `src/leasehold/{kafka,frontier,storage,clickhouse,grafana,nomad}` | one apply step each |
+| `src/leasehold/egress` | egress addresses, providers and budgets, shared by all environments; provider tagging for planners |
+| `src/leasehold/agent` | the egress agent: one per machine and environment, the only process there that talks to the dispatcher |
 | `src/leasehold/archive` | archive sinks: a topic to Parquet files in a bucket |
 | `src/leasehold/mocks` | a mock CT log for tests and the dev stack |
 | `dev/` | the dev stack (Docker Compose) |
@@ -46,6 +48,15 @@ uv run leasehold apply path/to/services -e dev/environment.yml --sha <git-sha>  
 ```
 
 `leasehold --help` lists the commands; every apply step is a dry run unless `--yes`.
+
+Egress addresses, provider rules and budgets live in one directory of YAML files
+(`registry.yml`, `providers.yml`, `budgets.yml`; formats in `leasehold.egress.config`),
+written to a Postgres schema all environments share:
+
+```bash
+uv run leasehold egress migrate --yes
+uv run leasehold egress apply path/to/egress          # dry run
+```
 
 `run_processor` hands its handler batches of at most `batch_size` events or
 `batch_max_bytes` bytes (default 64 MB; `LEASEHOLD_BATCH_MAX_BYTES` overrides it),

@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 TABLE = "{table}"
 SOURCE = "{source}"
+DATABASE = "{database}"
 
 
 class SchemaFileError(ValueError):
@@ -136,4 +137,31 @@ def parse(sql: str) -> SinkSchema:
         raise SchemaFileError(f"the SELECT must read FROM {SOURCE} (once) and not use {TABLE}")
     if SOURCE in create:
         raise SchemaFileError(f"{SOURCE} belongs in the SELECT")
+    return SinkSchema(create_table=create, select=select)
+
+
+def parse_derived(sql: str) -> SinkSchema:
+    """A derived table's schema file: ``CREATE TABLE {table} (...)`` and a SELECT over
+    the service's own tables, named ``{database}.<table>``."""
+    stmts = split_statements(sql)
+    if len(stmts) != 2:
+        raise SchemaFileError(
+            f"expected 2 statements (CREATE TABLE {TABLE} …; SELECT … FROM {DATABASE}.…;), "
+            f"found {len(stmts)}"
+        )
+    create, select = stmts
+    if not re.match(r"(?is)^CREATE\s+TABLE\s+\{table\}\s*\(", create):
+        raise SchemaFileError(f"the first statement must start with 'CREATE TABLE {TABLE} ('")
+    if create.count(TABLE) != 1 or SOURCE in create or DATABASE in create:
+        raise SchemaFileError(f"{TABLE} must appear once, in CREATE TABLE, and nothing else")
+    if re.search(r"(?is)\bON\s+CLUSTER\b", create):
+        raise SchemaFileError("leave out ON CLUSTER")
+    if re.search(r"(?is)\bCOMMENT\s+'(?:[^'\\]|\\.)*'\s*$", create):
+        raise SchemaFileError("leave out the table COMMENT; apply sets it")
+    if not re.match(r"(?is)^(SELECT|WITH)\b", select):
+        raise SchemaFileError("the second statement must be a SELECT")
+    if SOURCE in select or TABLE in select:
+        raise SchemaFileError(f"a derived table's SELECT reads {DATABASE}.<table>, not {SOURCE}")
+    if DATABASE not in select:
+        raise SchemaFileError(f"the SELECT must read this service's tables as {DATABASE}.<table>")
     return SinkSchema(create_table=create, select=select)

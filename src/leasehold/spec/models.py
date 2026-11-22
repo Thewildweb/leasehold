@@ -384,6 +384,22 @@ class TaskType(_Strict):
         "types fed by a planner, whose memory of what was done is in ClickHouse. "
         "None = keep them (the frontier itself remembers what was done)",
     )
+    target_leases: bool = Field(
+        default=False,
+        description="Tasks talk to targets (sites): leasing needs the worker's egress, and "
+        "takes an exclusive target lease per task group (leasehold.egress.dispatch)",
+    )
+    target_cap: int | None = Field(
+        default=None,
+        ge=1,
+        description="Most tasks granted per target lease. Default: lease_duration divided "
+        "by the target interval",
+    )
+    egress_class: Identifier = Field(
+        default="normal",
+        description="Priority class for egress budgets (target leases), one of the classes "
+        "in the egress budgets; outside prod it counts a class lower",
+    )
 
     @model_validator(mode="after")
     def _limits(self) -> TaskType:
@@ -393,6 +409,8 @@ class TaskType(_Strict):
             raise ValueError("lease_duration must be at least 10s")
         if self.keep_done is not None and self.recrawl_interval is not None:
             raise ValueError("keep_done is for one-shot task types; recurring tasks are never done")
+        if self.target_cap is not None and not self.target_leases:
+            raise ValueError("target_cap needs target_leases")
         return self
 
 
@@ -425,16 +443,39 @@ class SharedTable(_Strict):
     description: str = Field(min_length=1)
 
 
+class Derived(_Strict):
+    """A table recomputed from this service's own tables on a schedule (a refreshable
+    materialized view): e.g. a count over a sink that several planners read."""
+
+    schema_file: str = Field(
+        min_length=1,
+        description="SQL file, relative to service.yml: CREATE TABLE {table} (...); then a "
+        "SELECT over this service's tables, named {database}.<table>",
+    )
+    refresh: Duration = Field(description="How often the table is recomputed (at least 1m)")
+
+    @field_validator("refresh")
+    @classmethod
+    def _min_refresh(cls, v: timedelta) -> timedelta:
+        if v < timedelta(minutes=1):
+            raise ValueError("refresh must be at least 1m")
+        return v
+
+
 class ClickHouseSection(_Strict):
     database: SnakeName
     sinks: dict[SnakeName, Sink] = Field(default_factory=dict)
+    derived: dict[SnakeName, Derived] = Field(
+        default_factory=dict, description="Tables recomputed from this service's tables"
+    )
     shared: dict[SnakeName, SharedTable] = Field(
-        default_factory=dict, description="Sinks other services' planners may read"
+        default_factory=dict,
+        description="Sinks and derived tables other services' planners may read",
     )
 
     def tables(self) -> set[str]:
-        """Names of this service's own tables (its sinks)."""
-        return set(self.sinks)
+        """Names of this service's own tables (its sinks and derived tables)."""
+        return set(self.sinks) | set(self.derived)
 
 
 # --- Buckets and archive sinks ----------------------------------------------------------------
@@ -910,11 +951,16 @@ class ServiceSpec(_Strict):
             for name in sorted(self.clickhouse.tables() & reserved):
                 yield f"clickhouse: the table name {name!r} is reserved (the plan log)"
             for name in self.clickhouse.shared:
-                if name not in self.clickhouse.sinks:
+                if name not in self.clickhouse.tables():
                     yield (
-                        f"clickhouse.shared.{name}: not a sink of this service; "
-                        "only sinks can be shared"
+                        f"clickhouse.shared.{name}: not a sink or derived table of this "
+                        "service; only those can be shared"
                     )
+            for name in sorted(set(self.clickhouse.sinks) & set(self.clickhouse.derived)):
+                yield f"clickhouse.derived.{name}: a sink has the same name"
+            for name in sorted(self.clickhouse.derived):
+                if f"{name}_refresh" in self.clickhouse.tables():
+                    yield f"clickhouse.derived.{name}: the name {name}_refresh is taken"
 
         for exp in self.expects:
             where = f"expects.{exp.name}.sql"

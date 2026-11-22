@@ -12,7 +12,8 @@ Two kinds of credentials, both sent as ``Authorization: Bearer <token>``:
       {"tokens": [
         {"sha256": "<hex>", "admin": "erik"},
         {"sha256": "<hex>", "service": "certlog", "component": "worker"},
-        {"sha256": "<hex>", "alerts": "grafana"}
+        {"sha256": "<hex>", "alerts": "grafana"},
+        {"sha256": "<hex>", "agent": "egress-agent"}
       ]}
 
   ``leasehold api token`` creates a token and prints its entry.
@@ -21,6 +22,11 @@ Permissions come from ``service.yml``: a task-worker may lease the task types in
 ``consumes_tasks``; a component may create the task types in its ``creates_tasks``.
 Admins may create any task type and pause or resume task types. An ``alerts`` token
 (for Grafana's webhook) may only post alert notifications.
+
+An ``agent`` token is the egress agent on a machine (``leasehold.agent``). It calls on
+behalf of the workers on that machine: their own credential comes in the header
+``X-Leasehold-For``, is verified like any other, and their permissions apply. The agent
+holds the target leases; the tasks and events stay the worker's.
 """
 
 from __future__ import annotations
@@ -56,7 +62,9 @@ class Caller:
     component: str | None = None
     admin: bool = False
     alerts: bool = False  # may post alert notifications, nothing else
+    agent: bool = False  # an egress agent: calls on behalf of its machine's workers
     instance: str | None = None  # Nomad allocation ID, when known
+    via: str | None = None  # the agent this worker's call came through
 
 
 class Registry:
@@ -69,6 +77,15 @@ class Registry:
         }
         self.jobs = {naming.nomad_job(svc, comp): (svc, comp) for svc, comp in self.components}
         self.task_types = {tt: s.name for s in specs for tt in s.frontier.task_types}
+        self.target_leased = {
+            name for s in specs for name, tt in s.frontier.task_types.items() if tt.target_leases
+        }
+        self.egress_classes = {
+            name: tt.egress_class
+            for s in specs
+            for name, tt in s.frontier.task_types.items()
+            if tt.target_leases
+        }
 
     def component(self, caller: Caller) -> Component | None:
         if caller.service is None or caller.component is None:
@@ -120,6 +137,8 @@ def load_tokens(path: Path | None) -> list[_StaticEntry]:
             caller = Caller(name=f"admin:{t['admin']}", admin=True)
         elif "alerts" in t:
             caller = Caller(name=f"alerts:{t['alerts']}", alerts=True)
+        elif "agent" in t:
+            caller = Caller(name=f"agent:{t['agent']}", agent=True)
         elif "service" in t and "component" in t:
             caller = Caller(
                 name=f"{t['service']}.{t['component']}",
@@ -128,7 +147,7 @@ def load_tokens(path: Path | None) -> list[_StaticEntry]:
             )
         else:
             raise ValueError(
-                f"{path}: token {i} needs 'admin', 'alerts', or 'service' and 'component'"
+                f"{path}: token {i} needs 'admin', 'alerts', 'agent', or 'service' and 'component'"
             )
         if not re.fullmatch(r"[0-9a-f]{64}", t.get("sha256", "")):
             raise ValueError(f"{path}: token {i} needs a 'sha256' hex digest")
@@ -174,7 +193,7 @@ class Authenticator:
         for entry in self.tokens:
             if hmac.compare_digest(entry.sha256, digest):
                 c = entry.caller
-                if not (c.admin or c.alerts) and self.registry.component(c) is None:
+                if not (c.admin or c.alerts or c.agent) and self.registry.component(c) is None:
                     raise AuthError(f"token for unknown component {c.name}")
                 return c
         raise AuthError("unknown token")

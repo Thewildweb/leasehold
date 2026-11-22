@@ -232,3 +232,43 @@ def test_table_names_in_another_environment(monkeypatch):
     assert _run(select)[0] == 0
     assert out["other"] == "other_db.domains"
     assert out["own"] == "dev_jobs.planned"
+
+
+def test_tagger_from_the_control_api(monkeypatch):
+    rules = {
+        "providers": {"example-cdn": {"kind": "cdn", "per_egress_per_min": 30}},
+        "cnames": {"cdn.example.net": "example-cdn"},
+        "ranges": {"203.0.113.0/24": "example-cdn"},
+        "shared_ip": {"min_domains": 1000, "per_egress": 30, "fleet_per_second": 2},
+    }
+    monkeypatch.setattr(Control, "egress_providers", lambda self: rules, raising=False)
+    calls = {"n": 0}
+    orig = FakeCH.query
+
+    def query(self, sql, **params):
+        if "domains >=" in sql:
+            calls["n"] += 1
+            assert params == {"n": 1000}
+            assert "dev_other.domains" in sql
+            return [{"ip": "192.0.2.50"}]
+        return orig(self, sql, **params)
+
+    monkeypatch.setattr(FakeCH, "query", query)
+
+    def select(run):
+        tagger = run.tagger(shared_ips="other.domains")
+        assert run.tagger(shared_ips="other.domains") is tagger  # once per run
+        out = []
+        for domain, ip in (("a.nl", "203.0.113.1"), ("b.nl", "192.0.2.50"), ("c.nl", "192.0.2.1")):
+            tag = tagger.tag(domain, ip)
+            out.append(NewTask(domain, group=tag.target, provider=tag.provider))
+        return out
+
+    code, control, _, _ = _run(select)
+    assert code == 0 and calls["n"] == 1
+    got = [(t.key, t.group, t.provider) for t in control.upserts[0][1]]
+    assert got == [
+        ("a.nl", "a.nl", "example-cdn"),
+        ("b.nl", "b.nl", "ip:192.0.2.50"),
+        ("c.nl", "192.0.2.1", ""),
+    ]

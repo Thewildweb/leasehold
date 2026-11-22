@@ -168,6 +168,77 @@ def _cmd_frontier_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_egress_migrate(args: argparse.Namespace) -> int:
+    import psycopg
+
+    from leasehold.egress import schema
+
+    if not (dsn := _dsn(args)):
+        return 1
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        before = schema.current_version(conn, args.schema)
+        if not args.yes:
+            pending = [v for v, _ in schema.MIGRATIONS if v > before]
+            print(f"schema {args.schema}: version {before}")
+            print(f"pending migrations: {pending or 'none'}")
+            for role in args.writer:
+                print(
+                    f"grant: {role} reads the schema, writes "
+                    + ", ".join(schema.SHARED_WRITE_TABLES)
+                )
+            print("\ndry run; pass --yes to apply")
+            return 0
+        applied = schema.migrate(conn, args.schema)
+        schema.grant_writers(conn, args.writer, args.schema)
+    print(f"schema {args.schema}: applied {applied or 'nothing'}")
+    for role in args.writer:
+        print(f"granted {role}: read, and write {', '.join(schema.SHARED_WRITE_TABLES)}")
+    return 0
+
+
+def _cmd_egress_apply(args: argparse.Namespace) -> int:
+    import psycopg
+
+    from leasehold.egress import config, schema
+
+    try:
+        cfg = config.load(args.directory)
+    except config.ConfigError as e:
+        print(e, file=sys.stderr)
+        return 1
+    if not (dsn := _dsn(args)):
+        return 1
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        try:
+            d = schema.diff(conn, cfg, args.schema)
+        except RuntimeError as e:
+            print(e, file=sys.stderr)
+            return 1
+        if d.empty:
+            print("no changes")
+            return 0
+        for line in d.lines():
+            print(line)
+        if not args.yes:
+            print("\ndry run; pass --yes to apply")
+            return 0
+        schema.apply(conn, d, args.schema)
+    print("applied")
+    return 0
+
+
+def _cmd_agent_serve(args: argparse.Namespace) -> int:
+    from leasehold.agent.server import AgentSettings, serve
+
+    try:
+        settings = AgentSettings.from_env()
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+    serve(settings)
+    return 0
+
+
 def _cmd_api_serve(args: argparse.Namespace) -> int:
     import logging
 
@@ -572,7 +643,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             kafka_bootstrap=e.kafka.clients, node_pool=e.jobs.node_pool,
             host_network=e.jobs.host_network, node_classes=e.jobs.node_classes,
             clickhouse_url=e.jobs.clickhouse_url or (e.clickhouse.url if e.clickhouse else None),
-            reads_from=e.reads_from,
+            reads_from=e.reads_from, agent_volume=e.jobs.agent_volume,
             s3_endpoint=e.storage.clients if e.storage else None,
             s3_region=e.storage.region if e.storage else "",
             archive_image=e.jobs.archive_image,
@@ -709,6 +780,44 @@ def build_parser() -> argparse.ArgumentParser:
     fa.add_argument("--dsn-env", default="LEASEHOLD_DSN", help=dsn_help)
     fa.add_argument("--yes", action="store_true", help="apply the changes")
     fa.set_defaults(func=_cmd_frontier_apply)
+
+    eg = sub.add_parser(
+        "egress", help="egress addresses, providers and budgets in Postgres (all environments)"
+    )
+    egsub = eg.add_subparsers(dest="egress_command", required=True)
+
+    em = egsub.add_parser("migrate", help="create or upgrade the schema (dry run by default)")
+    em.add_argument("--schema", default="egress")
+    em.add_argument("--dsn-env", default="LEASEHOLD_DSN", help=dsn_help)
+    em.add_argument(
+        "--writer",
+        action="append",
+        default=[],
+        metavar="ROLE",
+        help="another environment's Postgres role: may read the schema and write the "
+        "dispatch tables (target leases, cooldowns, pair usage); repeatable",
+    )
+    em.add_argument("--yes", action="store_true", help="apply the migrations")
+    em.set_defaults(func=_cmd_egress_migrate)
+
+    ea = egsub.add_parser(
+        "apply",
+        help="write registry.yml, providers.yml and budgets.yml into Postgres (dry run by default)",
+    )
+    ea.add_argument("directory", help="directory with the three files")
+    ea.add_argument("--schema", default="egress")
+    ea.add_argument("--dsn-env", default="LEASEHOLD_DSN", help=dsn_help)
+    ea.add_argument("--yes", action="store_true", help="apply the changes")
+    ea.set_defaults(func=_cmd_egress_apply)
+
+    ag = sub.add_parser("agent", help="the egress agent of a machine (one per environment)")
+    agsub = ag.add_subparsers(dest="agent_command", required=True)
+    ags = agsub.add_parser(
+        "serve",
+        help="serve on LEASEHOLD_AGENT_SOCKET (settings from the environment, see "
+        "leasehold.agent.server)",
+    )
+    ags.set_defaults(func=_cmd_agent_serve)
 
     gr = sub.add_parser("grafana", help="dashboards derived from service.yml")
     grsub = gr.add_subparsers(dest="grafana_command", required=True)

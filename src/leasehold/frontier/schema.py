@@ -111,6 +111,18 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "CREATE INDEX tasks_done ON {s}.tasks (last_done_at) WHERE status = 'done'",
         ],
     ),
+    (
+        4,
+        [
+            # The provider the task's target belongs to (leasehold.egress.tagging): the
+            # budget it draws from. '' is plain hosting, limited by its target alone.
+            "ALTER TABLE {s}.tasks ADD COLUMN provider text NOT NULL DEFAULT ''",
+            # Task types whose tasks talk to targets: leasing takes target leases
+            # (leasehold.egress.dispatch), at most target_cap tasks per lease.
+            "ALTER TABLE {s}.task_types ADD COLUMN target_leases boolean NOT NULL DEFAULT false",
+            "ALTER TABLE {s}.task_types ADD COLUMN target_cap int",
+        ],
+    ),
 ]
 
 LATEST = MIGRATIONS[-1][0]
@@ -185,6 +197,8 @@ _SETTINGS = (
     "default_priority",
     "capabilities",
     "keep_done",
+    "target_leases",
+    "target_cap",
 )
 
 
@@ -200,6 +214,8 @@ def _desired_row(service: str, tt: TaskType) -> dict:
         "default_priority": tt.default_priority,
         "capabilities": list(tt.capabilities),
         "keep_done": tt.keep_done,
+        "target_leases": tt.target_leases,
+        "target_cap": tt.target_cap,
         "hash_partitions": tt.hash_partitions,
     }
 

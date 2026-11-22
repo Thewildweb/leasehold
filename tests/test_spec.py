@@ -339,7 +339,7 @@ def test_reserved_plan_log_names(certwatch):
 
 def test_shared_must_be_a_sink(certwatch):
     certwatch["clickhouse"]["shared"] = {"nope": {"description": "x"}}
-    assert "only sinks can be shared" in errors_of(certwatch)
+    assert "only those can be shared" in errors_of(certwatch)
 
 
 def test_registry_planner_reads_shared(certwatch):

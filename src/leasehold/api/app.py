@@ -11,10 +11,15 @@ Endpoints (all under ``/v1`` need a bearer token):
     POST /v1/tasks/ack             record success
     POST /v1/tasks/fail            record a failed attempt
     POST /v1/tasks/release         give leases back without an attempt counted
-                                   (optionally due again only after ``after_s``)
+                                   (optionally due again only after ``after_s``;
+                                   ``cooldown`` cools the task's target fleet-wide)
+    POST /v1/targets/renew         extend target leases, give some back; lists lost ones
+    POST /v1/targets/{target}/revoke   stop a target lease (admin)
+    POST /v1/targets/spend         tokens for requests beyond a task's first (agents)
     GET  /v1/task-types            settings and counts per task type
     POST /v1/task-types/{name}/pause   stop leasing; release current leases (admin)
     POST /v1/task-types/{name}/resume  (admin)
+    GET  /v1/egress/providers      provider rules and the shared-IP setting, for tagging
     GET  /v1/whoami                the caller, as the API sees it
     POST /v1/alerts                Grafana webhook: store alert notifications (alerts token)
     GET  /v1/alerts                alert incidents with their latest state (admin)
@@ -25,6 +30,7 @@ Endpoints (all under ``/v1`` need a bearer token):
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -54,6 +60,9 @@ from leasehold.api.auth import (
     load_tokens,
 )
 from leasehold.api.settings import Settings
+from leasehold.egress.dispatch import Cooling, Dispatcher, EgressRefused
+from leasehold.egress.planner import Planner, effective_class, publish_demand
+from leasehold.egress.store import EgressNotReady, provider_rules
 from leasehold.frontier import schema
 from leasehold.frontier.store import (
     AckItem,
@@ -93,6 +102,11 @@ class UpsertTask(_Model):
     group: str | None = Field(
         default=None, max_length=100, description="e.g. the server the task talks to"
     )
+    provider: str | None = Field(
+        default=None,
+        max_length=100,
+        description="Provider of the task's target (leasehold.egress.tagging); '' for none",
+    )
 
 
 class UpsertRequest(_Model):
@@ -122,6 +136,12 @@ class LeaseRequest(_Model):
         max_length=1000,
         description="Tasks per group the worker already holds; count against per_group",
     )
+    egress: str | None = Field(
+        default=None,
+        max_length=64,
+        description="The address the worker's requests leave from; required for task types "
+        "with target leases",
+    )
 
 
 class Ref(_Model):
@@ -140,10 +160,63 @@ class LeasedTask(Ref):
     payload: Any = None
     country: str | None = None
     group: str = ""
+    provider: str = ""
+    target: str = ""
+    target_lease_id: UUID | None = None
+
+
+class TargetLeaseOut(_Model):
+    target: str
+    lease_id: UUID
+    expires_at: datetime
+    interval_s: float = Field(description="At least this long between requests to the target")
+    provider: str
+    cap: int
+    granted: int
 
 
 class LeaseResponse(_Model):
     tasks: list[LeasedTask]
+    targets: list[TargetLeaseOut] = Field(default_factory=list)
+
+
+class TargetRenewRequest(_Model):
+    egress: str = Field(max_length=64)
+    worker_id: str | None = Field(default=None, max_length=200)
+    leases: list[UUID] = Field(default_factory=list, max_length=MAX_REFS)
+    release: list[UUID] = Field(
+        default_factory=list, max_length=MAX_REFS, description="No more tasks for these"
+    )
+
+
+class RenewedTarget(_Model):
+    lease_id: UUID
+    expires_at: datetime
+
+
+class LostTarget(_Model):
+    lease_id: UUID
+    reason: str
+
+
+class TargetRenewResponse(_Model):
+    renewed: list[RenewedTarget]
+    lost: list[LostTarget] = Field(description="Stop sending to these targets now")
+
+
+class SpendRequest(_Model):
+    egress: str = Field(max_length=64)
+    provider: str = Field(max_length=100)
+    task_type: str
+    n: int = Field(ge=1, le=1000)
+
+
+class SpendResponse(_Model):
+    granted: int
+
+
+class RevokeRequest(_Model):
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class RefsRequest(_Model):
@@ -174,10 +247,16 @@ class ReleaseRef(Ref):
         le=30 * 86400,
         description="Due again this many seconds from now; unset: due time unchanged",
     )
+    cooldown: bool = Field(
+        default=False,
+        description="The target pushed back: no egress gets it for after_s (target leases)",
+    )
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class ReleaseRequest(_Model):
     leases: list[ReleaseRef] = Field(min_length=1, max_length=MAX_REFS)
+    egress: str | None = Field(default=None, max_length=64, description="Recorded with cooldowns")
 
 
 class FailTask(Ref):
@@ -187,10 +266,15 @@ class FailTask(Ref):
         default=None, gt=0, le=30 * 86400, description="Override the backoff"
     )
     permanent: bool = Field(default=False, description="Mark dead now; no more attempts")
+    cooldown: bool = Field(
+        default=False,
+        description="The target pushed back: no egress gets it for retry_after_s (target leases)",
+    )
 
 
 class FailRequest(_Model):
     tasks: list[FailTask] = Field(min_length=1, max_length=MAX_REFS)
+    egress: str | None = Field(default=None, max_length=64, description="Recorded with cooldowns")
 
 
 class AppliedResponse(_Model):
@@ -272,6 +356,8 @@ def create_app(
         issuer=settings.jwt_issuer,
     )
     frontier = Frontier(settings.env)
+    dispatcher = Dispatcher(settings.env, frontier.schema, settings.egress_schema)
+    planner = Planner(settings.egress_schema)
     metrics = Metrics(settings.env)
     # jit off: the lease query runs as a prepared statement, and its generic plan's
     # cost crosses jit_above_cost, so Postgres would JIT-compile it on every call
@@ -284,7 +370,9 @@ def create_app(
         kwargs={"autocommit": True, "options": "-c jit=off"},
     )
 
-    async def background(name: str, interval: float, fn) -> None:
+    async def background(name: str, interval: float, fn, wait_first: bool = False) -> None:
+        if wait_first:
+            await asyncio.sleep(interval)
         while True:
             try:
                 await fn()
@@ -355,6 +443,52 @@ def create_app(
                     "SELECT pg_advisory_unlock(hashtext(%s))", (lock_key + ":purge",)
                 )
 
+    async def egress_sweep_once() -> None:
+        # Only the egress schema's owner deletes; one API instance at a time.
+        if not settings.egress_owner:
+            return
+        key = f"leasehold-egress-sweeper:{settings.egress_schema}"
+        async with pool.connection() as conn:
+            got = (
+                await (
+                    await conn.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (key,))
+                ).fetchone()
+            )[0]
+            if not got:
+                return
+            try:
+                await dispatcher.sweep(conn)
+                await planner.sweep(conn)
+            except EgressNotReady:
+                pass
+            finally:
+                await conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (key,))
+
+    async def plan_once() -> None:
+        # Demand from every environment; plans only from the schema's owner (prod), so
+        # code deployed to dev never plans the budgets prod uses.
+        async with pool.connection() as conn:
+            try:
+                budgets = await dispatcher.budgets(conn)
+            except Exception:  # noqa: BLE001 - the egress schema isn't there yet
+                return
+            classes = {
+                tt: effective_class(k, settings.env, budgets)
+                for tt, k in registry.egress_classes.items()
+            }
+            await publish_demand(
+                conn,
+                settings.env,
+                frontier.schema,
+                classes,
+                budgets.planning.horizon,
+                settings.egress_schema,
+            )
+            if settings.egress_owner:
+                n = await planner.plan(conn)
+                if n:
+                    log.info("planned egress allocations", extra={"fields": {"rows": n}})
+
     async def stats_once() -> None:
         async with pool.connection() as conn:
             for s in await frontier.stats(conn):
@@ -379,6 +513,13 @@ def create_app(
             asyncio.create_task(background("sweeper", settings.sweep_interval, sweep_once)),
             asyncio.create_task(background("stats", settings.stats_interval, stats_once)),
             asyncio.create_task(background("purge", settings.purge_interval, purge_once)),
+            asyncio.create_task(
+                background("egress sweeper", settings.purge_interval, egress_sweep_once)
+            ),
+            # The first run waits an interval: the window it plans is a minute ahead anyway.
+            asyncio.create_task(
+                background("egress planner", settings.plan_interval, plan_once, wait_first=True)
+            ),
             asyncio.create_task(inbox_table()),
         ]
         try:
@@ -400,6 +541,8 @@ def create_app(
     app.state.sweep_once = sweep_once
     app.state.stats_once = stats_once
     app.state.purge_once = purge_once
+    app.state.egress_sweep_once = egress_sweep_once
+    app.state.plan_once = plan_once
     app.state.inbox = inbox
 
     @app.exception_handler(AuthError)
@@ -412,6 +555,10 @@ def create_app(
     async def _forbidden(request: Request, exc: Forbidden):
         return JSONResponse({"detail": str(exc)}, status_code=403)
 
+    @app.exception_handler(EgressRefused)
+    async def _egress_refused(request: Request, exc: EgressRefused):
+        return JSONResponse({"detail": str(exc)}, status_code=403)
+
     @app.exception_handler(UnknownTaskType)
     async def _unknown(request: Request, exc: UnknownTaskType):
         return JSONResponse({"detail": f"unknown task type {exc.args[0]!r}"}, status_code=404)
@@ -419,9 +566,23 @@ def create_app(
     async def any_caller(authorization: Annotated[str | None, Header()] = None) -> Caller:
         return await auth.authenticate(authorization)
 
-    async def caller(c: Annotated[Caller, Depends(any_caller)]) -> Caller:
+    async def caller(
+        c: Annotated[Caller, Depends(any_caller)],
+        x_leasehold_for: Annotated[str | None, Header()] = None,
+    ) -> Caller:
         if c.alerts:
             raise Forbidden(f"{c.name} may only post alert notifications")
+        if c.agent:
+            if x_leasehold_for is None:
+                return c
+            # An agent calling for a worker on its machine: the worker's own credential,
+            # verified like any other, and the worker's permissions.
+            w = await auth.authenticate(x_leasehold_for)
+            if w.agent or w.alerts or w.admin:
+                raise Forbidden(f"{c.name} calls only on behalf of workers")
+            return dataclasses.replace(w, via=c.name)
+        if x_leasehold_for is not None:
+            raise Forbidden(f"{c.name} may not call on behalf of others")
         return c
 
     CallerDep = Annotated[Caller, Depends(caller)]
@@ -449,6 +610,7 @@ def create_app(
                 t.payload,
                 t.country.upper() if t.country else None,
                 t.group,
+                t.provider,
             )
             for t in req.tasks
         ]
@@ -465,13 +627,88 @@ def create_app(
             raise Forbidden(f"{c.name} consumes no task types")
         registry.require_lease(c, types)
         instance = c.instance or req.worker_id or "unknown"
+        holder = leased_by = f"{c.name}:{instance}"
+        if c.via:
+            # The machine's agent holds the target leases for all its workers.
+            holder = f"{c.via}@{req.egress}"
+        targeted = types & registry.target_leased
+        plain = types - targeted
+        if targeted and not req.egress:
+            # Fail closed: without its egress, a worker can't be given targets.
+            raise HTTPException(400, f"{', '.join(sorted(targeted))} need the worker's egress")
+        rows: list[dict] = []
+        targets = []
         async with pool.connection() as conn:
-            rows = await frontier.lease(
-                conn, sorted(types), req.max, f"{c.name}:{instance}", req.per_group, req.held
-            )
+            if targeted:
+                grant = await dispatcher.lease(
+                    conn,
+                    sorted(targeted),
+                    req.max,
+                    req.egress,
+                    holder,
+                    registry.egress_classes,
+                    leased_by=leased_by,
+                )
+                rows += grant.tasks
+                targets = grant.targets
+            if plain and len(rows) < req.max:
+                rows += await frontier.lease(
+                    conn, sorted(plain), req.max - len(rows), leased_by, req.per_group, req.held
+                )
         for r in rows:
             count(r["task_type"], "leased")
-        return LeaseResponse(tasks=[LeasedTask(**r) for r in rows])
+        return LeaseResponse(
+            tasks=[LeasedTask(**r) for r in rows],
+            targets=[TargetLeaseOut(**t.__dict__) for t in targets],
+        )
+
+    @app.post("/v1/targets/renew", response_model=TargetRenewResponse)
+    async def renew_targets(req: TargetRenewRequest, c: CallerDep):
+        if c.agent:
+            holder = f"{c.name}@{req.egress}"
+        elif registry.leasable(c) & registry.target_leased:
+            holder = f"{c.name}:{c.instance or req.worker_id or 'unknown'}"
+        else:
+            raise Forbidden(f"{c.name} consumes no task types with target leases")
+        async with pool.connection() as conn:
+            ok, lost = await dispatcher.renew(conn, req.egress, holder, req.leases, req.release)
+        return TargetRenewResponse(
+            renewed=[RenewedTarget(lease_id=i, expires_at=e) for i, e in ok.items()],
+            lost=[LostTarget(lease_id=i, reason=r) for i, r in lost.items()],
+        )
+
+    @app.post("/v1/targets/spend", response_model=SpendResponse)
+    async def spend(req: SpendRequest, c: CallerDep):
+        if not c.agent:
+            raise Forbidden(f"{c.name} is not an egress agent")
+        if req.task_type not in registry.target_leased:
+            raise UnknownTaskType(req.task_type)
+        async with pool.connection() as conn:
+            granted = await dispatcher.spend(
+                conn, req.egress, req.provider, registry.egress_classes[req.task_type], req.n
+            )
+        return SpendResponse(granted=granted)
+
+    @app.post("/v1/targets/{target}/revoke")
+    async def revoke_target(target: str, req: RevokeRequest, c: CallerDep):
+        require_admin(c)
+        async with pool.connection() as conn:
+            revoked = await dispatcher.revoke(conn, target, req.reason)
+        return {"revoked": revoked}
+
+    async def _cool(conn, items: list[tuple[str, str, float, str]], egress: str | None) -> None:
+        """items: (task_type, key, seconds, reason) of tasks whose target pushed back."""
+        items = [i for i in items if i[0] in registry.target_leased and i[2] > 0]
+        if not items:
+            return
+        targets = await dispatcher.targets_of(conn, [(a, b) for a, b, _, _ in items])
+        budgets = await dispatcher.budgets(conn)
+        cooling = [
+            Cooling(targets[(tt, key)], timedelta(seconds=s), reason)
+            for tt, key, s, reason in items
+            if (tt, key) in targets
+        ]
+        await dispatcher.cool(conn, cooling, egress, budgets.cooldown.max)
 
     def _check_refs(c: Caller, refs) -> None:
         registry.require_lease(c, {r.task_type for r in refs})
@@ -507,8 +744,12 @@ def create_app(
             )
             for t in req.tasks
         ]
+        cool = [
+            (t.task_type, t.key, t.retry_after_s or 0, t.reason) for t in req.tasks if t.cooldown
+        ]
         async with pool.connection() as conn:
             n, unknown = await frontier.fail(conn, items)
+            await _cool(conn, cool, req.egress)
         _count_applied(req.tasks, unknown, "failed")
         return AppliedResponse(applied=n, unknown=_refs(unknown))
 
@@ -516,10 +757,16 @@ def create_app(
     async def release(req: ReleaseRequest, c: CallerDep):
         _check_refs(c, req.leases)
         after = {r.to_store(): r.after_s for r in req.leases if r.after_s is not None}
+        cool = [
+            (r.task_type, r.key, r.after_s or 0, r.reason or "pushback")
+            for r in req.leases
+            if r.cooldown
+        ]
         async with pool.connection() as conn:
             n, unknown = await frontier.release(
                 conn, [r.to_store() for r in req.leases], after=after
             )
+            await _cool(conn, cool, req.egress)
         _count_applied(req.leases, unknown, "released")
         return AppliedResponse(applied=n, unknown=_refs(unknown))
 
@@ -575,6 +822,16 @@ def create_app(
         metrics.paused.labels(settings.env, name).set(0)
         log.warning("%s resumed %s", c.name, name)
         return {"resumed": name}
+
+    # --- egress ---
+
+    @app.get("/v1/egress/providers")
+    async def egress_providers(c: CallerDep):
+        async with pool.connection() as conn:
+            try:
+                return await provider_rules(conn, settings.egress_schema)
+            except EgressNotReady as e:
+                raise HTTPException(503, str(e)) from None
 
     @app.get("/v1/whoami")
     async def whoami(c: CallerDep):

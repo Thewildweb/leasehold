@@ -57,6 +57,9 @@ def load_spec(path: str | Path, *, dashboards: bool = True) -> ServiceSpec:
         for sname, sink in spec.clickhouse.sinks.items():
             if m := _check_schema_file(path.parent / sink.schema_file):
                 errors.append(f"clickhouse.sinks.{sname}.schema_file: {m}")
+        for dname, d in spec.clickhouse.derived.items():
+            if m := _check_schema_file(path.parent / d.schema_file, derived=True):
+                errors.append(f"clickhouse.derived.{dname}.schema_file: {m}")
     if errors:
         raise SpecError(path, errors)
     return spec
@@ -68,11 +71,11 @@ def read_dashboard_files(spec_path: str | Path, spec: ServiceSpec) -> dict[str, 
     return {f: json.loads((base / f).read_text()) for f in spec.dashboards.files}
 
 
-def _check_schema_file(path: Path) -> str | None:
-    from leasehold.clickhouse.schema import SchemaFileError, parse
+def _check_schema_file(path: Path, derived: bool = False) -> str | None:
+    from leasehold.clickhouse.schema import SchemaFileError, parse, parse_derived
 
     try:
-        parse(path.read_text())
+        (parse_derived if derived else parse)(path.read_text())
     except OSError as e:
         return str(e)
     except SchemaFileError as e:

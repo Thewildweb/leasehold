@@ -361,3 +361,32 @@ def test_planner_job_env():
     assert "LEASEHOLD_EGRESS_IP" not in env  # only task workers send requests out
     # The job reads its Nomad Variable (Kafka for the plan log, ClickHouse password).
     assert job.job["TaskGroups"][0]["Tasks"][0]["Templates"]
+
+
+def test_agent_socket_for_target_leasing_workers(spec):
+    from dataclasses import replace
+
+    from leasehold.spec import ServiceSpec
+
+    data = spec.model_dump(mode="json", exclude_none=True, by_alias=True)
+    data["frontier"]["task_types"]["certwatch.chunk"]["target_leases"] = True
+    targeted = ServiceSpec.model_validate(data)
+    with_agent = replace(PLATFORM, agent_volume="leasehold-agent")
+
+    job = render_job(targeted, "worker", "dev", SHA, with_agent).job
+    group = job["TaskGroups"][0]
+    assert group["Volumes"] == {
+        "leasehold-agent": {"Name": "leasehold-agent", "Type": "host", "Source": "leasehold-agent"}
+    }
+    task = _task(job)
+    assert task["VolumeMounts"] == [
+        {"Volume": "leasehold-agent", "Destination": "/run/leasehold-agent", "ReadOnly": False}
+    ]
+    assert task["Env"]["LEASEHOLD_AGENT_SOCKET"] == "/run/leasehold-agent/dev.sock"
+
+    # Without target leases, or without the volume configured: no mount, no socket.
+    for s, p in ((spec, with_agent), (targeted, PLATFORM)):
+        job = render_job(s, "worker", "dev", SHA, p).job
+        assert "Volumes" not in job["TaskGroups"][0]
+        assert "VolumeMounts" not in _task(job)
+        assert "LEASEHOLD_AGENT_SOCKET" not in _task(job)["Env"]
