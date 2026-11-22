@@ -10,6 +10,7 @@ Conventions:
 - Every other environment (e.g. ``dev``) prefixes its resources:
   ``dev.`` for Kafka names, ``dev_`` for database and schema names.
 - Nomad jobs are not prefixed; environments are separate Nomad namespaces.
+- Buckets get ``dev-`` (bucket names allow neither ``.`` nor ``_`` safely).
 """
 
 from __future__ import annotations
@@ -136,7 +137,7 @@ def clickhouse_kafka_variable(service: str) -> str:
     return f"leasehold/{service}/clickhouse-kafka"
 
 
-RESERVED_COMPONENT_NAMES = frozenset({"clickhouse"})
+RESERVED_COMPONENT_NAMES = frozenset({"clickhouse", "archive"})
 
 # The plan log: a topic per service with a planner, and its two sinks in the service's
 # database (one row per queued key, one per run). apply creates them; a service can't
@@ -194,7 +195,74 @@ def postgres_schema(env: str, schema: str) -> str:
     return f"{_underscore_prefix(env)}{schema}"
 
 
-def object_prefix(env: str, service: str) -> str:
-    """Object-storage key prefix, e.g. ``dev/certlog/``."""
+BUCKET_NAME_RE = re.compile(rf"^{KEBAB}$")
+BUCKET_REF_RE = re.compile(rf"^(?:(?P<service>{KEBAB})\.)?(?P<name>{KEBAB})$")
+
+
+def bucket(env: str, service: str, name: str) -> str:
+    """Object storage bucket, e.g. ``certlog-raw`` in prod and ``dev-certlog-raw`` in dev.
+
+    Hyphens only: bucket names can't contain ``_``, and dots break virtual-host TLS.
+    """
     _check(service, SERVICE_RE, "service name")
-    return f"{check_env(env)}/{service}/"
+    _check(name, BUCKET_NAME_RE, "bucket name")
+    prefix = "" if check_env(env) == PROD else f"{env}-"
+    full = f"{prefix}{service}-{name}"
+    if not 3 <= len(full) <= 63:
+        raise NamingError(f"bucket name {full!r} is longer than 63 characters")
+    return full
+
+
+@dataclass(frozen=True, order=True)
+class BucketRef:
+    """An environment-independent reference to a bucket: ``<service>.<bucket>``."""
+
+    service: str
+    name: str
+
+    @classmethod
+    def parse(cls, ref: str, default_service: str | None = None) -> BucketRef:
+        """``raw`` (with ``default_service``) or ``certlog.raw``."""
+        m = BUCKET_REF_RE.match(ref)
+        if not m or (m["service"] is None and default_service is None):
+            raise NamingError(f"invalid bucket reference {ref!r}: expected '<service>.<bucket>'")
+        return cls(m["service"] or default_service, m["name"])  # type: ignore[arg-type]
+
+    def __str__(self) -> str:
+        return f"{self.service}.{self.name}"
+
+
+def bucket_for(env: str, ref: BucketRef) -> str:
+    return bucket(env, ref.service, ref.name)
+
+
+def storage_user(env: str, service: str, component: str) -> str:
+    """Object storage user of one component, e.g. ``dev.certlog.worker`` (as its Kafka user)."""
+    return kafka_principal(env, service, component)
+
+
+def storage_policy(env: str, service: str, component: str) -> str:
+    """Policy attached to a component's storage user, e.g. ``leasehold.dev.certlog.worker``."""
+    return f"{STORAGE_POLICY_PREFIX}{storage_user(env, service, component)}"
+
+
+STORAGE_POLICY_PREFIX = "leasehold."
+
+# Archive sinks run as platform components named ``archive-<sink>``: their Nomad job,
+# Kafka user, consumer group and storage user are those of that component name.
+ARCHIVE_COMPONENT_PREFIX = "archive-"
+
+
+def archive_component(sink: str) -> str:
+    """Component name of an archive sink, e.g. ``archive-responses``."""
+    _check(sink, SERVICE_RE, "archive sink name")
+    return f"{ARCHIVE_COMPONENT_PREFIX}{sink}"
+
+
+# Claim check: payloads over the inline limit, stored under this prefix in a bucket.
+CLAIMS_PREFIX = "claims/"
+
+
+def claims_prefix(ref: TopicRef) -> str:
+    """Key prefix of one topic's claimed payloads, e.g. ``claims/certlog.entries.v1/``."""
+    return f"{CLAIMS_PREFIX}{ref}/"

@@ -39,5 +39,14 @@ def resource_names(spec: ServiceSpec, env: str) -> list[tuple[str, str, str]]:
                 rows.append(("clickhouse sink", "(plan log)", f"{db}.{sname}"))
         for name in spec.clickhouse.shared:
             rows.append(("shared table", name, f"{db}.{name}"))
-    rows.append(("object prefix", "-", naming.object_prefix(env, spec.name)))
+    for bname in spec.buckets:
+        rows.append(("bucket", bname, naming.bucket(env, spec.name, bname)))
+    for cname, c in spec.all_components().items():
+        if c.reads_buckets or c.writes_buckets:
+            rows.append(("storage user", cname, naming.storage_user(env, spec.name, cname)))
+    for aname in spec.archives:
+        cname = naming.archive_component(aname)
+        rows.append(("archive sink", aname, naming.nomad_job(spec.name, cname)))
+        rows.append(("kafka principal", cname, naming.kafka_principal(env, spec.name, cname)))
+        rows.append(("consumer group", cname, naming.consumer_group(env, spec.name, cname)))
     return rows

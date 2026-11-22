@@ -27,9 +27,17 @@ What each job gets:
   machine's egress agent (``leasehold.agent``) instead of the control API.
 - A workload identity ``leasehold`` (audience ``leasehold``) written to
   ``$NOMAD_SECRETS_DIR/nomad_leasehold.jwt``, which the control API client reads.
-- Secrets: components that use Kafka render the Nomad Variable ``nomad/jobs/<job>``
-  (written by ``apply``'s credentials step) into env vars; every path in the spec's
-  ``secrets`` is rendered the same way. A missing variable keeps the task from starting.
+- Components that read or write buckets: ``LEASEHOLD_S3_ENDPOINT`` (and
+  ``LEASEHOLD_S3_REGION`` when set); their keys are in the job's variable (storage step).
+- Archive sinks (``archives`` in the spec): a job ``<service>-archive-<sink>`` like a
+  processor's, running ``leasehold archive run`` in ``Platform.archive_image``, with the
+  sink's settings in ``LEASEHOLD_ARCHIVE`` (the image has no service.yml). Its
+  ephemeral disk holds one open file per partition: (topic partitions) x
+  (``file_size_mb`` + ``row_group_mb``) + 256 MB, so one instance can hold them all.
+- Secrets: components that use Kafka or buckets render the Nomad Variable
+  ``nomad/jobs/<job>`` (written by ``apply``'s credentials and storage steps) into env
+  vars; every path in the spec's ``secrets`` is rendered the same way. A missing
+  variable keeps the task from starting.
 - Long-running components (task-worker, processor, api): a dynamic port ``http``, a
   Nomad service ``<job>`` with an HTTP check on ``/health`` that restarts a stuck
   process, and tags ``leasehold``, ``env=..``, ``service=..``, ``component=..``. The
@@ -50,7 +58,15 @@ from datetime import timedelta
 from typing import Any
 
 from leasehold import naming
-from leasehold.spec.models import Api, Component, Processor, Scheduled, ServiceSpec, TaskWorker
+from leasehold.spec.models import (
+    Api,
+    ArchiveComponent,
+    Component,
+    Processor,
+    Scheduled,
+    ServiceSpec,
+    TaskWorker,
+)
 
 IDENTITY_NAME = "leasehold"
 IDENTITY_AUDIENCE = "leasehold"
@@ -98,6 +114,15 @@ class Platform:
     # Nomad host volume with the egress agents' sockets, on every machine that runs
     # target-leasing workers. Unset: those workers lease from the control API directly.
     agent_volume: str | None = None
+    # S3 endpoint as jobs reach it (e.g. http://minio.service:9000), for bucket users.
+    s3_endpoint: str | None = None
+    s3_region: str = ""
+    # Image of the archive sinks (leasehold's ``archive`` image target), with its tag.
+    archive_image: str | None = None
+    # Topic reference → bucket reference of its claims (any service); ``plan`` fills it in.
+    claim_buckets: dict[str, str] = field(default_factory=dict, hash=False)
+    # Topic reference → partitions (any service); ``plan`` fills it in.
+    topic_partitions: dict[str, int] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)
@@ -122,8 +147,15 @@ class NomadPlan:
     jobs: list[JobPlan]
 
 
-def uses_kafka(c: Component) -> bool:
-    return bool(c.topics_produced()) or isinstance(c, Processor)
+AnyComponent = Component | ArchiveComponent
+
+
+def uses_kafka(c: AnyComponent) -> bool:
+    return bool(c.topics_produced()) or isinstance(c, Processor | ArchiveComponent)
+
+
+def uses_storage(c: AnyComponent) -> bool:
+    return bool(c.reads_buckets or c.writes_buckets)
 
 
 def job_variable_path(job_id: str) -> str:
@@ -142,8 +174,39 @@ def _secrets_template(paths: list[str]) -> str:
     return "".join(parts)
 
 
+def _archive_env(spec: ServiceSpec, c: ArchiveComponent, env: str, platform: Platform) -> str:
+    """The archive sink's settings: the sink as declared, with the actual names."""
+    sink = spec.archives[c.sink]
+    ref = c.consumes[0]
+    claims = platform.claim_buckets.get(ref)
+    settings = {
+        "sink": c.sink,
+        "spec": sink.model_dump(mode="json", by_alias=True),
+        "topic": naming.topic_for(env, naming.TopicRef.parse(ref)),
+        "topic_ref": ref,
+        "bucket": naming.bucket(env, spec.name, sink.bucket),
+        "claims_bucket": (
+            naming.bucket_for(env, naming.BucketRef.parse(claims)) if claims else None
+        ),
+    }
+    return json.dumps(settings, separators=(",", ":"), sort_keys=True)
+
+
+ARCHIVE_DISK_MARGIN_MB = 256
+
+
+def archive_disk_mb(spec: ServiceSpec, c: ArchiveComponent, platform: Platform) -> int:
+    """Local disk for an archive sink's open files: every partition on one instance."""
+    sink = spec.archives[c.sink]
+    ref = c.consumes[0]
+    if ref not in platform.topic_partitions:
+        raise ValueError(f"{spec.name}.{c.sink}: archives {ref}, which no service produces")
+    per_file = sink.file_size_mb + sink.row_group_mb
+    return platform.topic_partitions[ref] * per_file + ARCHIVE_DISK_MARGIN_MB
+
+
 def _env(
-    spec: ServiceSpec, cname: str, c: Component, env: str, version: str, platform: Platform
+    spec: ServiceSpec, cname: str, c: AnyComponent, env: str, version: str, platform: Platform
 ) -> dict[str, str]:
     out = {
         "LEASEHOLD_ENV": env,
@@ -165,6 +228,14 @@ def _env(
             raise ValueError(f"{spec.name}.{cname} consumes {', '.join(missing)}: no producer")
         models = {r: platform.payload_models[r] for r in sorted(c.consumes)}
         out["LEASEHOLD_PAYLOAD_MODELS"] = json.dumps(models, separators=(",", ":"))
+    if uses_storage(c):
+        if not platform.s3_endpoint:
+            raise ValueError(f"{spec.name}.{cname} uses buckets; set the S3 endpoint (storage)")
+        out["LEASEHOLD_S3_ENDPOINT"] = platform.s3_endpoint
+        if platform.s3_region:
+            out["LEASEHOLD_S3_REGION"] = platform.s3_region
+    if isinstance(c, ArchiveComponent):
+        out["LEASEHOLD_ARCHIVE"] = _archive_env(spec, c, env, platform)
     if isinstance(c, TaskWorker):
         # Nomad interpolates the node's meta; a node without it leaves the text as is,
         # which the runtime reads as no egress address.
@@ -201,12 +272,19 @@ def _uses_agent(spec: ServiceSpec, c: Component, platform: Platform) -> bool:
 
 
 def _task(
-    spec: ServiceSpec, cname: str, c: Component, env: str, version: str, platform: Platform
+    spec: ServiceSpec, cname: str, c: AnyComponent, env: str, version: str, platform: Platform
 ) -> dict[str, Any]:
     job_id = naming.nomad_job(spec.name, cname)
-    config: dict[str, Any] = {
-        "image": naming.image_ref(platform.registry, spec.name, cname, version),
-    }
+    if isinstance(c, ArchiveComponent):
+        if not platform.archive_image:
+            raise ValueError(f"{spec.name}.{cname}: set the archive image (jobs.archive_image)")
+        config: dict[str, Any] = {
+            "image": platform.archive_image,
+            "command": "leasehold",
+            "args": ["archive", "run"],
+        }
+    else:
+        config = {"image": naming.image_ref(platform.registry, spec.name, cname, version)}
     if c.command:
         config["command"] = c.command[0]
         if c.command[1:]:
@@ -214,7 +292,10 @@ def _task(
     if not isinstance(c, Scheduled):
         config["ports"] = [HTTP_PORT]
 
-    secret_paths = ([job_variable_path(job_id)] if uses_kafka(c) else []) + list(spec.secrets)
+    own = uses_kafka(c) or uses_storage(c)
+    secret_paths = ([job_variable_path(job_id)] if own else []) + (
+        [] if isinstance(c, ArchiveComponent) else list(spec.secrets)
+    )
     templates = []
     if secret_paths:
         templates.append(
@@ -278,7 +359,7 @@ def _service(spec: ServiceSpec, cname: str, env: str) -> dict[str, Any]:
 def render_job(
     spec: ServiceSpec, cname: str, env: str, version: str, platform: Platform
 ) -> JobPlan:
-    c = spec.components[cname]
+    c = spec.all_components()[cname]
     job_id = naming.nomad_job(spec.name, cname)
     namespace = naming.nomad_namespace(env)
     task = _task(spec, cname, c, env, version, platform)
@@ -287,6 +368,8 @@ def render_job(
         group["Volumes"] = {
             AGENT_VOLUME: {"Name": AGENT_VOLUME, "Type": "host", "Source": platform.agent_volume}
         }
+    if isinstance(c, ArchiveComponent):
+        group["EphemeralDisk"] = {"SizeMB": archive_disk_mb(spec, c, platform)}
     if c.max_per_node is not None:
         group["Constraints"] = [
             {
@@ -328,7 +411,7 @@ def render_job(
         group["ReschedulePolicy"] = {"Attempts": 0, "Unlimited": False}
         return JobPlan(spec.name, cname, job_id, namespace, None, None, job)
 
-    assert isinstance(c, TaskWorker | Processor | Api)
+    assert isinstance(c, TaskWorker | Processor | Api | ArchiveComponent)
     job["Type"] = "service"
     group["Count"] = c.count.min
     port: dict[str, Any] = {"Label": HTTP_PORT}
@@ -364,11 +447,17 @@ def plan(specs: list[ServiceSpec], env: str, version: str, platform: Platform) -
         | platform.payload_models,
         databases={s.name: s.clickhouse.database for s in specs if s.clickhouse}
         | platform.databases,
+        claim_buckets={str(t): str(b) for s in specs for t, b in s.large_payload_buckets().items()}
+        | platform.claim_buckets,
+        topic_partitions={
+            str(s.topic_ref(name)): t.partitions for s in specs for name, t in s.topics().items()
+        }
+        | platform.topic_partitions,
     )
     jobs = [
         render_job(spec, cname, env, version, platform)
         for spec in sorted(specs, key=lambda s: s.name)
-        for cname in spec.components
+        for cname in spec.all_components()
     ]
     return NomadPlan(env=env, namespace=naming.nomad_namespace(env), jobs=jobs)
 

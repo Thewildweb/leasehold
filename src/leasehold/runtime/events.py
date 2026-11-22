@@ -11,8 +11,13 @@ Every message on every topic is one JSON object:
       "target": "…", "egress_ip": "…",       when the event is about a fetch
       "ts": "2026-11-11T12:00:00.123Z",
       "payload": { … },
-      "payload_ref": null          reserved for large payloads in object storage
+      "payload_ref": null          a claim check: see below
     }
+
+Claim check: an event over ``MAX_PAYLOAD_BYTES`` is refused (``PayloadTooLarge``),
+unless its topic has ``large_payloads: <bucket>``. Then the payload is stored in that
+bucket and the event is sent with ``payload: null`` and a ``payload_ref`` (bucket, key,
+sha256, size; ``leasehold.runtime.claims``). Consumers resolve it.
 
 The Kafka message key is the payload field named by the topic's ``key`` in
 ``service.yml``, unless a key is passed explicitly.
@@ -37,7 +42,7 @@ from prometheus_client import Counter
 from pydantic import BaseModel, ValidationError
 
 from leasehold import naming
-from leasehold.runtime import payloads
+from leasehold.runtime import claims, payloads
 from leasehold.runtime.config import RuntimeConfig
 
 log = logging.getLogger("leasehold")
@@ -47,6 +52,9 @@ MAX_PAYLOAD_BYTES = 1_900_000
 
 EVENTS = Counter("leasehold_events_produced", "Events confirmed by Kafka", ["topic"])
 PRODUCE_ERRORS = Counter("leasehold_produce_errors", "Events Kafka didn't accept", ["topic"])
+CLAIMED = Counter(
+    "leasehold_events_claimed", "Payloads stored in a bucket by claim check", ["topic"]
+)
 INVALID_PAYLOADS = Counter(
     "leasehold_invalid_payloads",
     "Payloads refused before producing: not the topic's model",
@@ -103,9 +111,13 @@ class EventProducer:
         cfg: RuntimeConfig,
         producer: Producer | None = None,
         models: dict[str, type[BaseModel]] | None = None,
+        objects=None,
     ):
-        """``models``: per topic name, instead of importing each ``payload_model``."""
+        """``models``: per topic name, instead of importing each ``payload_model``.
+        ``objects``: the object store for claims (default: from the environment, when a
+        payload needs one)."""
         self.cfg = cfg
+        self._objects = objects
         spec = cfg.spec
         self.allowed = cfg.component_spec.topics_produced()
         self.topics = {
@@ -183,7 +195,7 @@ class EventProducer:
         }
         value = json.dumps(envelope, separators=(",", ":"), default=str).encode()
         if len(value) > MAX_PAYLOAD_BYTES:
-            raise PayloadTooLarge(f"{topic}: event is {len(value)} bytes (max {MAX_PAYLOAD_BYTES})")
+            value = self._claim(topic, spec, envelope, len(value))
         d = Delivery(event_id, actual)
         while True:
             try:
@@ -197,6 +209,30 @@ class EventProducer:
             except BufferError:
                 # Local queue full: wait for deliveries to drain it.
                 self._producer.poll(0.5)
+
+    def _claim(self, topic: str, spec, envelope: dict, size: int) -> bytes:
+        """Store the payload by claim check; the envelope to send instead."""
+        if not spec.large_payloads:
+            raise PayloadTooLarge(
+                f"{topic}: event is {size} bytes (max {MAX_PAYLOAD_BYTES}); set "
+                "large_payloads on the topic to store large payloads in a bucket"
+            )
+        if self._objects is None:
+            from leasehold.storage.client import ObjectStore
+
+            self._objects = ObjectStore.from_env()
+        body = json.dumps(envelope["payload"], separators=(",", ":"), default=str).encode()
+        ref = claims.store(
+            self._objects,
+            self.cfg.env,
+            naming.BucketRef(self.cfg.service, spec.large_payloads),
+            self.cfg.spec.topic_ref(topic),
+            envelope["event_id"],
+            body,
+        )
+        CLAIMED.labels(self.topics[topic][0]).inc()
+        envelope = envelope | {"payload": None, "payload_ref": ref}
+        return json.dumps(envelope, separators=(",", ":"), default=str).encode()
 
     def flush(self, timeout: float = 30.0) -> int:
         """Wait for outstanding deliveries; returns how many are still pending."""

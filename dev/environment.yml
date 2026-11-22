@@ -1,7 +1,7 @@
 # `leasehold apply` against the dev stack (dev/docker-compose.yml):
 #
 #   export LEASEHOLD_KAFKA_PASSWORD=dev-admin LEASEHOLD_CLICKHOUSE_PASSWORD=dev-admin \
-#          LEASEHOLD_GRAFANA_PASSWORD=dev-admin \
+#          LEASEHOLD_GRAFANA_PASSWORD=dev-admin LEASEHOLD_S3_SECRET_KEY=dev-admin-secret \
 #          LEASEHOLD_DSN=postgresql://leasehold:dev-leasehold@localhost:15432/leasehold
 #   leasehold apply <services> -e dev/environment.yml --sha 0000000
 env: dev
@@ -19,6 +19,11 @@ clickhouse:
   url: http://localhost:18123
   user: admin
   password_env: LEASEHOLD_CLICKHOUSE_PASSWORD
+storage:
+  endpoint: http://localhost:19000
+  client_endpoint: http://minio:9000  # jobs and ClickHouse inside the compose network
+  access_key: admin
+  secret_key_env: LEASEHOLD_S3_SECRET_KEY
 grafana:
   url: http://localhost:13000
   user: admin

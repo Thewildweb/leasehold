@@ -57,4 +57,35 @@ def check_registry(specs: Iterable[ServiceSpec], *, partial: bool = False) -> li
                         "share (clickhouse.shared)"
                     )
 
+    errors.extend(_bucket_errors(specs, known_services, partial))
+    return errors
+
+
+def _bucket_errors(specs: list[ServiceSpec], known: set[str], partial: bool) -> list[str]:
+    """Buckets read from other services exist; consumers of a topic with a claim check
+    can read the claims (archive sinks get that grant from the platform)."""
+    from leasehold import naming
+    from leasehold.spec.models import Processor
+
+    errors = []
+    buckets = {naming.BucketRef(s.name, b) for s in specs for b in s.buckets}
+    claims = {t: b for s in specs for t, b in s.large_payload_buckets().items()}
+    for s in specs:
+        for cname, c in s.components.items():
+            read, write = c.bucket_refs(s.name)
+            for ref in sorted(read):
+                if ref.service == s.name or ref in buckets:
+                    continue
+                if partial and ref.service not in known:
+                    continue
+                errors.append(f"{s.name}: {cname} reads bucket {ref}, which no service declares")
+            if not isinstance(c, Processor):
+                continue
+            for r in c.consumes:
+                bucket = claims.get(naming.TopicRef.parse(r))
+                if bucket is not None and bucket not in read | write:
+                    errors.append(
+                        f"{s.name}: {cname} consumes {r}, whose large payloads are in bucket "
+                        f"{bucket}; add '{bucket}' to its reads_buckets"
+                    )
     return errors

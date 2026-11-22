@@ -2,11 +2,14 @@
 #
 #   docker build -f images/base/Dockerfile --target runtime     -t leasehold-base .
 #   docker build -f images/base/Dockerfile --target control-api -t leasehold-control-api .
+#   docker build -f images/base/Dockerfile --target archive     -t leasehold-archive .
 #
 # runtime:     Python 3.12 + leasehold with its locked dependencies. Every
 #              component image builds FROM it, so a deploy pulls only the
 #              component's own layers.
 # control-api: runtime + the server extra; runs `leasehold api serve`.
+# archive:     runtime + the archive extra (pyarrow); runs `leasehold archive run`, the
+#              archive sinks `apply` renders (environment file: jobs.archive_image).
 #
 # Dependencies come from uv.lock (exact versions), not from a fresh resolve.
 
@@ -25,6 +28,8 @@ COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable \
  && cp -a /opt/leasehold /opt/leasehold-runtime \
+ && uv sync --frozen --no-dev --no-editable --extra archive \
+ && cp -a /opt/leasehold /opt/leasehold-archive \
  && uv sync --frozen --no-dev --no-editable --extra server
 
 FROM ${PYTHON} AS common
@@ -56,3 +61,9 @@ LABEL org.opencontainers.image.description="leasehold control API"
 USER app
 EXPOSE 8400
 CMD ["leasehold", "api", "serve", "--host", "0.0.0.0", "--port", "8400"]
+
+FROM common AS archive
+COPY --from=build /opt/leasehold-archive /opt/leasehold
+LABEL org.opencontainers.image.description="leasehold archive sink"
+USER app
+CMD ["leasehold", "archive", "run"]

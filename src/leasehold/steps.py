@@ -15,7 +15,7 @@ from leasehold.spec import ServiceSpec
 
 Out = Callable[[str], None]
 
-ORDER = ("kafka", "frontier", "credentials", "clickhouse", "grafana", "nomad")
+ORDER = ("kafka", "frontier", "credentials", "storage", "clickhouse", "grafana", "nomad")
 
 
 @dataclass
@@ -130,6 +130,54 @@ def credentials(
             out(f"{len(creds)} credentials in place")
         if yes and (not d.empty or (prune and stale)):
             lh_credentials.apply(admin, nomad, d, prune=prune)
+            r.applied = True
+    finally:
+        nomad.close()
+    return r
+
+
+def storage(
+    out: Out,
+    specs: list[ServiceSpec],
+    env: str,
+    *,
+    endpoint: str,
+    access_key: str,
+    secret_key: str,
+    region: str = "",
+    nomad_url: str,
+    nomad_token: str | None,
+    rotate: bool = False,
+    yes: bool,
+    prune: bool,
+) -> Result:
+    """Buckets (lifecycle, versioning), a user and policy per component, its keys in Nomad."""
+    from leasehold import storage as lh_storage
+    from leasehold.nomad.apply import Nomad
+    from leasehold.storage import apply as sa
+
+    p = lh_storage.plan(specs, env)
+    st = sa.Storage.connect(endpoint, access_key, secret_key, region)
+    nomad = Nomad(nomad_url, token=nomad_token)
+    try:
+        d = sa.diff(st, nomad, p, sorted(s.name for s in specs), rotate=rotate)
+        for b in d.stale_buckets:
+            out(f"stale    {b}  (kept; buckets are never deleted by apply)")
+        for u in d.stale_users:
+            _stale(out, f"storage user {u}", prune, "deletes")
+        for name in d.stale_policies:
+            _stale(out, f"storage policy {name}", prune, "deletes")
+        for ns, path in d.stale_variables:
+            _stale(out, f"{ns}/{path} (storage keys)", prune, "clears")
+        for c in d.buckets:
+            out(str(c))
+        for c in d.users:
+            out(str(c))
+        r = Result(changes=d.changes + (d.prunable if prune else 0))
+        if not d.changes:
+            out(f"{len(p.buckets)} buckets and {len(p.users)} users in place")
+        if yes and r.changes:
+            sa.apply(st, nomad, d, prune=prune)
             r.applied = True
     finally:
         nomad.close()
@@ -285,6 +333,9 @@ def nomad(
     clickhouse_url: str | None = None,
     reads_from: dict[str, str] | None = None,
     agent_volume: str | None = None,
+    s3_endpoint: str | None = None,
+    s3_region: str = "",
+    archive_image: str | None = None,
     only: set[str] | None = None,
     yes: bool,
     prune: bool,
@@ -303,6 +354,9 @@ def nomad(
         clickhouse_url=clickhouse_url,
         reads_from=reads_from or {},
         agent_volume=agent_volume,
+        s3_endpoint=s3_endpoint,
+        s3_region=s3_region,
+        archive_image=archive_image,
     )
     naming.image_ref(registry, "x", "x", sha)  # checks the SHA and registry
     p = lh_nomad.plan(specs, env, sha, platform)
