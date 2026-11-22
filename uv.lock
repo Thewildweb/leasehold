@@ -434,7 +434,7 @@ requires-dist = [
     { name = "publicsuffixlist", specifier = ">=1.0" },
     { name = "pyarrow", marker = "extra == 'archive'", specifier = ">=18" },
     { name = "pydantic", specifier = ">=2.7" },
-    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'server'", specifier = ">=2.9" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'server'", specifier = ">=2.15.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30" },
 ]
