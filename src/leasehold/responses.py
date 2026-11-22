@@ -94,6 +94,11 @@ class Hop(BaseModel):
         "sent. Every other header's bytes are value.encode('utf-8')",
     )
     location: str = Field(default="", description="Location header, resolved to an absolute URL")
+    wire_bytes: int = Field(
+        default=0,
+        description="Body bytes as transferred, before content decoding (compressed size "
+        "when the server compressed); 0 if unknown",
+    )
 
 
 class Response(BaseModel):
@@ -121,6 +126,11 @@ class Response(BaseModel):
     # Who asked, how
     client: str = Field(description="e.g. curl_cffi 0.17.0")
     impersonate: str = Field(description="Browser profile the client imitates, e.g. chrome136")
+    egress: str = Field(
+        default="",
+        description="Egress class or pool the task asked for; '' if none. The address used "
+        "is the envelope's egress_ip",
+    )
     user_agent: str = Field(description="User-Agent header sent")
     rules_version: str = Field(
         default="", description="Version of the reflex rules the worker applied"
@@ -176,10 +186,18 @@ class Response(BaseModel):
         default="",
         description="Decoded text of the first body_bytes bytes. Charset as browsers pick "
         "it: byte order mark, Content-Type charset, <meta charset>; nothing declared: "
-        "UTF-8 if valid, else windows-1252. Undecodable bytes are replaced (U+FFFD)",
+        "UTF-8 if valid, else windows-1252. Undecodable bytes are replaced (U+FFFD). "
+        "Producers fill it with leasehold.decoding.decode_body; readers that want the "
+        "text use leasehold.decoding.body_text",
     )
     body_bytes: int = Field(default=0, description="Bytes received, after content decoding")
     body_truncated: bool = Field(default=False, description="Cut off at the size limit")
+    full_size: int = Field(
+        default=-1,
+        description="Decoded size of the whole body when known (a Content-Length without "
+        "Content-Encoding, or the size of a body that wasn't cut); -1 unknown. With "
+        "body_truncated, how much was left out",
+    )
     body_charset: str = Field(default="", description="Python codec name used for body")
     body_decode_errors: int = Field(
         default=0,
