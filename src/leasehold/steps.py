@@ -198,10 +198,16 @@ def clickhouse(
     accept_tables: set[str] = frozenset(),  # type: ignore[assignment]
     assume_passwords: set[str] = frozenset(),  # type: ignore[assignment]
     reads_from: dict[str, str] | None = None,
+    clickhouse_endpoint: str | None = None,
+    busy_tables: tuple[str, ...] = (),
     yes: bool,
     prune: bool,
 ) -> Result:
     """``services``: each spec with the directory of its ``service.yml``.
+
+    ``clickhouse_endpoint``: object storage as ClickHouse reaches it (snapshot datasets'
+    named collections). ``busy_tables``: what the environment's busy query reads,
+    granted to snapshot loaders.
 
     ``assume_passwords``: sink principals the credentials step will give a password;
     only used in a dry run, so the plan shows what the real run will do.
@@ -210,6 +216,8 @@ def clickhouse(
     from leasehold.clickhouse import users as lh_users
     from leasehold.clickhouse.apply import ClickHouse, apply, diff
     from leasehold.nomad.apply import Nomad
+    from leasehold.snapshots import apply as lh_snapshots_apply
+    from leasehold.snapshots import plan as lh_snapshots_plan
 
     p = lh_clickhouse.plan(services, env)
     ch = ClickHouse(url, user, password)
@@ -254,6 +262,27 @@ def clickhouse(
         for name in ud.stale:
             _stale(out, f"clickhouse user {name}", prune, "drops")
 
+        snapshot_plans = lh_snapshots_plan.plan(services, env)
+        sd, loader_profile_missing = lh_snapshots_apply.diff(
+            ch, nomad, snapshot_plans, env=env, services=sorted(s.name for s, _ in services),
+            clickhouse_endpoint=clickhouse_endpoint, busy_tables=tuple(busy_tables),
+            accept_tables=accept_tables,
+        )  # fmt: skip
+        for w in sd.warnings:
+            out(f"warning  {w}")
+        if loader_profile_missing and snapshot_plans:
+            out(f"create   settings profile {lh_snapshots_plan.LOADER_PROFILE}")
+        for c in sd.changes:
+            for line in c.lines():
+                out(line)
+        for name in sd.stale_users:
+            _stale(out, f"clickhouse user {name}", prune, "drops")
+        snapshot_changes = (
+            sd.count
+            + int(loader_profile_missing and bool(snapshot_plans))
+            + (len(sd.stale_users) if prune else 0)
+        )
+
         r = Result(
             changes=len(d.new_databases)
             + len(d.errors_tables)
@@ -261,13 +290,18 @@ def clickhouse(
             + (len(prunable) if prune else 0)
             + int(ud.profile_missing)
             + len(ud.changes)
-            + (len(ud.stale) if prune else 0),  # fmt: skip
-            skipped=list(d.skipped),
+            + (len(ud.stale) if prune else 0)
+            + snapshot_changes,  # fmt: skip
+            skipped=list(d.skipped) + list(sd.skipped),
         )
         if yes and r.changes:
             apply(ch, d, kafka_bootstrap, passwords, prune=prune)
             # After the sinks: the planners' own databases exist by now.
             lh_users.apply(ch, nomad, ud, prune=prune)
+            lh_snapshots_apply.apply(
+                ch, nomad, sd, loader_profile_missing and bool(snapshot_plans),
+                clickhouse_endpoint=clickhouse_endpoint, prune=prune,
+            )  # fmt: skip
             r.applied = True
     finally:
         ch.close()
@@ -336,10 +370,14 @@ def nomad(
     s3_endpoint: str | None = None,
     s3_region: str = "",
     archive_image: str | None = None,
+    snapshot_image: str | None = None,
+    snapshot_settings: dict[str, dict] | None = None,
     only: set[str] | None = None,
     yes: bool,
     prune: bool,
 ) -> Result:
+    """``snapshot_settings``: loader job ID → its settings
+    (``leasehold.snapshots.plan.loader_settings``)."""
     from leasehold import naming
     from leasehold import nomad as lh_nomad
     from leasehold.nomad import apply as na
@@ -357,6 +395,8 @@ def nomad(
         s3_endpoint=s3_endpoint,
         s3_region=s3_region,
         archive_image=archive_image,
+        snapshot_image=snapshot_image,
+        snapshot_settings=snapshot_settings or {},
     )
     naming.image_ref(registry, "x", "x", sha)  # checks the SHA and registry
     p = lh_nomad.plan(specs, env, sha, platform)

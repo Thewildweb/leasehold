@@ -215,7 +215,9 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
     naming.check_env(env)
     databases = []
     for spec, base in sorted(services, key=lambda x: x[0].name):
-        if spec.clickhouse is None or not (spec.sinks() or spec.clickhouse.derived):
+        if spec.clickhouse is None or not (
+            spec.sinks() or spec.clickhouse.derived or spec.snapshots
+        ):
             continue
         db = naming.clickhouse_database(env, spec.clickhouse.database)
         sinks = []

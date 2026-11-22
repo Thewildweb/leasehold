@@ -44,6 +44,25 @@ def resource_names(spec: ServiceSpec, env: str) -> list[tuple[str, str, str]]:
     for cname, c in spec.all_components().items():
         if c.reads_buckets or c.writes_buckets:
             rows.append(("storage user", cname, naming.storage_user(env, spec.name, cname)))
+    for dname, d in spec.snapshots.items():
+        cname = naming.snapshot_loader_component(dname)
+        rows.append(("snapshot loader", dname, naming.nomad_job(spec.name, cname)))
+        rows.append(("clickhouse user", cname, naming.snapshot_loader_user(env, spec.name, dname)))
+        rows.append(("named collection", dname,
+                     naming.snapshot_collection(env, spec.name, d.bucket)))  # fmt: skip
+        if spec.clickhouse:
+            db = naming.clickhouse_database(env, spec.clickhouse.database)
+            for t in d.tables:
+                rows.append(("snapshot table", t, f"{db}.{t} ({db}.{naming.snapshot_table(t)})"))
+    if spec.snapshots and spec.clickhouse:
+        db = naming.clickhouse_database(env, spec.clickhouse.database)
+        rows.append(("clickhouse table", "(snapshot loads)", f"{db}.{naming.SNAPSHOT_LOADS_TABLE}"))
+        rows.append(
+            ("clickhouse user", "(view definer)", naming.clickhouse_definer_user(env, spec.name))
+        )
+        rows.append(
+            ("storage user", "(clickhouse)", naming.clickhouse_storage_user(env, spec.name))
+        )
     for aname in spec.archives:
         cname = naming.archive_component(aname)
         rows.append(("archive sink", aname, naming.nomad_job(spec.name, cname)))

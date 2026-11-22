@@ -6,11 +6,12 @@ What each job gets:
   ``Meta`` with ``leasehold_env``, ``leasehold_service``, ``leasehold_component`` and
   ``leasehold_version`` (how ``apply`` finds the jobs it manages).
 - A constraint on ``node_class``, the spec's priority and resources (``memory_max``
-  becomes ``MemoryMaxMB``), and ``kill_timeout``. ``max_per_node`` becomes a
-  ``distinct_property`` constraint on ``${node.unique.id}``: at most that many
-  instances per machine, so instances that limit themselves per egress IP don't
-  share one. The environment's node pool (``Platform.node_pool``), when set, keeps
-  its jobs on that pool's machines (e.g. dev on dedicated nodes with clean IPs).
+  becomes ``MemoryMaxMB``, ``disk`` the group's ``EphemeralDisk``), and
+  ``kill_timeout``. ``max_per_node`` becomes a ``distinct_property`` constraint on
+  ``${node.unique.id}``: at most that many instances per machine, so instances that
+  limit themselves per egress IP don't share one. The environment's node pool
+  (``Platform.node_pool``), when set, keeps its jobs on that pool's machines (e.g. dev
+  on dedicated nodes with clean IPs).
   ``Platform.node_classes`` maps a spec's node class to the class used in this
   environment, for a pool that has no machine of that class (dev's pool has only
   ``processing`` machines, so ``services`` maps to ``processing`` there).
@@ -34,6 +35,11 @@ What each job gets:
   sink's settings in ``LEASEHOLD_ARCHIVE`` (the image has no service.yml). Its
   ephemeral disk holds one open file per partition: (topic partitions) x
   (``file_size_mb`` + ``row_group_mb``) + 256 MB, so one instance can hold them all.
+- Snapshot loaders (``snapshots`` in the spec): a periodic job ``<service>-load-<dataset>``
+  running ``leasehold snapshot load`` in ``Platform.snapshot_image``, every 20 minutes in
+  the environment's load window (cron in the window's time zone), with the dataset's
+  settings and schema files in ``LEASEHOLD_SNAPSHOT`` (``Platform.snapshot_settings``),
+  ``LEASEHOLD_CLICKHOUSE_URL`` and its ClickHouse password from the job's variable.
 - Secrets: components that use Kafka or buckets render the Nomad Variable
   ``nomad/jobs/<job>`` (written by ``apply``'s credentials and storage steps) into env
   vars; every path in the spec's ``secrets`` is rendered the same way. A missing
@@ -65,6 +71,7 @@ from leasehold.spec.models import (
     Processor,
     Scheduled,
     ServiceSpec,
+    SnapshotLoaderComponent,
     TaskWorker,
 )
 
@@ -123,6 +130,10 @@ class Platform:
     claim_buckets: dict[str, str] = field(default_factory=dict, hash=False)
     # Topic reference → partitions (any service); ``plan`` fills it in.
     topic_partitions: dict[str, int] = field(default_factory=dict, hash=False)
+    # Image of the snapshot loaders (leasehold's base image), with its tag.
+    snapshot_image: str | None = None
+    # Loader job ID → its settings (``leasehold.snapshots.plan.loader_settings``).
+    snapshot_settings: dict[str, dict] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)
@@ -147,7 +158,7 @@ class NomadPlan:
     jobs: list[JobPlan]
 
 
-AnyComponent = Component | ArchiveComponent
+AnyComponent = Component | ArchiveComponent | SnapshotLoaderComponent
 
 
 def uses_kafka(c: AnyComponent) -> bool:
@@ -242,6 +253,15 @@ def _env(
         out["LEASEHOLD_EGRESS_IP"] = "${meta.egress_ip}"
         if _uses_agent(spec, c, platform):
             out["LEASEHOLD_AGENT_SOCKET"] = agent_socket(env)
+    if isinstance(c, SnapshotLoaderComponent):
+        settings = platform.snapshot_settings.get(naming.nomad_job(spec.name, cname))
+        if settings is None:
+            raise ValueError(f"{spec.name}.{cname}: no loader settings (snapshot_settings)")
+        if not platform.clickhouse_url:
+            raise ValueError(f"{spec.name}.{cname} loads into ClickHouse; set the ClickHouse URL")
+        out["LEASEHOLD_SNAPSHOT"] = json.dumps(settings, separators=(",", ":"), sort_keys=True)
+        out["LEASEHOLD_CLICKHOUSE_URL"] = platform.clickhouse_url
+        out["LEASEHOLD_TIMEOUT_S"] = str(int(c.timeout.total_seconds()))
     if isinstance(c, Scheduled):
         out["LEASEHOLD_TIMEOUT_S"] = str(int(c.timeout.total_seconds()))
     if isinstance(c, Scheduled) and c.reads_clickhouse:
@@ -283,18 +303,26 @@ def _task(
             "command": "leasehold",
             "args": ["archive", "run"],
         }
+    elif isinstance(c, SnapshotLoaderComponent):
+        if not platform.snapshot_image:
+            raise ValueError(f"{spec.name}.{cname}: set the snapshot image (jobs.snapshot_image)")
+        config = {
+            "image": platform.snapshot_image,
+            "command": "leasehold",
+            "args": ["snapshot", "load"],
+        }
     else:
         config = {"image": naming.image_ref(platform.registry, spec.name, cname, version)}
     if c.command:
         config["command"] = c.command[0]
         if c.command[1:]:
             config["args"] = list(c.command[1:])
-    if not isinstance(c, Scheduled):
+    if not isinstance(c, Scheduled | SnapshotLoaderComponent):
         config["ports"] = [HTTP_PORT]
 
-    own = uses_kafka(c) or uses_storage(c)
+    own = uses_kafka(c) or uses_storage(c) or isinstance(c, SnapshotLoaderComponent)
     secret_paths = ([job_variable_path(job_id)] if own else []) + (
-        [] if isinstance(c, ArchiveComponent) else list(spec.secrets)
+        [] if isinstance(c, ArchiveComponent | SnapshotLoaderComponent) else list(spec.secrets)
     )
     templates = []
     if secret_paths:
@@ -370,6 +398,8 @@ def render_job(
         }
     if isinstance(c, ArchiveComponent):
         group["EphemeralDisk"] = {"SizeMB": archive_disk_mb(spec, c, platform)}
+    elif c.resources.disk:
+        group["EphemeralDisk"] = {"SizeMB": c.resources.disk}
     if c.max_per_node is not None:
         group["Constraints"] = [
             {
@@ -397,14 +427,19 @@ def render_job(
     if platform.node_pool:
         job["NodePool"] = platform.node_pool
 
-    if isinstance(c, Scheduled):
+    if isinstance(c, Scheduled | SnapshotLoaderComponent):
+        if isinstance(c, Scheduled):
+            cron, tz = c.schedule, "UTC"
+        else:
+            window = platform.snapshot_settings[job_id]["window"]
+            cron, tz = window_cron(window), window.get("timezone", "UTC")
         job["Type"] = "batch"
         job["Periodic"] = {
             "Enabled": True,
             "SpecType": "cron",
-            "Specs": [c.schedule],
+            "Specs": [cron],
             "ProhibitOverlap": True,
-            "TimeZone": "UTC",
+            "TimeZone": tz,
         }
         group["Count"] = 1
         group["RestartPolicy"] = {"Attempts": 0, "Mode": "fail"}
@@ -434,6 +469,13 @@ def render_job(
         "AutoRevert": True,
     }
     return JobPlan(spec.name, cname, job_id, namespace, c.count.min, c.count.max, job)
+
+
+def window_cron(window: dict) -> str:
+    """A loader's schedule: every 20 minutes in the window's hours (it checks minutes)."""
+    from leasehold.snapshots.loader import Window
+
+    return Window(**window).cron()
 
 
 def plan(specs: list[ServiceSpec], env: str, version: str, platform: Platform) -> NomadPlan:

@@ -363,6 +363,8 @@ def _nomad_plan(args: argparse.Namespace):
         node_pool=args.node_pool,
         host_network=args.host_network,
         clickhouse_url=args.clickhouse_url,
+        snapshot_image=args.snapshot_image,
+        snapshot_settings=_loader_settings(specs, args.paths, args.env),
     )
     try:
         naming.image_ref(args.registry, "x", "x", args.sha)
@@ -411,6 +413,8 @@ def _cmd_nomad_apply(args: argparse.Namespace) -> int:
         sha=args.sha, registry=args.registry, api_url=args.api_url,
         kafka_bootstrap=args.kafka_bootstrap, node_pool=args.node_pool,
         host_network=args.host_network, clickhouse_url=args.clickhouse_url,
+        snapshot_image=args.snapshot_image,
+        snapshot_settings=_loader_settings(specs, args.paths, args.env),
         only=set(args.only or []) or None, yes=args.yes, prune=args.prune,
     )  # fmt: skip
 
@@ -476,6 +480,115 @@ def _cmd_archive_run(args: argparse.Namespace) -> int:
     return sink.run()
 
 
+def _cmd_snapshot_load(args: argparse.Namespace) -> int:
+    from leasehold.snapshots import loader
+
+    return loader.main(force=args.now, snapshot=args.snapshot)
+
+
+def _snapshot_operator(args: argparse.Namespace):
+    """(ClickHouse as the environment's admin, the dataset's settings) or None."""
+    from leasehold import environment
+    from leasehold.clickhouse.apply import ClickHouse
+    from leasehold.snapshots.loader import Settings
+
+    try:
+        e = environment.load(args.environment)
+    except environment.EnvironmentFileError as err:
+        print(err, file=sys.stderr)
+        return None
+    if e.clickhouse is None:
+        print("the environment file has no clickhouse section", file=sys.stderr)
+        return None
+    password = os.environ.get(e.clickhouse.password_env)
+    if password is None:
+        print(f"set ${e.clickhouse.password_env}", file=sys.stderr)
+        return None
+    specs = _load_all(args.paths)
+    if specs is None:
+        return None
+    settings = _loader_settings(specs, args.paths, e.env, e.snapshots)
+    job = naming.nomad_job(args.service, naming.snapshot_loader_component(args.dataset))
+    if job not in settings:
+        print(f"no snapshot dataset {args.service}.{args.dataset}", file=sys.stderr)
+        return None
+    ch = ClickHouse(e.clickhouse.url, e.clickhouse.user, password)
+    return ch, Settings.from_json(json.dumps(settings[job]))
+
+
+def _cmd_snapshot_status(args: argparse.Namespace) -> int:
+    from leasehold.snapshots import loader
+
+    got = _snapshot_operator(args)
+    if got is None:
+        return 1
+    ch, s = got
+    try:
+        st = loader.status(ch, s)
+    finally:
+        ch.close()
+    print(f"current  {st['current'] or '(none)'}")
+    for t, kept in sorted(st["kept"].items()):
+        print(f"kept     {t}: {', '.join(kept) or '(none)'}")
+    for snapshot, status, at, error in st["recent"]:
+        print(f"{at}  {snapshot}  {status}" + (f"  {error[:200]}" if error else ""))
+    return 0
+
+
+def _cmd_snapshot_rollback(args: argparse.Namespace) -> int:
+    from leasehold.snapshots import loader
+
+    got = _snapshot_operator(args)
+    if got is None:
+        return 1
+    ch, s = got
+    try:
+        loader.rollback(ch, s, args.to, loader="leasehold snapshot rollback")
+    except loader.LoadError as e:
+        print(e, file=sys.stderr)
+        return 1
+    finally:
+        ch.close()
+    print(
+        f"{args.service}.{args.dataset}: {args.to} is current; the loader holds until "
+        "`leasehold snapshot release`"
+    )
+    return 0
+
+
+def _cmd_snapshot_release(args: argparse.Namespace) -> int:
+    from leasehold.snapshots import loader
+
+    got = _snapshot_operator(args)
+    if got is None:
+        return 1
+    ch, s = got
+    try:
+        held = loader.release(ch, s, loader="leasehold snapshot release")
+    except loader.LoadError as e:
+        print(e, file=sys.stderr)
+        return 1
+    finally:
+        ch.close()
+    print(f"{args.service}.{args.dataset}: released ({held} stays current until a newer load)")
+    return 0
+
+
+def _cmd_snapshot_retry(args: argparse.Namespace) -> int:
+    from leasehold.snapshots import loader
+
+    got = _snapshot_operator(args)
+    if got is None:
+        return 1
+    ch, s = got
+    try:
+        loader.retry(ch, s, args.snapshot, loader="leasehold snapshot retry")
+    finally:
+        ch.close()
+    print(f"{args.service}.{args.dataset}: the loader tries {args.snapshot} again")
+    return 0
+
+
 def _with_dirs(specs: list[ServiceSpec], paths: list[str]):
     """Each spec with the directory of its service.yml."""
     from pathlib import Path
@@ -487,6 +600,15 @@ def _with_dirs(specs: list[ServiceSpec], paths: list[str]):
         if name in by_name:  # not when the environment leaves the service out
             out.append((by_name[name], Path(p).parent))
     return out
+
+
+def _loader_settings(specs, paths, env: str, snapshots=None) -> dict[str, dict]:
+    """Loader job ID → settings, with the environment's window and busy query."""
+    from leasehold.snapshots.plan import loader_settings
+
+    window = snapshots.window.model_dump() if snapshots else None
+    busy = snapshots.busy_query if snapshots else None
+    return loader_settings(_with_dirs(specs, paths), env, window, busy)
 
 
 def _clickhouse_plan(args: argparse.Namespace):
@@ -629,7 +751,9 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             user=e.clickhouse.user, password=secrets["clickhouse"],
             kafka_bootstrap=e.kafka.clients, nomad_url=e.nomad.url,
             nomad_token=secrets["nomad"], accept_tables=set(args.accept_table or []),
-            assume_passwords=new_passwords, reads_from=e.reads_from, **kw,
+            assume_passwords=new_passwords, reads_from=e.reads_from,
+            clickhouse_endpoint=e.storage.for_clickhouse if e.storage else None,
+            busy_tables=tuple(e.snapshots.busy_tables), **kw,
         ),
         "grafana": lambda: steps.grafana(
             print, dashboards(), e.env, url=e.grafana.url,
@@ -646,7 +770,8 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             reads_from=e.reads_from, agent_volume=e.jobs.agent_volume,
             s3_endpoint=e.storage.clients if e.storage else None,
             s3_region=e.storage.region if e.storage else "",
-            archive_image=e.jobs.archive_image,
+            archive_image=e.jobs.archive_image, snapshot_image=e.jobs.snapshot_image,
+            snapshot_settings=_loader_settings(specs, args.paths, e.env, e.snapshots),
             only=set(args.job) if args.job else None, **kw,
         ),
     }  # fmt: skip
@@ -866,6 +991,7 @@ def build_parser() -> argparse.ArgumentParser:
         x.add_argument("--node-pool", help="Nomad node pool for these jobs (default pool)")
         x.add_argument("--host-network", help="Nomad host network for the http port")
         x.add_argument("--clickhouse-url", help="ClickHouse HTTP interface, for planners")
+        x.add_argument("--snapshot-image", help="image of the snapshot loaders (with its tag)")
 
     nmp = nmsub.add_parser("plan", help="show the jobs for an environment")
     nomad_common(nmp)
@@ -934,6 +1060,42 @@ def build_parser() -> argparse.ArgumentParser:
         "run", help="run an archive sink (settings from LEASEHOLD_ARCHIVE, set by its job)"
     )
     arr.set_defaults(func=_cmd_archive_run)
+
+    sn = sub.add_parser(
+        "snapshot", help="snapshot datasets: files in a bucket loaded by ClickHouse"
+    )
+    snsub = sn.add_subparsers(dest="snapshot_command", required=True)
+    snl = snsub.add_parser(
+        "load", help="one loader run (settings from LEASEHOLD_SNAPSHOT, set by its job)"
+    )
+    snl.add_argument("--now", action="store_true", help="ignore the load window and busy check")
+    snl.add_argument("--snapshot", help="load this snapshot (again), not the newest pending one")
+    snl.set_defaults(func=_cmd_snapshot_load)
+
+    def snapshot_common(x: argparse.ArgumentParser) -> None:
+        x.add_argument("paths", nargs="+", help="service.yml files or directories (all services)")
+        x.add_argument("-e", "--environment", required=True, help="environment file")
+        x.add_argument("--service", required=True)
+        x.add_argument("--dataset", required=True)
+
+    sns = snsub.add_parser("status", help="current snapshot, kept snapshots, recent loads")
+    snapshot_common(sns)
+    sns.set_defaults(func=_cmd_snapshot_status)
+    snr = snsub.add_parser("rollback", help="make an earlier, still kept snapshot current again")
+    snapshot_common(snr)
+    snr.add_argument("--to", required=True, help="snapshot id")
+    snr.set_defaults(func=_cmd_snapshot_rollback)
+    snl = snsub.add_parser(
+        "release", help="after a rollback: let the loader load new snapshots again"
+    )
+    snapshot_common(snl)
+    snl.set_defaults(func=_cmd_snapshot_release)
+    snt = snsub.add_parser(
+        "retry", help="let the loader try a snapshot again that failed max_attempts times"
+    )
+    snapshot_common(snt)
+    snt.add_argument("--snapshot", required=True, help="snapshot id")
+    snt.set_defaults(func=_cmd_snapshot_retry)
 
     ch = sub.add_parser("clickhouse", help="ClickHouse sinks derived from service.yml")
     chsub = ch.add_subparsers(dest="clickhouse_command", required=True)

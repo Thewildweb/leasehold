@@ -33,6 +33,7 @@ Stack: Python 3.12, Postgres, Kafka, ClickHouse, Grafana, Nomad, MinIO.
 | `src/leasehold/egress` | egress addresses, providers and budgets, shared by all environments; provider tagging for planners |
 | `src/leasehold/agent` | the egress agent: one per machine and environment, the only process there that talks to the dispatcher |
 | `src/leasehold/archive` | archive sinks: a topic to Parquet files in a bucket |
+| `src/leasehold/snapshots` | snapshot datasets: files in a bucket that ClickHouse loads, the manifest, the loader |
 | `src/leasehold/mocks` | a mock CT log for tests and the dev stack |
 | `dev/` | the dev stack (Docker Compose) |
 | `images/` | the base image that component images build on |
@@ -159,6 +160,92 @@ FROM s3('http://minio:9000/dev-example-archive/example.responses.v1/dt=2026-11-1
 WHERE status >= 400
 LIMIT 10;
 ```
+
+## Snapshot datasets
+
+A dataset that arrives as one large update on an interval (a register published as a
+monthly file) doesn't go through Kafka. The service writes the snapshot as Parquet files
+plus a manifest to one of its buckets; ClickHouse loads the files itself, in the
+environment's load window. The producer and the loader share only the bucket and the
+manifest, so the producer can be any process that writes that layout.
+
+```yaml
+buckets:
+  snapshots: { retention: 400d }
+components:
+  extract: { kind: scheduled, ..., writes_buckets: [snapshots] }
+clickhouse:
+  database: registry
+  shared: { addresses: { description: "..." } }   # readers get the view
+snapshots:
+  registry:                        # the dataset; its loader is the component load-registry
+    bucket: snapshots
+    node_class: services
+    keep: 2                        # snapshots kept in ClickHouse (to roll back to)
+    tables:
+      addresses: { schema_file: schema/addresses.sql }               # current snapshot only
+      changes:   { schema_file: schema/changes.sql, mode: append }   # every loaded snapshot
+    checks:
+      - { table: addresses, min_rows: 1000000, max_change: 0.05 }
+```
+
+**Files.** `<dataset>/<snapshot>/<table>/<file>.parquet`, then
+`<dataset>/<snapshot>/manifest.json` last; a snapshot without a manifest is ignored. The
+manifest (`leasehold.snapshot/1`) lists each table's columns, files, rows, bytes and
+sha256. A producer writes it with `SnapshotWriter`:
+
+```python
+from leasehold.snapshots.manifest import SnapshotWriter
+from leasehold.storage.client import ObjectStore
+
+w = SnapshotWriter(ObjectStore.from_env(), bucket, dataset="registry", snapshot="2026-11-08")
+w.add_file("addresses", "/tmp/addresses-0.parquet")  # uploads; rows from the footer
+w.commit(source_date="2026-11-08")  # the manifest, last
+```
+
+**Schema files** are like a sink's: `CREATE TABLE {table} (...)` with a column
+`snapshot LowCardinality(String)`, a MergeTree engine and `PARTITION BY snapshot`, then
+`SELECT {snapshot} AS snapshot, ... FROM {source}`, where `{source}` is the table's files.
+
+**What `apply` creates**, in the service's database: `<table>__snapshots` (one partition
+per kept snapshot), a view `<table>` that readers use (`SQL SECURITY DEFINER` as the
+service's definer user, so readers need a grant on the view only), `snapshot_loads` (one
+row per state change of a load) and `snapshot_current`. In object storage, a read-only
+user for ClickHouse, whose keys go into a named collection with the bucket's URL, none
+of them overridable. A loader user per dataset, limited to `_staging_*` tables, its
+`__snapshots` partitions, `snapshot_loads` and its named collection. A periodic job
+`<service>-load-<dataset>` that runs `leasehold snapshot load`.
+
+**One load.** The loader checks the files against the manifest, loads each table into a
+new `_staging_*` table, compares row counts and runs the checks, attaches each as a new
+partition (`REPLACE PARTITION ... FROM`, a partition no view shows yet), and then
+inserts one `current` row: every view switches at once. Until that row nothing a reader
+sees has changed; on an error the loader drops what it made and records `failed`.
+Partitions beyond `keep` are dropped afterwards.
+
+**When.** The environment file's `snapshots` section sets the window and a busy check,
+so heavy loads stay away from backups:
+
+```yaml
+snapshots:
+  window: { start: "05:00", end: "09:00", timezone: Europe/Amsterdam, skip_first_sunday: true }
+  busy_query: SELECT count() FROM ops.heavy_jobs WHERE finished_at IS NULL
+  busy_tables: [ops.heavy_jobs]
+storage:
+  clickhouse_endpoint: http://127.0.0.1:9000   # object storage as ClickHouse reaches it
+jobs:
+  snapshot_image: ghcr.io/example/leasehold-base:<sha>
+```
+
+`leasehold snapshot status|rollback --to <snapshot>|release|retry --snapshot <snapshot>`
+(with `-e <environment file> --service --dataset`) show the loads, make a kept snapshot
+current again, end the hold a rollback puts on the dataset, or let the loader try a
+snapshot again that failed `max_attempts` times. After a rollback the loader loads
+nothing until `release`; after that it loads only snapshots newer than the current one
+that were never current. A snapshot rolled back from comes back only with
+`leasehold snapshot load --now --snapshot <id>`. The
+ClickHouse user that runs `apply` needs named collection control
+(`named_collection_control`; the dev stack sets it in `dev/clickhouse/`).
 
 ## License
 

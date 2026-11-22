@@ -16,6 +16,8 @@ bottom enforce the ownership rules:
 - Buckets work like topics: only this service's components write its buckets
   (``writes_buckets``); any component may read a bucket it names in ``reads_buckets``
   (``<service>.<bucket>`` for another service's).
+- Snapshots (``snapshots``) are datasets published as files in one of the service's
+  buckets, loaded by ClickHouse; their tables are this service's tables like its sinks.
 
 Checks that need more than one service (does a consumed topic exist?) live in
 ``leasehold.spec.registry``.
@@ -50,6 +52,7 @@ from leasehold.types import (
     SecretPath,
     ServiceName,
     SnakeName,
+    SnapshotTableName,
     TaskTypeName,
     TopicName,
     TopicRefStr,
@@ -70,6 +73,12 @@ class Resources(_Strict):
     memory: int = Field(gt=0, description="Memory reservation in MB")
     memory_max: int | None = Field(
         default=None, gt=0, description="Hard memory ceiling in MB; allows bursting above `memory`"
+    )
+    disk: int | None = Field(
+        default=None,
+        gt=0,
+        description="Local disk in MB (Nomad ephemeral disk, the allocation directory "
+        "$NOMAD_ALLOC_DIR): the job is placed only where that much is free",
     )
 
     @model_validator(mode="after")
@@ -295,6 +304,16 @@ class ArchiveComponent(_ComponentBase):
     sink: str
     consumes: list[TopicRefStr]
     count: Count
+
+
+class SnapshotLoaderComponent(_ComponentBase):
+    """A snapshot dataset's loader as the platform runs it: derived from
+    ``snapshots.<dataset>`` as the component ``load-<dataset>``, a periodic job inside the
+    environment's load window. It only sends SQL to ClickHouse, which reads the files."""
+
+    kind: Literal["snapshot-loader"] = "snapshot-loader"
+    dataset: str
+    timeout: Duration
 
 
 # --- Kafka ------------------------------------------------------------------------------------
@@ -598,6 +617,77 @@ class ArchiveSink(_Strict):
         return self
 
 
+# --- Snapshots ---------------------------------------------------------------------------------
+
+
+class SnapshotTable(_Strict):
+    """One table of a snapshot dataset.
+
+    The schema file has two statements, like a sink's: ``CREATE TABLE {table} (...)`` with
+    a column ``snapshot LowCardinality(String)``, a MergeTree engine and ``PARTITION BY
+    snapshot``; then a ``SELECT ... FROM {source}`` that gives ``{snapshot} AS snapshot``.
+    ``{source}`` becomes the table's files in the snapshot (Parquet), ``{snapshot}`` the
+    snapshot id. Readers use the view ``<table>``; the data is in ``<table>__snapshots``.
+    """
+
+    schema_file: str = Field(min_length=1, description="SQL file, relative to service.yml")
+    mode: Literal["replace", "append"] = Field(
+        default="replace",
+        description="replace: the view shows the current snapshot only. append: the view "
+        "shows every loaded snapshot up to the current one (e.g. a table of changes)",
+    )
+
+
+class SnapshotCheck(_Strict):
+    """A check on a loaded snapshot, before it becomes current. A failed check fails the
+    load and leaves the current snapshot in place."""
+
+    table: SnapshotTableName
+    min_rows: int | None = Field(default=None, ge=0, description="At least this many rows")
+    max_change: float | None = Field(
+        default=None,
+        gt=0,
+        description="Row count differs at most this fraction from the current snapshot's "
+        "(replace tables)",
+    )
+
+    @model_validator(mode="after")
+    def _something(self) -> SnapshotCheck:
+        if self.min_rows is None and self.max_change is None:
+            raise ValueError("a check needs min_rows or max_change")
+        return self
+
+
+class SnapshotDataset(_Strict):
+    """A dataset published as snapshots: files plus a manifest under
+    ``<dataset>/<snapshot>/`` in one of this service's buckets. The platform's loader
+    (component ``load-<dataset>``) loads each new complete snapshot into ClickHouse in the
+    environment's load window, checks it, and switches every table to it at once."""
+
+    bucket: BucketName = Field(description="One of this service's buckets")
+    tables: dict[SnapshotTableName, SnapshotTable] = Field(min_length=1)
+    keep: int = Field(
+        default=2,
+        ge=1,
+        le=24,
+        description="Snapshots kept in ClickHouse (replace tables): the current one and "
+        "the ones before it, to roll back to",
+    )
+    checks: list[SnapshotCheck] = Field(default_factory=list)
+    max_attempts: int = Field(
+        default=3,
+        ge=1,
+        description="Failed loads of one snapshot before the loader stops "
+        "trying it (`leasehold snapshot retry` resets)",
+    )
+    timeout: Duration = Field(
+        default=timedelta(hours=2), description="A load longer than this is killed"
+    )
+    node_class: str = Field(min_length=1, description="Nomad node class the loader runs on")
+    resources: Resources = Field(default_factory=lambda: Resources(cpu=100, memory=128))
+    description: str | None = None
+
+
 # --- Destinations (non-target rate budgets) ---------------------------------------------------
 
 
@@ -798,6 +888,10 @@ class ServiceSpec(_Strict):
     archives: dict[ComponentName, ArchiveSink] = Field(
         default_factory=dict, description="Topics written to Parquet files in a bucket"
     )
+    snapshots: dict[ComponentName, SnapshotDataset] = Field(
+        default_factory=dict,
+        description="Datasets published as snapshot files in a bucket, loaded by ClickHouse",
+    )
     destinations: dict[Identifier, Destination] = Field(default_factory=dict)
     secrets: list[SecretPath] = Field(default_factory=list, description="Nomad variable paths")
     expects: list[Expect] = Field(default_factory=list)
@@ -846,9 +940,34 @@ class ServiceSpec(_Strict):
             )
         return out
 
-    def all_components(self) -> dict[str, Component | ArchiveComponent]:
-        """``components`` plus the archive sinks' components: everything that gets a job."""
-        return dict(self.components) | self.archive_components()
+    def snapshot_loader_components(self) -> dict[str, SnapshotLoaderComponent]:
+        """Each snapshot dataset's loader as the component the platform runs (``load-<name>``)."""
+        return {
+            naming.snapshot_loader_component(name): SnapshotLoaderComponent(
+                dataset=name,
+                timeout=d.timeout,
+                node_class=d.node_class,
+                resources=d.resources,
+            )
+            for name, d in self.snapshots.items()
+        }
+
+    def all_components(
+        self,
+    ) -> dict[str, Component | ArchiveComponent | SnapshotLoaderComponent]:
+        """``components`` plus the archive sinks' and snapshot loaders' components:
+        everything that gets a job."""
+        return dict(self.components) | self.archive_components() | self.snapshot_loader_components()
+
+    def snapshot_tables(self) -> dict[str, tuple[str, SnapshotTable]]:
+        """Every snapshot table of this service → (its dataset, the table)."""
+        return {t: (ds, st) for ds, d in self.snapshots.items() for t, st in d.tables.items()}
+
+    def clickhouse_tables(self) -> set[str]:
+        """Names readers can use in this service's database: sinks, derived tables and
+        snapshot tables (their views)."""
+        own = self.clickhouse.tables() if self.clickhouse else set()
+        return own | set(self.snapshot_tables())
 
     def large_payload_buckets(self) -> dict[naming.TopicRef, naming.BucketRef]:
         """This service's topics with a claim check → the bucket their claims are in."""
@@ -951,10 +1070,10 @@ class ServiceSpec(_Strict):
             for name in sorted(self.clickhouse.tables() & reserved):
                 yield f"clickhouse: the table name {name!r} is reserved (the plan log)"
             for name in self.clickhouse.shared:
-                if name not in self.clickhouse.tables():
+                if name not in self.clickhouse_tables():
                     yield (
-                        f"clickhouse.shared.{name}: not a sink or derived table of this "
-                        "service; only those can be shared"
+                        f"clickhouse.shared.{name}: not a sink, derived or snapshot table "
+                        "of this service; only those can be shared"
                     )
             for name in sorted(set(self.clickhouse.sinks) & set(self.clickhouse.derived)):
                 yield f"clickhouse.derived.{name}: a sink has the same name"
@@ -985,6 +1104,7 @@ class ServiceSpec(_Strict):
                 )
 
         yield from self._bucket_errors()
+        yield from self._snapshot_errors()
 
         names = [r.name for r in self.alerts.rules] + [e.name for e in self.expects]
         for dup in sorted({n for n in names if names.count(n) > 1}):
@@ -1083,6 +1203,39 @@ class ServiceSpec(_Strict):
             elif a.topic not in self.kafka.produces:
                 yield f"{where}.topic: unknown topic {a.topic!r}; declare it under kafka.produces"
 
+    def _snapshot_errors(self):
+        for cname in self.components:
+            if cname.startswith(naming.SNAPSHOT_LOADER_PREFIX):
+                yield (
+                    f"components.{cname}: names starting with 'load-' are reserved for "
+                    "snapshot loaders"
+                )
+        if not self.snapshots:
+            return
+        if self.clickhouse is None:
+            yield "snapshots: snapshot tables live in ClickHouse; add a clickhouse section"
+        seen: dict[str, str] = {}
+        others = (self.clickhouse.tables() if self.clickhouse else set()) | (
+            naming.RESERVED_SINK_NAMES | naming.RESERVED_SNAPSHOT_TABLES
+        )
+        for name, d in self.snapshots.items():
+            where = f"snapshots.{name}"
+            if len(naming.snapshot_loader_component(name)) > 30:
+                yield f"{where}: the name is too long (at most 25 characters)"
+            if d.bucket not in self.buckets:
+                yield f"{where}.bucket: unknown bucket {d.bucket!r}; declare it under buckets"
+            for t in d.tables:
+                if t in others:
+                    yield f"{where}.tables.{t}: a sink, derived or reserved table has this name"
+                if t in seen:
+                    yield f"{where}.tables.{t}: also a table of snapshots.{seen[t]}"
+                seen[t] = name
+            for i, c in enumerate(d.checks):
+                if c.table not in d.tables:
+                    yield f"{where}.checks.{i}.table: {c.table!r} is not a table of this dataset"
+                elif c.max_change is not None and d.tables[c.table].mode != "replace":
+                    yield f"{where}.checks.{i}.max_change: only for replace tables"
+
     def _check_planner(self, planner: Planner, where: str):
         if planner.task_type not in self.frontier.task_types:
             yield (
@@ -1095,7 +1248,9 @@ class ServiceSpec(_Strict):
         yield from self._check_reads(planner.reads, f"{where}.reads")
 
     def _check_reads(self, reads: list[str], where: str):
-        own = self.clickhouse.tables() | naming.RESERVED_SINK_NAMES
+        own = (
+            self.clickhouse_tables() | naming.RESERVED_SINK_NAMES | naming.RESERVED_SNAPSHOT_TABLES
+        )
         for ref in reads:
             service, table = ref.split(".", 1)
             if service == self.name and table not in own:
