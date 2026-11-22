@@ -1,5 +1,6 @@
 # leasehold dev stack: Kafka (KRaft, SASL/SCRAM, ACLs enforced), Karapace, kafka-ui,
-# Postgres for the frontier, Grafana for dashboards, and ClickHouse for sinks.
+# Postgres for the frontier, Grafana for dashboards, ClickHouse for sinks and MinIO
+# for buckets.
 #
 #   docker compose -f dev/docker-compose.yml up -d
 #
@@ -12,6 +13,8 @@
 #   18123  ClickHouse 26.4 (HTTP), user admin / dev-admin
 #   14646  Nomad 1.9 (server only, no ACLs), namespace dev
 #   18500  mock CT log (leasehold mock ctlog): /log_list.json, /logs/<name>/ct/v1/...
+#   19000  MinIO S3 API, user admin / dev-admin-secret (buckets, archive sinks, claim check)
+#   19001  MinIO console
 #
 # The broker uses the same configuration as production (dev/kafka/server.properties),
 # so ACL and authentication behaviour is the same in dev, CI and prod.
@@ -192,6 +195,27 @@ services:
       nomad:
         condition: service_healthy
 
+  minio:
+    # Object storage for buckets declared in service.yml. Inside the compose network
+    # (ClickHouse's s3() function) it is http://minio:9000.
+    # minio/minio is no longer published; pgsty/minio is a maintained build of the same
+    # server (checked 2026-11-17). Only the S3 and MinIO admin APIs are used.
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: dev-admin-secret  # MinIO wants at least 8 characters
+    ports:
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
   ctlog:
     # Built from this repository; rebuild after changing it:
     #   docker compose -f dev/docker-compose.yml build ctlog
@@ -211,3 +235,4 @@ volumes:
   postgres-data:
   clickhouse-data:
   nomad-data:
+  minio-data:

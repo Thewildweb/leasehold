@@ -72,3 +72,7 @@ SnakeName = Annotated[str, StringConstraints(pattern=naming.SNAKE_RE.pattern, ma
 Identifier = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]*$", max_length=60)]
 SecretPath = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9/_.-]*$", max_length=120)]
 EnvVarName = Annotated[str, StringConstraints(pattern=r"^[A-Z][A-Z0-9_]*$", max_length=80)]
+BucketName = Annotated[str, StringConstraints(pattern=naming.BUCKET_NAME_RE.pattern, max_length=30)]
+BucketRefStr = Annotated[
+    str, StringConstraints(pattern=naming.BUCKET_REF_RE.pattern, max_length=72)
+]

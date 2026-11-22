@@ -18,6 +18,12 @@ secrets; it never holds a secret itself::
       url: http://localhost:18123
       user: admin
       password_env: LEASEHOLD_CLICKHOUSE_PASSWORD
+    storage:
+      endpoint: http://localhost:19000  # where leasehold reaches MinIO as admin
+      client_endpoint: http://minio:9000  # what jobs and ClickHouse use (default: endpoint)
+      access_key: admin
+      secret_key_env: LEASEHOLD_S3_SECRET_KEY
+      region: ""                        # optional
     grafana:
       url: http://localhost:13000
       token_env: LEASEHOLD_GRAFANA_TOKEN   # or user + password_env
@@ -27,6 +33,7 @@ secrets; it never holds a secret itself::
       node_pool: dev                    # optional: run only on this Nomad node pool
       host_network: tailscale           # optional: publish ports only on this host network
       node_classes: {services: processing}  # optional: spec node class -> class used here
+      archive_image: ghcr.io/example/leasehold-archive:<sha>  # needed for archive sinks
     services: [certlog, dns]            # optional: apply only these services here
     reads_from: {dns: prod}             # optional: readers here read dns's tables in prod
 
@@ -88,6 +95,18 @@ class ClickHouse(_Model):
     password_env: str = "LEASEHOLD_CLICKHOUSE_PASSWORD"
 
 
+class Storage(_Model):
+    endpoint: str
+    client_endpoint: str | None = None
+    access_key: str = "admin"
+    secret_key_env: str = "LEASEHOLD_S3_SECRET_KEY"
+    region: str = ""
+
+    @property
+    def clients(self) -> str:
+        return self.client_endpoint or self.endpoint
+
+
 class Grafana(_Model):
     url: str
     token_env: str = "LEASEHOLD_GRAFANA_TOKEN"
@@ -104,6 +123,7 @@ class Jobs(_Model):
     host_network: str | None = None  # Nomad host network for the http port, e.g. tailscale
     node_classes: dict[str, str] = {}  # spec node class -> node class in this environment
     clickhouse_url: str | None = None  # ClickHouse HTTP interface for planners
+    archive_image: str | None = None  # image the archive sinks run (leasehold's archive target)
 
 
 class Environment(_Model):
@@ -112,6 +132,7 @@ class Environment(_Model):
     postgres: Postgres | None = None
     nomad: Nomad | None = None
     clickhouse: ClickHouse | None = None
+    storage: Storage | None = None
     grafana: Grafana | None = None
     jobs: Jobs | None = None
     services: list[str] | None = None
@@ -123,6 +144,7 @@ NEEDS = {
     "kafka": ("kafka",),
     "frontier": ("postgres",),
     "credentials": ("kafka", "nomad"),
+    "storage": ("storage", "nomad"),
     "clickhouse": ("clickhouse", "kafka", "nomad"),
     "grafana": ("grafana",),
     "nomad": ("nomad", "jobs", "kafka"),
@@ -153,7 +175,7 @@ def missing_sections(e: Environment, steps: list[str]) -> list[str]:
 def secrets(e: Environment, steps: list[str]) -> tuple[dict[str, str | None], list[str]]:
     """The secrets the steps need, read from the environment, and what's missing.
 
-    Keys: ``kafka``, ``dsn``, ``nomad``, ``clickhouse``, ``grafana_token``,
+    Keys: ``kafka``, ``dsn``, ``nomad``, ``clickhouse``, ``storage``, ``grafana_token``,
     ``grafana_password``. The Nomad token may be absent (Nomad without ACLs);
     everything else is required by the steps that use it.
     """
@@ -174,6 +196,8 @@ def secrets(e: Environment, steps: list[str]) -> tuple[dict[str, str | None], li
         values["nomad"] = os.environ.get(e.nomad.token_env)
     if "clickhouse" in needed and e.clickhouse:
         need("clickhouse", e.clickhouse.password_env)
+    if "storage" in needed and e.storage:
+        need("storage", e.storage.secret_key_env)
     if "grafana" in needed and e.grafana:
         if e.grafana.user:
             need("grafana_password", e.grafana.password_env)

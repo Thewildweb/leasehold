@@ -12,6 +12,8 @@ dependencies = [
     "prometheus-client>=0.20",
     "publicsuffixlist>=1.0",
     "idna>=3.7",
+    # S3 for buckets and the claim check, and MinIO's admin API for users and policies.
+    "minio>=7.2.15",
 ]
 
 [project.optional-dependencies]
@@ -23,13 +25,18 @@ server = [
     "psycopg[binary,pool]>=3.2",
     "pyjwt[crypto]>=2.9",
 ]
+# The archive sink: Kafka topic -> Parquet in a bucket.
+archive = [
+    "pyarrow>=18",
+]
 
 [project.scripts]
 leasehold = "leasehold.cli:main"
 
 [dependency-groups]
 dev = [
-    "leasehold[server]",
+    "leasehold[server,archive]",
+    "duckdb>=1.1",
     "pytest>=8",
     "ruff>=0.6",
 ]
