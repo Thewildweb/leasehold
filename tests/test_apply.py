@@ -15,6 +15,7 @@ SECRETS = {
     "LEASEHOLD_DSN": "postgresql://x",
     "LEASEHOLD_CLICKHOUSE_PASSWORD": "c",
     "LEASEHOLD_GRAFANA_TOKEN": "g",
+    "LEASEHOLD_S3_SECRET_KEY": "s",
 }
 FULL = """
 env: dev
@@ -22,6 +23,7 @@ kafka: {bootstrap: "localhost:19092", client_bootstrap: "kafka:9092"}
 postgres: {}
 nomad: {url: "http://nomad:4646"}
 clickhouse: {url: "http://ch:8123"}
+storage: {endpoint: "http://localhost:19000", client_endpoint: "http://minio:9000"}
 grafana: {url: "http://grafana:3000"}
 jobs: {registry: "registry.example", api_url: "http://api:8400"}
 """
@@ -85,8 +87,21 @@ def test_runs_all_steps_in_order_with_environment_values(envfile, secrets, fake_
     assert kw["clickhouse"]["kafka_bootstrap"] == "kafka:9092"  # client address
     assert kw["nomad"]["kafka_bootstrap"] == "kafka:9092"
     assert kw["nomad"]["sha"] == "abc1234" and kw["nomad"]["token"] is None
+    assert kw["storage"]["endpoint"] == "http://localhost:19000"
+    assert kw["storage"]["secret_key"] == "s"
+    assert kw["nomad"]["s3_endpoint"] == "http://minio:9000"  # client address
     assert all(not k.get("yes") for k in kw.values())
     assert "no changes" in capsys.readouterr().out
+
+
+def test_storage_step_left_out_without_storage_section(tmp_path, secrets, fake_steps):
+    calls, _ = fake_steps
+    p = tmp_path / "e.yml"
+    p.write_text("\n".join(x for x in FULL.splitlines() if not x.startswith("storage")))
+    assert _run(p) == 0
+    assert [n for n, _ in calls] == [s for s in steps.ORDER if s != "storage"]
+    assert calls[-1][1]["s3_endpoint"] is None
+    assert main(["apply", str(FIXTURES), "-e", str(p), "--only", "storage"]) == 1
 
 
 def test_missing_secrets_sections_and_sha_stop_before_any_step(

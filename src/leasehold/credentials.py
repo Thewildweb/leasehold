@@ -67,7 +67,7 @@ def plan(specs: list[ServiceSpec], env: str) -> list[KafkaCredential]:
     namespace = naming.nomad_namespace(env)
     out = []
     for spec in specs:
-        for cname, c in spec.components.items():
+        for cname, c in spec.all_components().items():
             if uses_kafka(c):
                 out.append(
                     KafkaCredential(

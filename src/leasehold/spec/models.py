@@ -13,6 +13,9 @@ bottom enforce the ownership rules:
 - A component may only produce topics this service declares.
 - Every declared topic is produced by some component, and every task type is
   consumed by some task-worker.
+- Buckets work like topics: only this service's components write its buckets
+  (``writes_buckets``); any component may read a bucket it names in ``reads_buckets``
+  (``<service>.<bucket>`` for another service's).
 
 Checks that need more than one service (does a consumed topic exist?) live in
 ``leasehold.spec.registry``.
@@ -36,6 +39,8 @@ from pydantic import (
 from leasehold import naming
 from leasehold.types import (
     PRIORITY_ORDER,
+    BucketName,
+    BucketRefStr,
     ComponentName,
     Duration,
     EnvVarName,
@@ -125,6 +130,21 @@ class _ComponentBase(_Strict):
         description="At most this many instances on one machine. Use 1 for components that "
         "keep their own rate limit per egress IP: instances on one machine share its IP",
     )
+    reads_buckets: list[BucketRefStr] = Field(
+        default_factory=list,
+        description="Buckets this component reads: this service's by name ('raw'), another "
+        "service's as '<service>.<bucket>'",
+    )
+    writes_buckets: list[BucketName] = Field(
+        default_factory=list,
+        description="This service's buckets this component writes (and reads)",
+    )
+
+    def bucket_refs(self, service: str) -> tuple[set[naming.BucketRef], set[naming.BucketRef]]:
+        """(read, write) bucket references. Write implies read; it isn't listed twice."""
+        write = {naming.BucketRef(service, b) for b in self.writes_buckets}
+        read = {naming.BucketRef.parse(r, service) for r in self.reads_buckets} - write
+        return read, write
 
     def topics_produced(self) -> set[str]:
         """``produces``, plus the plan log for a planner."""
@@ -266,6 +286,17 @@ class Api(_ComponentBase):
 Component = Annotated[TaskWorker | Processor | Scheduled | Api, Field(discriminator="kind")]
 
 
+class ArchiveComponent(_ComponentBase):
+    """An archive sink as the platform runs it: not declared under ``components``, but
+    derived from ``archives.<name>`` as the component ``archive-<name>``. It consumes one
+    topic as its own consumer group and writes Parquet files to one bucket."""
+
+    kind: Literal["archive"] = "archive"
+    sink: str
+    consumes: list[TopicRefStr]
+    count: Count
+
+
 # --- Kafka ------------------------------------------------------------------------------------
 
 
@@ -282,6 +313,13 @@ class KafkaTopic(_Strict):
         default=None, gt=0, description="Size cap per partition, as a backstop to time retention"
     )
     key: str | None = Field(default=None, description="Payload field used as partition key")
+    large_payloads: BucketName | None = Field(
+        default=None,
+        description="Claim check: a payload whose event would be over the inline limit is "
+        "stored in this bucket of the service (under claims/), and the event carries a "
+        "payload_ref instead. Every component producing the topic must write the bucket. "
+        "Claims expire one day after the topic's retention",
+    )
 
 
 PLAN_LOG = KafkaTopic(
@@ -397,6 +435,126 @@ class ClickHouseSection(_Strict):
     def tables(self) -> set[str]:
         """Names of this service's own tables (its sinks)."""
         return set(self.sinks)
+
+
+# --- Buckets and archive sinks ----------------------------------------------------------------
+
+
+class Bucket(_Strict):
+    retention: Duration | None = Field(
+        default=None,
+        description="Objects expire this long after they were written (lifecycle rule, whole "
+        "days); omit to keep them",
+    )
+    versioning: bool = False
+    description: str | None = None
+
+    @field_validator("retention")
+    @classmethod
+    def _whole_days(cls, value: timedelta | None) -> timedelta | None:
+        if value is not None and (value.total_seconds() % 86400 or value < timedelta(days=1)):
+            raise ValueError(
+                "retention must be a whole number of days (lifecycle rules count days)"
+            )
+        return value
+
+
+ColumnType = Literal["string", "int32", "int64", "float64", "bool", "timestamp", "json", "base64"]
+FieldName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$", max_length=60)]
+
+
+class Column(_Strict):
+    """A payload field lifted into a typed Parquet column.
+
+    ``string``/``int32``/``int64``/``float64``/``bool``: the JSON value as that type.
+    ``timestamp``: an ISO 8601 string (or epoch seconds) as a UTC timestamp in ms.
+    ``json``: the value as JSON text (lists, nested objects).
+    ``base64``: a base64 string decoded into a binary column. With ``text_fallback``,
+    an event whose field is empty or missing gets the text field encoded as UTF-8
+    instead, and the column ``<name>_from_text`` says which rows those are.
+    """
+
+    type: ColumnType
+    field: FieldName | None = Field(default=None, description="Payload field; default: the name")
+    text_fallback: FieldName | None = None
+
+    @model_validator(mode="after")
+    def _fallback_for_base64(self) -> Column:
+        if self.text_fallback is not None and self.type != "base64":
+            raise ValueError("text_fallback is for base64 columns")
+        return self
+
+
+class ArchiveSink(_Strict):
+    """A topic written to Parquet files in one of this service's buckets.
+
+    Files: ``<topic ref>/dt=YYYY-MM-DD/hh=HH/p<partition>-<first offset>-<last offset>.parquet``
+    (zstd). Columns: the envelope, the Kafka coordinates, the ``columns`` declared here,
+    and ``payload``: every other payload field as JSON text.
+    """
+
+    topic: str = Field(
+        description="A topic of this service by name ('responses'), or any topic by reference"
+    )
+    bucket: BucketName = Field(description="One of this service's buckets")
+    columns: dict[FieldName, ColumnType | Column] = Field(
+        default_factory=dict, description="Payload fields as typed columns"
+    )
+    drop: list[FieldName] = Field(
+        default_factory=list, description="Payload fields left out of the archive"
+    )
+    file_size_mb: int = Field(
+        default=128, ge=1, le=1024, description="A file is closed at about this size"
+    )
+    max_age: Duration = Field(
+        default=timedelta(hours=1), description="A file is closed after being open this long"
+    )
+    row_group_mb: int = Field(
+        default=16,
+        ge=1,
+        le=256,
+        description="Rows buffered in memory per open file (one file per Kafka partition)",
+    )
+    node_class: str = Field(min_length=1, description="Nomad node class to run on")
+    resources: Resources = Field(default_factory=lambda: Resources(cpu=300, memory=512))
+    count: Count = Field(default_factory=lambda: Count(min=1, max=1))
+    kill_timeout: Duration = Field(default=timedelta(seconds=60))
+
+    def column_specs(self) -> dict[str, Column]:
+        return {
+            name: (c if isinstance(c, Column) else Column(type=c)).model_copy(
+                update={"field": (c.field if isinstance(c, Column) else None) or name}
+            )
+            for name, c in self.columns.items()
+        }
+
+    def column_names(self) -> list[str]:
+        """The declared columns, with ``<name>_from_text`` after each text fallback."""
+        out = []
+        for name, c in self.column_specs().items():
+            out.append(name)
+            if c.text_fallback:
+                out.append(f"{name}_from_text")
+        return out
+
+    @model_validator(mode="after")
+    def _checks(self) -> ArchiveSink:
+        from leasehold.archive.layout import FIXED_COLUMNS
+
+        names = self.column_names()
+        clash = sorted(set(names) & set(FIXED_COLUMNS))
+        if clash:
+            raise ValueError(f"columns {', '.join(clash)} are the envelope's")
+        if len(set(names)) != len(names):
+            raise ValueError("a column name is used twice (including <name>_from_text)")
+        fields = [c.field for c in self.column_specs().values()]
+        if len(set(fields)) != len(fields):
+            raise ValueError("a payload field is in two columns")
+        if self.max_age < timedelta(minutes=1):
+            raise ValueError("max_age must be at least 1m")
+        if self.row_group_mb > self.file_size_mb:
+            raise ValueError("row_group_mb must be <= file_size_mb")
+        return self
 
 
 # --- Destinations (non-target rate budgets) ---------------------------------------------------
@@ -593,6 +751,12 @@ class ServiceSpec(_Strict):
     kafka: KafkaSection = Field(default_factory=KafkaSection)
     frontier: FrontierSection = Field(default_factory=FrontierSection)
     clickhouse: ClickHouseSection | None = None
+    buckets: dict[BucketName, Bucket] = Field(
+        default_factory=dict, description="Object storage buckets this service owns"
+    )
+    archives: dict[ComponentName, ArchiveSink] = Field(
+        default_factory=dict, description="Topics written to Parquet files in a bucket"
+    )
     destinations: dict[Identifier, Destination] = Field(default_factory=dict)
     secrets: list[SecretPath] = Field(default_factory=list, description="Nomad variable paths")
     expects: list[Expect] = Field(default_factory=list)
@@ -622,7 +786,36 @@ class ServiceSpec(_Strict):
                 refs.update(naming.TopicRef.parse(r) for r in c.consumes)
         for sink in self.sinks().values():
             refs.add(self.sink_topic_ref(sink.topic))
+        for archive in self.archives.values():
+            refs.add(self.sink_topic_ref(archive.topic))
         return refs
+
+    def archive_components(self) -> dict[str, ArchiveComponent]:
+        """Each archive sink as the component the platform runs (``archive-<name>``)."""
+        out = {}
+        for name, a in self.archives.items():
+            out[naming.archive_component(name)] = ArchiveComponent(
+                sink=name,
+                consumes=[str(self.sink_topic_ref(a.topic))],
+                node_class=a.node_class,
+                resources=a.resources,
+                count=a.count,
+                kill_timeout=a.kill_timeout,
+                writes_buckets=[a.bucket],
+            )
+        return out
+
+    def all_components(self) -> dict[str, Component | ArchiveComponent]:
+        """``components`` plus the archive sinks' components: everything that gets a job."""
+        return dict(self.components) | self.archive_components()
+
+    def large_payload_buckets(self) -> dict[naming.TopicRef, naming.BucketRef]:
+        """This service's topics with a claim check → the bucket their claims are in."""
+        return {
+            self.topic_ref(t): naming.BucketRef(self.name, k.large_payloads)
+            for t, k in self.kafka.produces.items()
+            if k.large_payloads
+        }
 
     def sink_topic_ref(self, topic: str) -> naming.TopicRef:
         if "." in topic:
@@ -745,6 +938,8 @@ class ServiceSpec(_Strict):
                     f"{DATABASE_PLACEHOLDER} so each environment queries its own database"
                 )
 
+        yield from self._bucket_errors()
+
         names = [r.name for r in self.alerts.rules] + [e.name for e in self.expects]
         for dup in sorted({n for n in names if names.count(n) > 1}):
             yield f"alerts/expects: name {dup!r} is used more than once"
@@ -784,6 +979,63 @@ class ServiceSpec(_Strict):
         if not self.planners():
             return None
         return self.topic_ref(naming.PLAN_LOG_TOPIC)
+
+    def _bucket_errors(self):
+        for b in self.buckets:
+            if len(self.name) + 1 + len(b) > 50:
+                yield (
+                    f"buckets.{b}: '{self.name}-{b}' is too long; with an environment prefix "
+                    "a bucket name has at most 63 characters (keep service + bucket <= 50)"
+                )
+        for cname, c in self.components.items():
+            where = f"components.{cname}"
+            if cname.startswith(naming.ARCHIVE_COMPONENT_PREFIX):
+                yield f"{where}: names starting with 'archive-' are reserved for archive sinks"
+            for b in c.writes_buckets:
+                if b not in self.buckets:
+                    yield (
+                        f"{where}.writes_buckets: unknown bucket {b!r}; declare it under "
+                        "buckets (a service only writes its own buckets)"
+                    )
+            for r in c.reads_buckets:
+                ref = naming.BucketRef.parse(r, self.name)
+                if ref.service == self.name and ref.name not in self.buckets:
+                    yield f"{where}.reads_buckets: this service has no bucket {ref.name!r}"
+            if len(set(c.writes_buckets)) != len(c.writes_buckets) or len(
+                {naming.BucketRef.parse(r, self.name) for r in c.reads_buckets}
+            ) != len(c.reads_buckets):
+                yield f"{where}: a bucket is listed twice"
+
+        for t, k in self.kafka.produces.items():
+            if not k.large_payloads:
+                continue
+            where = f"kafka.produces.{t}.large_payloads"
+            if k.large_payloads not in self.buckets:
+                yield f"{where}: unknown bucket {k.large_payloads!r}; declare it under buckets"
+                continue
+            for cname, c in self.components.items():
+                if t in c.produces and k.large_payloads not in c.writes_buckets:
+                    yield (
+                        f"components.{cname}.writes_buckets: produces {t!r}, whose large "
+                        f"payloads go to {k.large_payloads!r}; add it to writes_buckets"
+                    )
+
+        for aname, a in self.archives.items():
+            where = f"archives.{aname}"
+            if len(naming.archive_component(aname)) > 30:
+                yield f"{where}: the name is too long (at most 22 characters)"
+            if a.bucket not in self.buckets:
+                yield f"{where}.bucket: unknown bucket {a.bucket!r}; declare it under buckets"
+            if "." in a.topic:
+                try:
+                    ref = naming.TopicRef.parse(a.topic)
+                except naming.NamingError as e:
+                    yield f"{where}.topic: {e}"
+                    continue
+                if ref.service == self.name:
+                    yield from self._check_own_ref(ref, f"{where}.topic")
+            elif a.topic not in self.kafka.produces:
+                yield f"{where}.topic: unknown topic {a.topic!r}; declare it under kafka.produces"
 
     def _check_planner(self, planner: Planner, where: str):
         if planner.task_type not in self.frontier.task_types:

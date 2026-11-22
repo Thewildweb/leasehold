@@ -8,6 +8,7 @@ ACL rules, per environment:
 - A component that produces a topic gets WRITE and DESCRIBE on it.
 - A processor gets READ and DESCRIBE on each topic it consumes, and READ on its
   consumer group.
+- An archive sink (component ``archive-<sink>``) is granted like a processor.
 - ClickHouse reads each sink's topic as the service's ``<service>.clickhouse``
   principal, with one consumer group per sink.
 
@@ -21,7 +22,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from leasehold import naming
-from leasehold.spec.models import Processor, ServiceSpec
+from leasehold.spec.models import ArchiveComponent, Processor, ServiceSpec
 
 
 @dataclass(frozen=True, order=True)
@@ -85,12 +86,12 @@ def plan(specs: Iterable[ServiceSpec], env: str) -> KafkaPlan:
                 )
             )
 
-        for cname, c in spec.components.items():
+        for cname, c in spec.all_components().items():
             user = naming.kafka_principal(env, spec.name, cname)
             for tname in sorted(c.topics_produced()):
                 topic = naming.topic_for(env, spec.topic_ref(tname))
                 grant(user, "TOPIC", topic, "WRITE", "DESCRIBE")
-            if isinstance(c, Processor):
+            if isinstance(c, Processor | ArchiveComponent):
                 for ref_str in c.consumes:
                     topic = naming.topic_for(env, naming.TopicRef.parse(ref_str))
                     grant(user, "TOPIC", topic, "READ", "DESCRIBE")

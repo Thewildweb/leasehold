@@ -360,6 +360,51 @@ def _cmd_credentials_apply(args: argparse.Namespace) -> int:
     )  # fmt: skip
 
 
+def _cmd_storage_plan(args: argparse.Namespace) -> int:
+    from leasehold import storage
+
+    specs = _load_all(args.paths)
+    if specs is None:
+        return 1
+    p = storage.plan(specs, args.env)
+    print(f"# environment: {p.env}")
+    print("\n# buckets")
+    for b in p.buckets:
+        rules = ", ".join(f"{r.prefix or '*'} {r.days}d" for r in b.rules) or "kept"
+        print(f"{b.name}  ({b.service}.{b.bucket}; expiry: {rules}"
+              f"{'; versioning' if b.versioning else ''})")  # fmt: skip
+    print("\n# users")
+    for u in p.users:
+        print(f"{u.user}  policy {u.policy}  → {u.namespace}/{u.variable}")
+        for b in sorted(u.write):
+            print(f"    write {b}")
+        for b in sorted(u.read):
+            print(f"    read  {b}")
+    return 0
+
+
+def _cmd_storage_apply(args: argparse.Namespace) -> int:
+    specs = _load_all(args.paths)
+    if specs is None:
+        return 1
+    secret = os.environ.get(args.secret_key_env)
+    if not secret:
+        print(f"set the storage admin secret in ${args.secret_key_env}", file=sys.stderr)
+        return 1
+    return _run_step(
+        steps.storage, specs, args.env, endpoint=args.endpoint, access_key=args.access_key,
+        secret_key=secret, region=args.region, nomad_url=args.url,
+        nomad_token=os.environ.get(args.token_env), rotate=args.rotate, yes=args.yes,
+        prune=args.prune,
+    )  # fmt: skip
+
+
+def _cmd_archive_run(args: argparse.Namespace) -> int:
+    from leasehold.archive import sink
+
+    return sink.run()
+
+
 def _with_dirs(specs: list[ServiceSpec], paths: list[str]):
     """Each spec with the directory of its service.yml."""
     from pathlib import Path
@@ -443,6 +488,7 @@ def _ending(r: steps.Result, yes: bool) -> str:
 
 def _cmd_apply(args: argparse.Namespace) -> int:
     from leasehold import environment
+    from leasehold.storage import plan as storage_plan
 
     try:
         e = environment.load(args.environment)
@@ -450,6 +496,11 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         print(err, file=sys.stderr)
         return 1
     chosen = [s for s in steps.ORDER if s in (args.only or steps.ORDER) and s not in args.skip]
+    # An environment without object storage leaves the storage step out, unless asked
+    # for; a service that declares buckets then fails below.
+    no_storage = e.storage is None and "storage" in chosen and not args.only
+    if no_storage:
+        chosen.remove("storage")
     problems = environment.missing_sections(e, chosen)
     if "nomad" in chosen and not args.sha:
         problems.append("step nomad needs --sha (or --skip nomad)")
@@ -472,6 +523,13 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         specs = [s for s in specs if s.name in e.services]
         if left_out:
             print(f"# not in this environment: {', '.join(left_out)}")
+    if no_storage:
+        p = storage_plan(specs, e.env)
+        users = sorted({b.service for b in p.buckets} | {u.service for u in p.users})
+        if users:
+            print(f"step storage needs the 'storage' section ({', '.join(users)} use buckets)",
+                  file=sys.stderr)  # fmt: skip
+            return 1
 
     def dashboards():
         loaded = _load_with_dashboards(args.paths)
@@ -488,6 +546,11 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "credentials": lambda: steps.credentials(
             print, specs, e.env, bootstrap=e.kafka.bootstrap, kafka_username=e.kafka.username,
             kafka_password=secrets["kafka"], nomad_url=e.nomad.url,
+            nomad_token=secrets["nomad"], **kw,
+        ),
+        "storage": lambda: steps.storage(
+            print, specs, e.env, endpoint=e.storage.endpoint, access_key=e.storage.access_key,
+            secret_key=secrets["storage"], region=e.storage.region, nomad_url=e.nomad.url,
             nomad_token=secrets["nomad"], **kw,
         ),
         "clickhouse": lambda: steps.clickhouse(
@@ -509,7 +572,11 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             kafka_bootstrap=e.kafka.clients, node_pool=e.jobs.node_pool,
             host_network=e.jobs.host_network, node_classes=e.jobs.node_classes,
             clickhouse_url=e.jobs.clickhouse_url or (e.clickhouse.url if e.clickhouse else None),
-            reads_from=e.reads_from, only=set(args.job) if args.job else None, **kw,
+            reads_from=e.reads_from,
+            s3_endpoint=e.storage.clients if e.storage else None,
+            s3_region=e.storage.region if e.storage else "",
+            archive_image=e.jobs.archive_image,
+            only=set(args.job) if args.job else None, **kw,
         ),
     }  # fmt: skip
 
@@ -727,6 +794,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--prune", action="store_true", help="also delete stale users and their variable keys"
     )
     cra.set_defaults(func=_cmd_credentials_apply)
+
+    so = sub.add_parser("storage", help="buckets and storage users derived from service.yml")
+    sosub = so.add_subparsers(dest="storage_command", required=True)
+    sop = sosub.add_parser("plan", help="show the buckets, users and grants for an environment")
+    sop.add_argument("paths", nargs="+", help="service.yml files or directories (all services)")
+    sop.add_argument("--env", default=naming.PROD)
+    sop.set_defaults(func=_cmd_storage_plan)
+    soa = sosub.add_parser("apply", help="compare with MinIO and apply (dry run by default)")
+    soa.add_argument("paths", nargs="+", help="service.yml files or directories (all services)")
+    soa.add_argument("--env", default=naming.PROD)
+    soa.add_argument("--endpoint", required=True, help="MinIO, e.g. http://localhost:19000")
+    soa.add_argument("--access-key", default="admin")
+    soa.add_argument("--secret-key-env", default="LEASEHOLD_S3_SECRET_KEY")
+    soa.add_argument("--region", default="")
+    soa.add_argument("--url", required=True, help="Nomad, e.g. http://<nomad>:4646")
+    soa.add_argument("--token-env", default="NOMAD_TOKEN")
+    soa.add_argument("--rotate", action="store_true", help="new secrets for all storage users")
+    soa.add_argument("--yes", action="store_true", help="apply the changes")
+    soa.add_argument(
+        "--prune",
+        action="store_true",
+        help="also delete stale users and policies and their variable keys (never buckets)",
+    )
+    soa.set_defaults(func=_cmd_storage_apply)
+
+    ar = sub.add_parser("archive", help="archive sinks: a topic to Parquet files in a bucket")
+    arsub = ar.add_subparsers(dest="archive_command", required=True)
+    arr = arsub.add_parser(
+        "run", help="run an archive sink (settings from LEASEHOLD_ARCHIVE, set by its job)"
+    )
+    arr.set_defaults(func=_cmd_archive_run)
 
     ch = sub.add_parser("clickhouse", help="ClickHouse sinks derived from service.yml")
     chsub = ch.add_subparsers(dest="clickhouse_command", required=True)
