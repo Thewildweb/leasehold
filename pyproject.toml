@@ -36,7 +36,7 @@ leasehold = "leasehold.cli:main"
 [dependency-groups]
 dev = [
     "leasehold[server,archive]",
-    "duckdb>=1.1",
+    "duckdb>=2.0.1",
     "pytest>=8",
     "ruff>=0.17.5",
 ]
