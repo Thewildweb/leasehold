@@ -185,9 +185,7 @@ def _diff_rules(g: Grafana, p: GrafanaPlan, d: GrafanaDiff) -> None:
     wanted = {r.uid for r in p.rules}
     for r in existing:
         if _managed(r, p.env) and r["uid"] not in wanted:
-            d.stale.append(
-                Change("delete-rule", r["uid"], r.get("title", ""), "no service.yml declares it")
-            )
+            d.stale.append(Change("delete-rule", r["uid"], r.get("title", ""), "no longer planned"))
     groups = {(r.folder_uid, r.group): r.interval_s for r in p.rules}
     for (folder, group), interval in sorted(groups.items()):
         cur = g.get(_group_path(folder, group))

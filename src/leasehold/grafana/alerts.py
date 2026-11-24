@@ -27,8 +27,19 @@ A range after one of them (``dead_tasks(T)[1h]``) becomes a subquery, so
 ``delta(dead_tasks(certlog.chunk)[1h]) > 0`` works. The rule fires while the
 expression returns any series.
 
+**Platform rules** (``PLATFORM_RULES``), in the platform folder (``lhf-<env>--platform``),
+are about the platform itself rather than one service: today the egress system's proxy
+accounts. Each is PromQL with ``{env}`` for the environment, and every series it returns
+is its own alert, with the series' labels (one alert per account and state, not one for
+all). Rules on tables every environment shares (the proxy accounts, owned by prod) are
+rendered in prod only, so they don't fire twice. Levels (90% used, paid_until within 7
+days, ...) are egress settings (``budgets.proxies``): the control API compares against
+them and exports 0/1 gauges, so a changed level needs no re-apply. The outage rule
+(``kafka_up``, ``control_api_up``) and a rule on failed scheduled runs belong here too.
+
 Every rule is labelled ``managed_by=leasehold``, ``env``, ``service``, ``rule``,
-``priority``, and ``component`` when it has one; ``priority: page`` adds
+``priority``, and ``component`` when it has one (platform rules: ``service=platform``
+and the series' own labels); ``priority: page`` adds
 ``page="true"``, which Grafana's routing sends to a phone (prod only, outside this
 module). The annotation ``leasehold_hash`` records the rendered rule, so ``apply``
 updates a rule only when the hash changes.
@@ -154,6 +165,29 @@ def _prom_rule(expr: str, prometheus_uid: str) -> tuple[list[dict], str]:
     return data, "C"
 
 
+def _series_rule(expr: str, prometheus_uid: str) -> tuple[list[dict], str]:
+    """One alert per series ``expr`` returns, with its labels; ``$values.B`` is its value."""
+    data = [
+        {
+            "refId": "A",
+            "relativeTimeRange": {"from": 600, "to": 0},
+            "datasourceUid": prometheus_uid,
+            "model": {"refId": "A", "expr": expr, "instant": True},
+        },
+        {
+            "refId": "B",
+            "datasourceUid": EXPR_DATASOURCE,
+            "model": {"refId": "B", "type": "reduce", "expression": "A", "reducer": "last"},
+        },
+        {
+            "refId": "C",
+            "datasourceUid": EXPR_DATASOURCE,
+            "model": {"refId": "C", "type": "math", "expression": "$B == $B"},
+        },
+    ]
+    return data, "C"
+
+
 def _ch_rule(sql: str, low: float | None, high: float | None, clickhouse_uid: str):
     """Fires while the query's one number is outside [low, high]."""
     outside = " || ".join(
@@ -191,9 +225,12 @@ def _ch_rule(sql: str, low: float | None, high: float | None, clickhouse_uid: st
     return data, "C"
 
 
+PLATFORM = "platform"
+
+
 @dataclass
 class _Builder:
-    spec: ServiceSpec
+    spec: ServiceSpec | None  # None: the platform rules
     env: str
     folder_uid: str
     prometheus_uid: str
@@ -213,11 +250,13 @@ class _Builder:
         group: str = RULE_GROUP,
         interval_s: int = 60,
         no_data: str = "OK",
+        summary: str | None = None,
     ) -> None:
+        service = self.spec.name if self.spec else PLATFORM
         labels = {
             MANAGED_LABEL: MANAGED_VALUE,
             "env": self.env,
-            "service": self.spec.name,
+            "service": service,
             "rule": name,
             "priority": priority,
         }
@@ -227,8 +266,8 @@ class _Builder:
             labels["page"] = "true"
         suffix = "" if self.env == naming.PROD else f" ({self.env})"
         rule = {
-            "uid": rule_uid(self.env, self.spec.name, name),
-            "title": f"{self.spec.name}: {title}{suffix}",
+            "uid": rule_uid(self.env, service if self.spec else f"-{PLATFORM}", name),
+            "title": f"{service}: {title}{suffix}",
             "folderUID": self.folder_uid,
             "ruleGroup": group,
             "orgID": 1,
@@ -239,7 +278,7 @@ class _Builder:
             "for": format_duration(for_ or timedelta(0)),
             "labels": labels,
             "annotations": {
-                "summary": f"{self.spec.name} {self.env}: {title}",
+                "summary": f"{service} {self.env}: {summary or title}",
                 "description": description,
             },
             "isPaused": False,
@@ -247,9 +286,7 @@ class _Builder:
         digest = hashlib.sha256(json.dumps(rule, sort_keys=True).encode()).hexdigest()[:16]
         rule["annotations"][HASH_ANNOTATION] = digest
         self.rules.append(
-            RulePlan(
-                rule["uid"], rule["title"], self.folder_uid, group, interval_s, self.spec.name, rule
-            )
+            RulePlan(rule["uid"], rule["title"], self.folder_uid, group, interval_s, service, rule)
         )
 
     def prom(self, name, title, expr, priority, for_, description, component=None) -> None:
@@ -392,4 +429,119 @@ def service_rules(
         if r.uid in seen:
             raise AlertSpecError(f"{spec.name}: two alert rules render to uid {r.uid}")
         seen.add(r.uid)
+    return b.rules
+
+
+# --- platform rules -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PlatformRule:
+    name: str
+    title: str
+    expr: str  # PromQL; {env} is the environment; every series it returns is an alert
+    priority: str
+    summary: str  # Grafana template: {{ $labels.account }}, {{ $values.B.Value }}
+    description: str
+    for_: timedelta | None = None
+    owner_only: bool = False  # on tables every environment shares: prod only
+
+
+_ACTIVE = (
+    " and on (account) (max by (account) "
+    '(leasehold_proxy_account_status{{env="{env}", status!="disabled"}}) == 1)'
+)
+
+PLATFORM_RULES: tuple[PlatformRule, ...] = (
+    PlatformRule(
+        "proxy-account-state",
+        "proxy account not ok",
+        'max by (account, vendor, state) (leasehold_proxy_account_state{{env="{env}", '
+        'state!="ok"}}) == 1' + _ACTIVE,
+        "page",
+        "proxy account {{ $labels.account }} ({{ $labels.vendor }}) is {{ $labels.state }}",
+        "The account's exits and pools are out of dispatch. Evidence: "
+        "GET /v1/egress/accounts (state_reason). quota_exhausted is the 100% level.",
+        owner_only=True,
+    ),
+    PlatformRule(
+        "proxy-quota-warning",
+        "proxy account quota",
+        'max by (account, vendor) (leasehold_proxy_remaining_bytes{{env="{env}"}}) / 1e9'
+        " and on (account) (max by (account) "
+        '(leasehold_proxy_quota_warning{{env="{env}"}}) == 1)' + _ACTIVE,
+        "warning",
+        "proxy account {{ $labels.account }} ({{ $labels.vendor }}): "
+        '{{ printf "%.2f" $values.B.Value }} GB left; add GB',
+        "At proxies.warn_used of the quota used, or below the account's warn_remaining_gb.",
+        owner_only=True,
+    ),
+    PlatformRule(
+        "proxy-usage-poll-failing",
+        "proxy usage API failing",
+        'max by (account) (leasehold_proxy_usage_poll_failing{{env="{env}"}}) == 1' + _ACTIVE,
+        "warning",
+        "proxy account {{ $labels.account }}: the vendor's usage API keeps failing",
+        "Failing for longer than proxies.usage_poll_warn_after; dispatch goes on with our own "
+        "byte count.",
+        owner_only=True,
+    ),
+    PlatformRule(
+        "proxy-paid-until",
+        "proxy account paid_until",
+        'max by (account, vendor) (leasehold_proxy_paid_until_warning{{env="{env}"}}) == 1'
+        + _ACTIVE,
+        "warning",
+        "proxy account {{ $labels.account }} ({{ $labels.vendor }}) is paid only until soon",
+        "paid_until is within proxies.paid_until_warn.",
+        owner_only=True,
+    ),
+    PlatformRule(
+        "proxy-auto-disabled",
+        "proxy exit or pool disabled",
+        'sum by (account) (increase(leasehold_proxy_auto_disabled_total{{env="{env}"}}[15m])) > 0',
+        "warning",
+        "proxy account {{ $labels.account }}: an exit or pool was disabled by connect failures",
+        "proxies.max_connect_failures in a row. leasehold proxy list shows which; enable it "
+        "again once it works.",
+    ),
+    PlatformRule(
+        "proxy-usage-drift",
+        "proxy byte count drift",
+        'max by (account, vendor) (leasehold_proxy_usage_drift_warning{{env="{env}"}}) == 1'
+        + _ACTIVE,
+        "info",
+        "proxy account {{ $labels.account }}: our byte count and the vendor's differ",
+        "By more than proxies.drift_warn of the plan.",
+        for_=timedelta(hours=1),
+        owner_only=True,
+    ),
+    PlatformRule(
+        "proxy-exit-moved",
+        "proxy exit moved",
+        'sum(increase(leasehold_proxy_exit_moves_total{{env="{env}"}}[1h])) > 0',
+        "info",
+        "a fixed proxy exit has a new address",
+        "The probe saw an exit at a new address; its old egress row was disabled.",
+        owner_only=True,
+    ),
+    PlatformRule(
+        "proxy-task-type-stopped",
+        "task type stopped on a proxy account",
+        'max by (task_type, account) (leasehold_proxy_stopped{{env="{env}"}}) == 1',
+        "info",
+        "{{ $labels.task_type }} stopped on proxy account {{ $labels.account }} "
+        "(stop_at_used); resolved when it resumes",
+        "The task type's stop_at_used share of the account is used.",
+    ),
+)
+
+
+def platform_rules(env: str, folder_uid: str, prometheus_uid: str) -> list[RulePlan]:
+    b = _Builder(None, env, folder_uid, prometheus_uid, "")
+    for r in PLATFORM_RULES:
+        if r.owner_only and env != naming.PROD:
+            continue
+        data, cond = _series_rule(r.expr.format(env=env), prometheus_uid)
+        b.add(r.name, r.title, data, cond, r.priority, r.for_, r.description, summary=r.summary)
     return b.rules

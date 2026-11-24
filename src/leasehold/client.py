@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 import httpx
@@ -127,9 +128,70 @@ class NewTask:
 
 
 @dataclass(frozen=True)
+class ProxySettings:
+    scheme: str  # http, https or socks5h (the proxy resolves the target's name)
+    host: str
+    port: int
+    username: str = field(repr=False)
+    password: str = field(repr=False)
+
+    def url(self) -> str:
+        """With credentials: never log it (``redacted_url`` is for logs)."""
+        u, p = quote(self.username, safe=""), quote(self.password, safe="")
+        return f"{self.scheme}://{u}:{p}@{self.host}:{self.port}"
+
+    def redacted_url(self) -> str:
+        return f"{self.scheme}://***@{self.host}:{self.port}"
+
+
+@dataclass(frozen=True)
+class Route:
+    """How to reach a target on a proxy tier (leasehold.egress.proxies): through
+    ``proxy`` with its credentials, never directly. Holds credentials; its repr doesn't
+    show them, and nothing should log ``proxy.url()``."""
+
+    egress: str  # the exit address, or pool:<name>
+    kind: str
+    account: str
+    proxy: ProxySettings
+    country: str | None = None
+    pool: str | None = None
+    session: str | None = None
+    session_ttl_s: int | None = None
+    exit_ip: str | None = None  # known for fixed exits
+    exit_ip_header: str | None = None  # a response header the vendor puts the exit IP in
+    account_remaining: float | None = None
+    errors: tuple[dict, ...] = ()
+    credentials_fp: str | None = None
+
+    @classmethod
+    def parse(cls, d: dict) -> Route:
+        p = d["proxy"]
+        sess = d.get("session") or {}
+        return cls(
+            egress=d["egress"],
+            kind=d.get("kind") or "",
+            account=d["account"],
+            proxy=ProxySettings(
+                p["scheme"], p["host"], int(p["port"]), p["username"], p["password"]
+            ),
+            country=d.get("country"),
+            pool=d.get("pool"),
+            session=sess.get("id"),
+            session_ttl_s=sess.get("ttl_s"),
+            exit_ip=d.get("exit_ip"),
+            exit_ip_header=d.get("exit_ip_header"),
+            account_remaining=d.get("account_remaining"),
+            errors=tuple(d.get("errors") or ()),
+            credentials_fp=d.get("credentials_fp"),
+        )
+
+
+@dataclass(frozen=True)
 class TargetLease:
     """An exclusive lease on a target (leasehold.egress.dispatch): send at most one
-    request per ``interval_s`` to it, and nothing after ``expires_at``."""
+    request per ``interval_s`` to it, and nothing after ``expires_at``. On a proxy tier,
+    ``route`` says how to reach it."""
 
     target: str
     lease_id: UUID
@@ -138,15 +200,71 @@ class TargetLease:
     provider: str = ""
     cap: int = 0
     granted: int = 0
+    tier: str = "datacenter"
+    route: Route | None = None
+
+
+@dataclass(frozen=True)
+class ProxyError:
+    """The proxy failed before the target answered (``leasehold.runtime.proxy``)."""
+
+    # refused: the proxy answered CONNECT with an error status (an account matter);
+    # gateway: it answered 502/503/504 (it couldn't reach the target: the target or the
+    # exit); connect: the proxy itself couldn't be reached or the tunnel failed.
+    kind: str
+    status: int | None = None
+    excerpt: str = ""  # redacted
+
+    def json(self) -> dict:
+        d: dict[str, Any] = {"kind": self.kind, "excerpt": self.excerpt[:200]}
+        if self.status is not None:
+            d["status"] = self.status
+        return d
+
+
+@dataclass(frozen=True)
+class RouteRef:
+    """The route a task ran on, sent with its outcome: bytes and proxy errors are charged
+    to this lease, account and egress, not to whatever the target holds by then. With
+    the credentials fingerprint the API recognises a route that was rotated or removed
+    meanwhile."""
+
+    lease_id: UUID  # the target lease
+    account: str
+    egress: str
+    credentials_fp: str | None = None
+
+    @classmethod
+    def of(cls, lease_id: UUID | None, route: Route | None) -> RouteRef | None:
+        if lease_id is None or route is None:
+            return None
+        return cls(lease_id, route.account, route.egress, route.credentials_fp)
+
+    def json(self) -> dict:
+        d: dict[str, Any] = {
+            "lease_id": str(self.lease_id),
+            "account": self.account,
+            "egress": self.egress,
+        }
+        if self.credentials_fp is not None:
+            d["credentials_fp"] = self.credentials_fp
+        return d
 
 
 @dataclass(frozen=True)
 class AckItem:
     ref: LeaseRef
     event_id: UUID
+    bytes: int | None = None  # through a proxy
+    route: RouteRef | None = None
 
     def json(self) -> dict:
-        return self.ref.json() | {"event_id": str(self.event_id)}
+        d = self.ref.json() | {"event_id": str(self.event_id)}
+        if self.bytes is not None:
+            d["bytes"] = self.bytes
+        if self.route is not None:
+            d["route"] = self.route.json()
+        return d
 
 
 @dataclass(frozen=True)
@@ -155,15 +273,27 @@ class ReleaseItem:
     after: timedelta | None = None
     cooldown: bool = False  # the target pushed back: cool it fleet-wide for ``after``
     reason: str | None = None
+    cause: str | None = None  # challenge, block, rate, retry_after (with cooldown)
+    bytes: int | None = None
+    proxy_error: ProxyError | None = None
+    route: RouteRef | None = None
 
     def json(self) -> dict:
         d = self.ref.json()
+        if self.route is not None:
+            d["route"] = self.route.json()
         if self.after is not None:
             d["after_s"] = max(0.0, self.after.total_seconds())
         if self.cooldown:
             d["cooldown"] = True
         if self.reason:
             d["reason"] = self.reason[:500]
+        if self.cause:
+            d["cause"] = self.cause
+        if self.bytes is not None:
+            d["bytes"] = self.bytes
+        if self.proxy_error is not None:
+            d["proxy_error"] = self.proxy_error.json()
         return d
 
 
@@ -175,11 +305,23 @@ class FailItem:
     retry_after: timedelta | None = None
     permanent: bool = False
     cooldown: bool = False  # the target pushed back: cool it fleet-wide for ``retry_after``
+    cause: str | None = None
+    bytes: int | None = None
+    proxy_error: ProxyError | None = None  # gateway: the attempt counts (maybe the target)
+    route: RouteRef | None = None
 
     def json(self) -> dict:
         d = self.ref.json() | {"reason": self.reason[:1000] or "failed"}
+        if self.route is not None:
+            d["route"] = self.route.json()
+        if self.proxy_error is not None:
+            d["proxy_error"] = self.proxy_error.json()
         if self.cooldown:
             d["cooldown"] = True
+        if self.cause:
+            d["cause"] = self.cause
+        if self.bytes is not None:
+            d["bytes"] = self.bytes
         if self.event_id is not None:
             d["event_id"] = str(self.event_id)
         if self.retry_after is not None:
@@ -345,6 +487,8 @@ class ControlClient:
                 provider=x.get("provider") or "",
                 cap=int(x.get("cap") or 0),
                 granted=int(x.get("granted") or 0),
+                tier=x.get("tier") or "datacenter",
+                route=Route.parse(x["route"]) if x.get("route") else None,
             )
             for x in r.get("targets", [])
         ]
@@ -352,23 +496,29 @@ class ControlClient:
 
     def renew_targets(
         self,
-        egress: str,
+        egress: str | None,
         leases: Sequence[UUID],
         release: Sequence[UUID] = (),
         worker_id: str | None = None,
+        routes: dict[UUID, Route] | None = None,
     ) -> tuple[dict[UUID, datetime], dict[UUID, str]]:
         """Extend target leases and give back ``release``. Returns (new expiry per renewed
-        lease, lost lease → reason); stop sending to a lost target at once."""
+        lease, lost lease → reason); stop sending to a lost target at once. ``routes``
+        gets new routes for leases whose proxy credentials changed."""
         body: dict[str, Any] = {
-            "egress": egress,
             "leases": [str(i) for i in leases],
             "release": [str(i) for i in release],
         }
+        if egress:
+            body["egress"] = egress
         if worker_id:
             body["worker_id"] = worker_id
         r = self._request("POST", "/v1/targets/renew", body, repeatable=True)
         renewed = {UUID(x["lease_id"]): _parse_time(x["expires_at"]) for x in r["renewed"]}
         lost = {UUID(x["lease_id"]): x["reason"] for x in r["lost"]}
+        if routes is not None:
+            for x in r.get("routes") or []:
+                routes[UUID(x["lease_id"])] = Route.parse(x["route"])
         return renewed, lost
 
     def renew(self, refs: Sequence[LeaseRef]) -> tuple[dict[LeaseRef, datetime], list[LeaseRef]]:
@@ -428,7 +578,12 @@ class ControlClient:
         return self._request("GET", "/v1/task-types", repeatable=True)["task_types"]
 
     def agent_token(
-        self, target_lease_id: UUID, task_type: str, cost: int = 1, first: bool = False
+        self,
+        target_lease_id: UUID,
+        task_type: str,
+        cost: int = 1,
+        first: bool = False,
+        credentials_fp: str | None = None,
     ) -> dict:
         """Ask the machine's agent for leave to send a request to a target: ``first`` for a
         task's first request (its budget was spent at grant), else ``cost`` tokens.
@@ -439,7 +594,30 @@ class ControlClient:
             "cost": cost,
             "first": first,
         }
+        if credentials_fp is not None:
+            body["credentials_fp"] = credentials_fp
         return self._request("POST", "/v1/agent/token", body, repeatable=False)
+
+    def clear_target(self, target: str, source: str, reason: str, evidence: Any = None) -> dict:
+        """Lift a target's cooldown (scope ``targets:clear``)."""
+        body = {"source": source, "reason": reason, "evidence": evidence}
+        return self._request(
+            "POST", f"/v1/targets/{quote(target, safe='')}/clear", body, repeatable=True
+        )
+
+    def escalate_target(
+        self, target: str, task_type: str, reason: str, evidence: Any = None
+    ) -> dict:
+        """Move a target to the task type's next egress tier (scope ``targets:escalate``),
+        e.g. on an ``unreachable_from_dc`` verdict."""
+        body = {"task_type": task_type, "reason": reason, "evidence": evidence}
+        return self._request(
+            "POST", f"/v1/targets/{quote(target, safe='')}/escalate", body, repeatable=True
+        )
+
+    def egress_accounts(self) -> list[dict]:
+        """Proxy accounts with their state and remaining quota (no credentials)."""
+        return self._request("GET", "/v1/egress/accounts", repeatable=True)["accounts"]
 
     def egress_providers(self) -> dict:
         """Provider rules and the shared-IP setting (``leasehold.egress.tagging``)."""

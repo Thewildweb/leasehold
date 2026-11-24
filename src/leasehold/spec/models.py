@@ -148,6 +148,12 @@ class _ComponentBase(_Strict):
         default_factory=list,
         description="This service's buckets this component writes (and reads)",
     )
+    api_scopes: list[Literal["targets:clear", "targets:escalate"]] = Field(
+        default_factory=list,
+        description="Extra control API permissions: targets:clear lifts a target's "
+        "cooldown, targets:escalate moves a target to its next egress tier (health "
+        "consumers, classifiers)",
+    )
 
     def bucket_refs(self, service: str) -> tuple[set[naming.BucketRef], set[naming.BucketRef]]:
         """(read, write) bucket references. Write implies read; it isn't listed twice."""
@@ -366,6 +372,139 @@ class KafkaSection(_Strict):
 
 # --- Frontier ---------------------------------------------------------------------------------
 
+_PROXY_TIERS = ("isp", "residential", "mobile")
+_ALL_TIERS = ("datacenter", *_PROXY_TIERS)
+ProxyName = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+ProxyTier = Literal["isp", "residential", "mobile"]
+
+
+def _share(v) -> float:
+    """``70%`` or ``0.7`` → 0.7."""
+    if isinstance(v, str):
+        text = v.strip()
+        if not text.endswith("%"):
+            raise ValueError(f"{v!r}: a share is '70%' or a number between 0 and 1")
+        v = float(text[:-1]) / 100
+    v = float(v)
+    if not 0 < v <= 1:
+        raise ValueError("a share used is above 0% and at most 100%")
+    return round(v, 6)
+
+
+Share = Annotated[float | str, Field(description="Share used: '70%' or 0.7")]
+
+
+class EgressSession(_Strict):
+    mode: Literal["per_request", "sticky"] = Field(
+        default="per_request",
+        description="per_request: a new exit per request (rotating pools); sticky: one exit "
+        "per target lease, on pools that support it",
+    )
+    ttl: Duration | None = Field(default=None, description="Sticky session lifetime")
+
+    @model_validator(mode="after")
+    def _ttl(self) -> EgressSession:
+        if self.mode == "sticky" and self.ttl is None:
+            raise ValueError("a sticky session needs a ttl")
+        if self.mode == "per_request" and self.ttl is not None:
+            raise ValueError("ttl is for sticky sessions")
+        return self
+
+
+class EgressEnvOverride(_Strict):
+    stop_at_used: dict[ProxyTier, Share] = Field(default_factory=dict)
+
+    @field_validator("stop_at_used")
+    @classmethod
+    def _shares(cls, v: dict) -> dict:
+        return {k: _share(x) for k, x in v.items()}
+
+
+class TaskEgress(_Strict):
+    """Which egresses a task type with target leases may use (leasehold.egress.tiers)."""
+
+    tiers: list[Literal["datacenter"] | dict[ProxyTier, list[ProxyName]]] = Field(
+        default_factory=lambda: ["datacenter"],
+        min_length=1,
+        description="Escalation order. 'datacenter' is our own addresses; a proxy tier "
+        "names the proxy accounts or pools it may use, in preference order: "
+        "[datacenter, {isp: [isp-a]}, {residential: [resi-a, resi-b]}]",
+    )
+    countries: list[Annotated[str, StringConstraints(pattern=r"^[A-Z]{2}$")]] = Field(
+        default_factory=list, description="Exit countries for proxy tiers; empty: any"
+    )
+    stop_at_used: dict[ProxyTier, Share] = Field(
+        default_factory=dict,
+        description="Per proxy tier: no route through an account once this share of its "
+        "quota is used ('70%'); the task type's own stop. Unset: until quota_exhausted",
+    )
+    session: EgressSession | None = None
+    per_env: dict[str, EgressEnvOverride] = Field(
+        default_factory=dict,
+        description="Per environment: its own stop_at_used, e.g. {dev: {stop_at_used: {isp: 20%}}}",
+    )
+
+    @field_validator("stop_at_used")
+    @classmethod
+    def _shares(cls, v: dict) -> dict:
+        return {k: _share(x) for k, x in v.items()}
+
+    @model_validator(mode="after")
+    def _tiers(self) -> TaskEgress:
+        seen: list[str] = []
+        for entry in self.tiers:
+            if isinstance(entry, str):
+                seen.append(entry)
+                continue
+            if len(entry) != 1:
+                raise ValueError("each proxy tier is one {tier: [names]} entry")
+            ((tier, names),) = entry.items()
+            if not names:
+                raise ValueError(f"tier {tier} names no proxy accounts or pools")
+            if len(set(names)) != len(names):
+                raise ValueError(f"tier {tier} names an account or pool twice")
+            seen.append(tier)
+        if len(set(seen)) != len(seen):
+            raise ValueError("a tier is listed twice")
+        order = [_ALL_TIERS.index(t) for t in seen]
+        if order != sorted(order):
+            raise ValueError(f"tiers go up in order {', '.join(_ALL_TIERS)}")
+        for name in self.per_env:
+            naming.check_env(name)
+        for stops in [self.stop_at_used, *(o.stop_at_used for o in self.per_env.values())]:
+            for tier in stops:
+                if tier not in seen:
+                    raise ValueError(f"stop_at_used names tier {tier}, which tiers don't list")
+        if self.session is not None and self.session.mode == "sticky":
+            if not any(t in _PROXY_TIERS for t in seen):
+                raise ValueError("sticky sessions are for proxy tiers")
+        return self
+
+    def resolve(self, env: str) -> dict:
+        """The block as stored for one environment (leasehold.egress.tiers)."""
+        tiers = []
+        for entry in self.tiers:
+            if isinstance(entry, str):
+                tiers.append({"tier": entry, "names": []})
+            else:
+                ((tier, names),) = entry.items()
+                tiers.append({"tier": tier, "names": list(names)})
+        stops = dict(self.stop_at_used)
+        if env in self.per_env:
+            stops.update(self.per_env[env].stop_at_used)
+        session = None
+        if self.session is not None and self.session.mode == "sticky":
+            session = {"mode": "sticky", "ttl_s": int(self.session.ttl.total_seconds())}
+        return {
+            "tiers": tiers,
+            "countries": list(self.countries),
+            "stop_at_used": {k: stops[k] for k in sorted(stops)},
+            "session": session,
+        }
+
+    def names(self) -> set[str]:
+        return {n for e in self.tiers if isinstance(e, dict) for ns in e.values() for n in ns}
+
 
 class TaskType(_Strict):
     key: str = Field(min_length=1, description="What the task key is, e.g. 'domain', 'log:chunk'")
@@ -419,6 +558,11 @@ class TaskType(_Strict):
         description="Priority class for egress budgets (target leases), one of the classes "
         "in the egress budgets; outside prod it counts a class lower",
     )
+    egress: TaskEgress | None = Field(
+        default=None,
+        description="Egress tiers (target leases): datacenter, then proxy tiers with the "
+        "accounts or pools they may use. Default: datacenter only",
+    )
 
     @model_validator(mode="after")
     def _limits(self) -> TaskType:
@@ -430,6 +574,8 @@ class TaskType(_Strict):
             raise ValueError("keep_done is for one-shot task types; recurring tasks are never done")
         if self.target_cap is not None and not self.target_leases:
             raise ValueError("target_cap needs target_leases")
+        if self.egress is not None and not self.target_leases:
+            raise ValueError("egress needs target_leases")
         return self
 
 

@@ -160,3 +160,39 @@ def test_api_down(agent):
     agent.api.down = True
     r = agent.post("/v1/tasks/lease", json={"max": 1}, headers={"Authorization": "Bearer w"})
     assert r.status_code == 503
+
+
+def test_routed_targets(agent):
+    """A route passes through to the worker; extra tokens spend on the route's egress; a
+    renewal's new route reaches the worker with its next token."""
+    route = {"egress": "pool:resi", "account": "resi-a", "credentials_fp": "fp1",
+             "proxy": {"scheme": "http", "host": "gw.example", "port": 9000,
+                       "username": "u", "password": "p1"}}  # fmt: skip
+    orig = agent.api.handler
+
+    def handler(request):
+        r = orig(request)
+        if request.url.path == "/v1/tasks/lease":
+            data = json.loads(r.content)
+            data["targets"][0]["route"] = route
+            return httpx.Response(200, json=data)
+        if request.url.path == "/v1/targets/renew":
+            data = json.loads(r.content)
+            data["routes"] = [{"lease_id": agent.api.lease_id,
+                               "route": route | {"credentials_fp": "fp2"}}]  # fmt: skip
+            return httpx.Response(200, json=data)
+        return r
+
+    agent.api.handler = handler
+    agent.state.api._transport = httpx.MockTransport(handler)
+    body = lease(agent)
+    assert body["targets"][0]["route"]["proxy"]["password"] == "p1"
+    assert token(agent, first=True, credentials_fp="fp1") == {"granted": True, "interval_s": 0.3}
+    t = agent.state.targets[uuid.UUID(agent.api.lease_id)]
+    t.expires = datetime.now(UTC) + timedelta(seconds=10)
+    asyncio.run(agent.state.maintain())
+    t.next_at = 0
+    r = token(agent, cost=2, credentials_fp="fp1")
+    assert r["granted"] and r["route"]["credentials_fp"] == "fp2"
+    spend = [c for c in agent.api.calls if c[0] == "/v1/targets/spend"]
+    assert spend[-1][1]["egress"] == "pool:resi"

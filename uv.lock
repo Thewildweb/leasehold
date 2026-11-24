@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -420,6 +420,7 @@ archive = [
     { name = "pyarrow" },
 ]
 server = [
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pyjwt", extra = ["crypto"] },
@@ -437,6 +438,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "confluent-kafka", specifier = ">=2.16.2" },
+    { name = "cryptography", marker = "extra == 'server'", specifier = ">=44" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.165.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "idna", specifier = ">=3.7" },

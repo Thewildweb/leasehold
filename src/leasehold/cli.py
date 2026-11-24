@@ -186,13 +186,18 @@ def _cmd_egress_migrate(args: argparse.Namespace) -> int:
                     f"grant: {role} reads the schema, writes "
                     + ", ".join(schema.SHARED_WRITE_TABLES)
                 )
+            for role in args.reader:
+                print(f"grant: {role} reads the schema except the credential columns")
             print("\ndry run; pass --yes to apply")
             return 0
         applied = schema.migrate(conn, args.schema)
         schema.grant_writers(conn, args.writer, args.schema)
+        schema.grant_readers(conn, args.reader, args.schema)
     print(f"schema {args.schema}: applied {applied or 'nothing'}")
     for role in args.writer:
         print(f"granted {role}: read, and write {', '.join(schema.SHARED_WRITE_TABLES)}")
+    for role in args.reader:
+        print(f"granted {role}: read, except the credential columns")
     return 0
 
 
@@ -922,6 +927,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="another environment's Postgres role: may read the schema and write the "
         "dispatch tables (target leases, cooldowns, pair usage); repeatable",
     )
+    em.add_argument(
+        "--reader",
+        action="append",
+        default=[],
+        metavar="ROLE",
+        help="a read-only role (dashboards): may read the schema except the proxy "
+        "credential columns; repeatable",
+    )
     em.add_argument("--yes", action="store_true", help="apply the migrations")
     em.set_defaults(func=_cmd_egress_migrate)
 
@@ -1177,6 +1190,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sl.add_argument("out", nargs="?", help="file to write (default: stdout)")
     sl.set_defaults(func=_cmd_suffix_list)
+
+    from leasehold.proxy_cli import add_parser as add_proxy_parser
+
+    add_proxy_parser(sub)
 
     a = sub.add_parser("api", help="the control API")
     asub = a.add_subparsers(dest="api_command", required=True)

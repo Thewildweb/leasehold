@@ -75,7 +75,7 @@ class TargetControl(FakeControl):
                 )
         return tasks, targets
 
-    def renew_targets(self, egress, leases, release=(), worker_id=None):
+    def renew_targets(self, egress, leases, release=(), worker_id=None, routes=None):
         self._check()
         self.renew_calls.append((egress, list(leases), list(release)))
         renewed, lost = {}, {}
@@ -251,7 +251,7 @@ class AgentControl(TargetControl):
         self.token_calls: list[tuple] = []
         self.grants: list[tuple[float, bool]] = []
 
-    def agent_token(self, target_lease_id, task_type, cost=1, first=False):
+    def agent_token(self, target_lease_id, task_type, cost=1, first=False, credentials_fp=None):
         self._check()
         self.token_calls.append((target_lease_id, cost, first))
         if target_lease_id in self.lost:

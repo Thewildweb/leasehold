@@ -14,11 +14,13 @@ These functions use a synchronous psycopg connection; they run from the CLI.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import timedelta
 
 import psycopg
 from psycopg import sql
+from psycopg.types.json import Jsonb
 
 from leasehold import naming
 from leasehold.spec.models import ServiceSpec, TaskType
@@ -123,6 +125,15 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE {s}.task_types ADD COLUMN target_cap int",
         ],
     ),
+    (
+        5,
+        [
+            # The task type's egress block from service.yml, resolved for this
+            # environment (leasehold.egress.tiers): tiers with the proxy accounts or pools
+            # each may use, countries, stops, session. NULL: datacenter only.
+            "ALTER TABLE {s}.task_types ADD COLUMN egress jsonb",
+        ],
+    ),
 ]
 
 LATEST = MIGRATIONS[-1][0]
@@ -199,10 +210,11 @@ _SETTINGS = (
     "keep_done",
     "target_leases",
     "target_cap",
+    "egress",
 )
 
 
-def _desired_row(service: str, tt: TaskType) -> dict:
+def _desired_row(service: str, tt: TaskType, env: str) -> dict:
     return {
         "service": service,
         "key_schema": tt.key,
@@ -216,6 +228,7 @@ def _desired_row(service: str, tt: TaskType) -> dict:
         "keep_done": tt.keep_done,
         "target_leases": tt.target_leases,
         "target_cap": tt.target_cap,
+        "egress": Jsonb(tt.egress.resolve(env)) if tt.egress is not None else None,
         "hash_partitions": tt.hash_partitions,
     }
 
@@ -241,7 +254,14 @@ class TaskTypeDiff:
         return not self.changes
 
 
+def _cmp(v):
+    return v.obj if isinstance(v, Jsonb) else v
+
+
 def _fmt(v) -> str:
+    v = _cmp(v)
+    if isinstance(v, dict):
+        return json.dumps(v, separators=(",", ":"), sort_keys=True)
     if isinstance(v, timedelta):
         return f"{int(v.total_seconds())}s"
     return repr(v)
@@ -259,7 +279,7 @@ def diff_task_types(conn: psycopg.Connection, env: str, specs: list[ServiceSpec]
         raise RuntimeError(f"schema {s} is not migrated; run `leasehold frontier migrate`")
 
     desired = {
-        name: _desired_row(spec.name, tt)
+        name: _desired_row(spec.name, tt, env)
         for spec in specs
         for name, tt in spec.frontier.task_types.items()
     }
@@ -283,12 +303,13 @@ def diff_task_types(conn: psycopg.Connection, env: str, specs: list[ServiceSpec]
                 f"{name}: hash_partitions is {have['hash_partitions']} in the database and "
                 f"{want['hash_partitions']} in service.yml; it can't change after creation"
             )
-        changed = [k for k in _SETTINGS if have[k] != want[k]]
+        changed = [k for k in _SETTINGS if _cmp(have[k]) != _cmp(want[k])]
         if changed:
             detail = ", ".join(f"{k}: {_fmt(have[k])} -> {_fmt(want[k])}" for k in changed)
             d.changes.append(TaskTypeChange("update", name, detail, want))
         if not have["declared"]:
             d.changes.append(TaskTypeChange("redeclare", name))
+    d.warnings += _unknown_proxy_names(conn, specs)
     for name, have in sorted(existing.items()):
         if name in desired:
             continue
@@ -296,6 +317,41 @@ def diff_task_types(conn: psycopg.Connection, env: str, specs: list[ServiceSpec]
             d.changes.append(TaskTypeChange("undeclare", name, "no service.yml declares it"))
         d.warnings.append(f"{name}: not declared by any service.yml; its tasks are kept")
     return d
+
+
+def _unknown_proxy_names(conn: psycopg.Connection, specs: list[ServiceSpec]) -> list[str]:
+    """Proxy accounts and pools named by egress tiers that the egress schema doesn't know.
+    Not an error: proxies are live data, and the dispatcher skips names it can't find."""
+    named = {
+        (name, n)
+        for spec in specs
+        for name, tt in spec.frontier.task_types.items()
+        if tt.egress is not None
+        for n in tt.egress.names()
+    }
+    if not named:
+        return []
+    have = conn.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema = 'egress' AND table_name IN ('proxy_accounts', 'proxy_pools')"
+    ).fetchone()[0]
+    if have < 2:
+        return [
+            f"{tt}: egress names proxies, but the egress schema has no proxy tables yet"
+            for tt in sorted({t for t, _ in named})
+        ]
+    known = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM egress.proxy_accounts WHERE removed_at IS NULL "
+            "UNION SELECT name FROM egress.proxy_pools WHERE removed_at IS NULL"
+        )
+    }
+    return [
+        f"{tt}: egress names {n!r}, which is no proxy account or pool"
+        for tt, n in sorted(named)
+        if n not in known
+    ]
 
 
 def apply_task_types(conn: psycopg.Connection, env: str, d: TaskTypeDiff) -> None:
