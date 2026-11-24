@@ -9,7 +9,7 @@ or a ciphertext, only fingerprints. Request bodies are not logged.
     POST  /v1/admin/proxies/accounts                add an account
     PATCH /v1/admin/proxies/accounts/{name}         change caps, adapter, envs, ...
     POST  /v1/admin/proxies/accounts/{name}/credentials   {username, password} or {usage_key}
-    POST  /v1/admin/proxies/accounts/{name}/{drain|disable|enable|probe}
+    POST  /v1/admin/proxies/accounts/{name}/{drain|disable|enable|probe|poll}
     POST  /v1/admin/proxies/pools                   add a rotating pool
     PATCH /v1/admin/proxies/pools/{name}
     POST  /v1/admin/proxies/pools/{name}/{drain|disable|enable|remove}
@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from leasehold.egress.probe import Prober
 from leasehold.egress.proxy_admin import ProxyAdmin, ProxyAdminError, parse_lines
+from leasehold.egress.quota import QuotaKeeper
 from leasehold.egress.secrets import SecretsError
 
 log = logging.getLogger("leasehold.api.proxies")
@@ -165,6 +166,7 @@ def register_proxy_routes(
     caller_dep,
     keyring,
     probe_transport=None,
+    adapters: dict | None = None,
 ) -> None:
     background: set[asyncio.Task] = set()
 
@@ -221,6 +223,31 @@ def register_proxy_routes(
         except Exception:  # noqa: BLE001 - a background probe only logs
             log.exception("proxy probe failed", extra={"fields": {"account": name}})
 
+    async def poll_account(name: str, actor: str) -> dict:
+        """Run the account's usage adapter once, whatever its status: a new account
+        (disabled) gets the vendor's plan size before drain or enable, which need a limit."""
+        keeper = QuotaKeeper(admin, adapters or {})
+        async with pool.connection() as conn:
+            await admin.account(conn, name)
+            result = (await keeper.poll(conn, account=name))[name]
+            row = await admin.account(conn, name)
+            await admin.audit(conn, actor, "poll", "account", name, {"result": result})
+        return {
+            "account": name,
+            "result": result,
+            **{
+                k: row[k]
+                for k in (
+                    "vendor_used_bytes",
+                    "vendor_limit_bytes",
+                    "vendor_remaining_bytes",
+                    "vendor_period_end",
+                    "vendor_seen_at",
+                    "vendor_error",
+                )
+            },
+        }
+
     @app.get("/v1/admin/proxies")
     async def list_proxies(c: Admin, account: str | None = None, unused: bool = False):
         async with pool.connection() as conn:
@@ -276,8 +303,10 @@ def register_proxy_routes(
 
     @app.post("/v1/admin/proxies/accounts/{name}/{action}")
     async def account_action(
-        name: str, action: Literal["drain", "disable", "enable", "probe"], c: Writer
+        name: str, action: Literal["drain", "disable", "enable", "probe", "poll"], c: Writer
     ):
+        if action == "poll":
+            return await poll_account(name, c.name)
         if action == "probe":
             async with pool.connection() as conn:
                 await admin.account(conn, name)

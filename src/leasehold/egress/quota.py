@@ -88,16 +88,29 @@ class QuotaKeeper:
         self.paid_until_warn = paid_until_warn
         self.drift_warn = drift_warn
 
-    async def poll(self, conn: AsyncConnection, now: datetime | None = None) -> dict[str, str]:
+    async def poll(
+        self, conn: AsyncConnection, now: datetime | None = None, account: str | None = None
+    ) -> dict[str, str]:
         """Read every active account's usage. Returns account → ``ok``, ``generic`` (no
-        usage API) or the error."""
+        usage API) or the error.
+
+        ``account``: only that account, whatever its status (``leasehold proxy account
+        poll``). A new account starts disabled, and drain and enable need a limit; this
+        poll stores the vendor's plan size first, so no placeholder ``cap_gb`` is needed."""
         now = now or datetime.now(UTC)
         out: dict[str, str] = {}
-        rows = await self.admin._rows(
-            conn,
-            "SELECT * FROM {e}.proxy_accounts WHERE removed_at IS NULL AND status <> 'disabled' "
-            "ORDER BY name",
-        )
+        if account is None:
+            rows = await self.admin._rows(
+                conn,
+                "SELECT * FROM {e}.proxy_accounts WHERE removed_at IS NULL "
+                "AND status <> 'disabled' ORDER BY name",
+            )
+        else:
+            rows = await self.admin._rows(
+                conn,
+                "SELECT * FROM {e}.proxy_accounts WHERE removed_at IS NULL AND name = %s",
+                (account,),
+            )
         kinds = {
             r["account"]: r["kind"]
             for r in await self.admin._rows(

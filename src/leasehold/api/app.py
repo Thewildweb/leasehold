@@ -1340,7 +1340,7 @@ def create_app(
         }
 
     register_proxy_routes(
-        app, pool, admin, dispatcher, registry, settings, caller, keyring, probe_transport
+        app, pool, admin, dispatcher, registry, settings, caller, keyring, probe_transport, adapters
     )
 
     @app.get("/v1/whoami")

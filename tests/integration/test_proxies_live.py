@@ -662,9 +662,12 @@ def api(world, tmp_path):
         stats_interval=3600, egress_schema=world.eg, egress_owner=True, plan_interval=3600,
         proxy_interval=3600,
     )  # fmt: skip
-    app = create_app(settings, registry=Registry([SPEC]), keyring=world.ring, adapters={})
+    fake = FakeAdapter()
+    app = create_app(settings, registry=Registry([SPEC]), keyring=world.ring,
+                     adapters={"fake": fake})  # fmt: skip
     with TestClient(app) as client:
         client.tokens = tokens
+        client.fake = fake
         yield client
 
 
@@ -877,3 +880,45 @@ def test_an_account_without_a_limit_cant_be_enabled(world):
     # And an account in use can't drop its only limit.
     with pytest.raises(Conflict, match="no limit"):
         run(lambda c: world.admin.update_account(c, "admin:t", "isp-a", cap_gb=None))
+
+
+def test_first_poll_of_a_disabled_account_gives_it_a_limit(world):
+    fake = FakeAdapter()
+    keeper = QuotaKeeper(world.admin, {"fake": fake})
+    run(lambda c: world.admin.add_account(c, "admin:t", "new-a", adapter="fake",
+                                          envs=[world.env]))  # fmt: skip
+    run(lambda c: world.admin.set_usage_key(c, "admin:t", "new-a", b"usage-key-2"))
+    # The periodic poll skips disabled accounts, and drain needs a limit.
+    assert "new-a" not in run(lambda c: keeper.poll(c))
+    with pytest.raises(Conflict, match="account poll"):
+        run(lambda c: world.admin.account_status(c, "admin:t", "new-a", "drain"))
+    # Polling the account by name reads it anyway; the vendor's plan size is its limit.
+    fake.calls.clear()
+    assert run(lambda c: keeper.poll(c, account="new-a")) == {"new-a": "ok"}
+    assert fake.calls == [("new-a", None, b"usage-key-2")]
+    assert world.sql(
+        "SELECT status, vendor_limit_bytes, vendor_used_bytes, cap_gb FROM {e}.proxy_accounts "
+        "WHERE name = 'new-a'"
+    ) == [("disabled", 1_000_000_000, 950_000_000, None)]
+    run(lambda c: world.admin.account_status(c, "admin:t", "new-a", "enable"))
+    # Unknown or removed: nothing polled.
+    assert run(lambda c: keeper.poll(c, account="nope")) == {}
+
+
+def test_api_account_poll(api, world):
+    run(lambda c: world.admin.add_account(c, "admin:t", "new-b", adapter="fake",
+                                          envs=[world.env]))  # fmt: skip
+    run(lambda c: world.admin.set_usage_key(c, "admin:t", "new-b", b"usage-key-3"))
+    assert call(api, "worker", "POST", "/v1/admin/proxies/accounts/new-b/poll").status_code == 403
+    assert call(api, "admin", "POST", "/v1/admin/proxies/accounts/nope/poll").status_code == 404
+    r = call(api, "admin", "POST", "/v1/admin/proxies/accounts/new-b/poll")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["result"] == "ok" and body["vendor_limit_bytes"] == 1_000_000_000
+    assert body["vendor_error"] is None and "usage-key-3" not in r.text
+    assert api.fake.calls == [("new-b", None, b"usage-key-3")]
+    assert world.sql(
+        "SELECT action FROM {e}.proxy_audit WHERE object = 'new-b' ORDER BY id DESC LIMIT 1"
+    ) == [("poll",)]
+    r = call(api, "admin", "POST", "/v1/admin/proxies/accounts/new-b/drain")
+    assert r.status_code == 200, r.text
