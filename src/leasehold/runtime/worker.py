@@ -259,7 +259,9 @@ class TaskContext:
 
     def token(self, cost: int = 1) -> None:
         """Wait for leave to send one more request to this task's target (after the first,
-        which the lease covers). ``cost``: tokens it uses, e.g. N for a browser page load.
+        which the lease covers); asks the control API first whether the task and the target
+        are still leased, so a pause or revoke stops the task here. ``cost``:
+        tokens it uses, e.g. N for a browser page load.
         Raises ``TargetLost`` when the target may not be contacted any more. Without
         target leases it returns at once."""
         if self._token_fn is not None:
@@ -622,6 +624,7 @@ class Worker:
                 if r.get("lost"):
                     raise TargetLost(r["lost"])
                 if r.get("granted"):
+                    self._check_leases(held, t)
                     return
                 wait = float(r.get("wait_s") or 0.5)
             else:
@@ -629,6 +632,10 @@ class Worker:
                 if now >= t.stop_at:
                     raise TargetLost("target lease ends")
                 if now >= t.next_start:
+                    self._check_leases(held, t)
+                    now = time.monotonic()
+                    if now >= t.stop_at:
+                        raise TargetLost("target lease ends")
                     t.next_start = now + t.lease.interval_s
                     return
                 wait = t.next_start - now
@@ -636,6 +643,59 @@ class Worker:
                 raise TargetLost("no leave to send within the time limit")
             if self.ctx.stopping.wait(min(wait, 5.0)):
                 raise TargetLost("worker stopping")
+
+    def _check_leases(self, held: _Held, t: _Target) -> None:
+        """Runs in the handler's thread, before an extra request: ask the control API
+        whether the task and its target are still leased. The renewals in the main loop
+        come at half the lease duration, so a pause, a revoke or a cooldown would otherwise
+        reach a running task only then. Raises ``TargetLost``. When the API can't be
+        reached the task goes on until its lease expires, as with the renewals. With an
+        agent, the agent checks the target lease itself."""
+        ref = held.leased.ref
+        try:
+            renewed, lost = self.client.renew([ref])
+        except (Unavailable, ClientError) as e:
+            self._api_error("renew", e)
+            if held.expires <= _now():
+                self._lost_in_task(held)
+                raise TargetLost("lease expired") from None
+        else:
+            if ref in lost:
+                self._lost_in_task(held)
+                raise TargetLost("lease lost")
+            held.expires = renewed.get(ref, held.expires)
+        if self.via_agent:
+            return
+        tid = t.lease.lease_id
+        routes: dict[uuid.UUID, Route] = {}
+        now = _now()
+        try:
+            targets, gone = self.client.renew_targets(
+                self.egress, [tid], (), worker_id=self.worker_id, routes=routes
+            )
+        except (Unavailable, ClientError) as e:
+            self._api_error("renew_targets", e)
+            return  # the caller checks stop_at
+        if tid in gone:
+            # One task per target runs at a time, so no other task needs to be told.
+            t.lost = t.lost or gone[tid]
+            self._lost_in_task(held)
+            log.info(
+                "target lease lost",
+                extra={"fields": {"target": t.lease.target, "reason": t.lost}},
+            )
+            raise TargetLost(t.lost)
+        if tid in targets:
+            t.expires = targets[tid]
+            t.stop_at = _stop_at(t.expires, now)
+        if tid in routes:
+            t.route = routes[tid]  # tasks started from now use it
+
+    @staticmethod
+    def _lost_in_task(held: _Held) -> None:
+        if not held.task.lost.is_set():
+            held.task.lost.set()
+            LOST.labels(held.task.task_type).inc()
 
     def _launch(self, held: _Held) -> None:
         self.running[held.leased.ref] = held
