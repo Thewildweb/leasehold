@@ -287,6 +287,7 @@ def clickhouse(
             changes=len(d.new_databases)
             + len(d.errors_tables)
             + len(d.changes)
+            + len(d.derived)
             + (len(prunable) if prune else 0)
             + int(ud.profile_missing)
             + len(ud.changes)
