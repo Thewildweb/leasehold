@@ -27,12 +27,20 @@ WAFs, hosted platforms), and how a target is recognised::
 from __future__ import annotations
 
 import ipaddress
+import re
 from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 from leasehold.types import Duration
 
@@ -41,6 +49,7 @@ PROVIDERS_FILE = "providers.yml"
 BUDGETS_FILE = "budgets.yml"
 
 ProviderName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]*$", max_length=60)]
+_HOSTNAME = re.compile(r"^([a-z0-9_]([a-z0-9_-]*[a-z0-9])?\.)*[a-z0-9]+\Z")
 Hostname = Annotated[
     str,
     StringConstraints(
@@ -245,14 +254,56 @@ class Network(_Strict):
     per_asn: int | None = Field(default=None, ge=0, description="Per minute")
 
 
+def _target_pattern(v: str) -> str:
+    """A target's name (a host or an IP address, as tasks carry it) or ``*.`` and a host."""
+    try:
+        return str(ipaddress.ip_address(v))
+    except ValueError:
+        pass
+    if not _HOSTNAME.match(v.removeprefix("*.")) or len(v) > 253:
+        raise ValueError(f"{v!r} is not a lower-case host, an IP address or '*.' and a host")
+    return v
+
+
+class TargetOverride(_Strict):
+    """Limits of the targets a pattern matches; an unset one is the general limit."""
+
+    interval: Duration | None = Field(default=None, description="Instead of targets.interval")
+    per_hour: int | None = Field(
+        default=None, ge=1, description="Instead of pair.per_hour, per egress and target"
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> TargetOverride:
+        if self.interval is None and self.per_hour is None:
+            raise ValueError("a target override sets interval, per_hour or both")
+        if self.interval is not None and self.interval <= timedelta(0):
+            raise ValueError("a target override's interval must be positive")
+        return self
+
+
 class Targets(_Strict):
     """The pace towards one target (a server, or a domain behind a CDN or platform),
     for the whole fleet: one egress holds the target at a time and sends at most one
-    request per ``interval``."""
+    request per ``interval``.
+
+    ``overrides`` sets limits by target, before its kind::
+
+        overrides:
+          api.example.com: { interval: 3s }
+          "*.example.net": { interval: 10s, per_hour: 100 }
+
+    The key is the target's exact name, or ``*.`` and a host for every name below that
+    host (not the host itself). One entry applies: the exact name, else the longest
+    matching pattern. A pattern sets each target's own limit, not one they share.
+    """
 
     interval: Duration = timedelta(seconds=5)
     per_kind: dict[Literal["cdn", "platform", "parking", "shared_ip", "none"], Duration] = Field(
         default_factory=dict, description="Instead of interval, by the target's kind"
+    )
+    overrides: dict[Annotated[str, AfterValidator(_target_pattern)], TargetOverride] = Field(
+        default_factory=dict, description="Instead of the interval and the pair budget, by target"
     )
 
     @model_validator(mode="after")
@@ -262,7 +313,20 @@ class Targets(_Strict):
                 raise ValueError("targets: intervals must be positive")
         return self
 
-    def interval_for(self, kind: str) -> timedelta:
+    def override_for(self, target: str) -> TargetOverride | None:
+        if target in self.overrides:
+            return self.overrides[target]
+        rest = target
+        while "." in rest:
+            rest = rest.split(".", 1)[1]
+            if f"*.{rest}" in self.overrides:
+                return self.overrides[f"*.{rest}"]
+        return None
+
+    def interval_for(self, kind: str, target: str = "") -> timedelta:
+        override = self.override_for(target)
+        if override is not None and override.interval is not None:
+            return override.interval
         return self.per_kind.get(kind or "none", self.interval)  # type: ignore[call-overload]
 
 
@@ -347,6 +411,13 @@ class Budgets(_Strict):
     pair: Pair = Pair()
     cooldown: Cooldown = Cooldown()
     proxies: Proxies = Proxies()
+
+    def pair_per_hour(self, target: str) -> int | None:
+        """Requests per (egress, target) per hour; None: no pair budget."""
+        override = self.targets.override_for(target)
+        if override is not None and override.per_hour is not None:
+            return override.per_hour
+        return self.pair.per_hour
 
 
 # --- loading ----------------------------------------------------------------------------------

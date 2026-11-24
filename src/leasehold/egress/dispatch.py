@@ -28,7 +28,8 @@ a proxy egress the dispatcher picks. In one transaction the dispatcher:
    but no tokens left (or no plan) gets no tasks on that egress.
 
 A target lease carries the interval between requests to the target (``budgets.yml``
-``targets``, by the provider's kind) and a cap of tasks per lease; a routed one also the
+``targets``, by the target's override or its provider's kind) and a cap of tasks per
+lease; a routed one also the
 proxy route (endpoint, rendered username, credentials, session, error rules), which the
 API returns with the lease and again on renewal when the account's credentials changed.
 Holders renew their target leases with their task leases; a renewal lists the leases
@@ -529,7 +530,7 @@ class Dispatcher:
         """Lease parameters for a target (with ``room``: tasks it may get now), or None
         and why it waits."""
         tt = x.types[c["task_type"]]
-        interval = x.budgets.targets.interval_for(_kind(c["provider"], x.kinds))
+        interval = x.budgets.targets.interval_for(_kind(c["provider"], x.kinds), target)
         cap = _cap(tt, interval)
         base = {
             "provider": c["provider"],
@@ -537,7 +538,7 @@ class Dispatcher:
             "duration_ms": int(tt["lease_duration"].total_seconds() * 1000),
             "cap": cap,
         }
-        per_hour = x.budgets.pair.per_hour
+        per_hour = x.budgets.pair_per_hour(target)
 
         def pair_left(key: str) -> int:
             if per_hour is None:
