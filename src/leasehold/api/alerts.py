@@ -181,7 +181,7 @@ class AlertInbox:
 
     async def _select(self, sql: str, params: dict) -> list[dict]:
         out = await self._post(sql + " FORMAT JSONEachRow", params=params)
-        return [json.loads(line) for line in out.splitlines() if line]
+        return [json.loads(line) for line in out.split("\n") if line]  # not splitlines()
 
     async def incidents(
         self,

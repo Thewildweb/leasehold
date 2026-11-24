@@ -117,7 +117,7 @@ class Loader:
 
     def _scalar(self, sql: str) -> str:
         out = self.ch.execute(sql + " FORMAT TSV").strip()
-        return out.splitlines()[0] if out else ""
+        return out.split("\n")[0] if out else ""  # not splitlines()
 
     def _record(
         self,

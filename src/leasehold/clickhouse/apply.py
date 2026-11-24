@@ -54,7 +54,7 @@ class ClickHouse:
 
     def rows(self, sql: str) -> list[list[str]]:
         out = self.execute(sql + " FORMAT TSV")
-        return [line.split("\t") for line in out.splitlines() if line]
+        return [line.split("\t") for line in out.split("\n") if line]  # not splitlines()
 
     def tables(self, database: str) -> dict[str, tuple[str, str]]:
         """name → (engine, comment) for every table and view in ``database``."""
