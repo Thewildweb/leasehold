@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Annotated, Any, Literal
@@ -56,6 +57,7 @@ from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict, Field
 
+from leasehold import naming
 from leasehold.api.alerts import AlertInbox, InboxError, default_database, rows_from_webhook
 from leasehold.api.auth import (
     Authenticator,
@@ -66,6 +68,8 @@ from leasehold.api.auth import (
     load_tokens,
 )
 from leasehold.api.proxy_routes import redact_text, register_proxy_routes
+from leasehold.api.runs import RunLog
+from leasehold.api.runs import jobs as scheduled_jobs
 from leasehold.api.settings import Settings
 from leasehold.egress import tiers
 from leasehold.egress.dispatch import ClearRefused, Cooling, Dispatcher, EgressRefused
@@ -89,6 +93,8 @@ from leasehold.frontier.store import (
     UnknownTaskType,
     UpsertItem,
 )
+from leasehold.kafka import lag as kafka_lag
+from leasehold.kafka.apply import admin_client
 from leasehold.spec import ServiceSpec, find_specs, load_spec
 from leasehold.types import parse_duration
 
@@ -512,6 +518,59 @@ class Metrics:
             "Exits and pools per account and state",
             ["account", "kind", "state"],
         )
+        part = ["group", "topic", "partition", "service"]
+        self.lag = p("leasehold_kafka_group_lag", "Messages a group hasn't read", part)
+        self.lag_age = p(
+            "leasehold_kafka_group_oldest_unread_seconds", "Age of the oldest unread message", part
+        )
+        self.lag_retention = p(
+            "leasehold_kafka_group_retention_used_ratio",
+            "Age of the oldest unread message / the topic's retention",
+            part,
+        )
+        self.lag_share = p(
+            "leasehold_kafka_group_unread_share",
+            "Unread share of the messages the partition holds",
+            part,
+        )
+        self.lag_skipped = p(
+            "leasehold_kafka_group_skipped_messages",
+            "Messages deleted before the group read them",
+            part,
+        )
+        self.lag_success = p(
+            "leasehold_kafka_lag_last_success_timestamp_seconds",
+            "When a group's lag was last measured",
+            ["group", "topic"],
+        )
+        self.retention_bytes = p(
+            "leasehold_kafka_retention_bytes", "retention.bytes of a topic that has one", ["topic"]
+        )
+        self.dead_letters = p(
+            "leasehold_dead_letters_total_offset",
+            "Next offset of a service's dead-letter topic: every event ever moved there",
+            ["service"],
+        )
+        job = ["service", "component"]
+        self.run_failed = p(
+            "leasehold_scheduled_last_run_failed", "1 when the last run failed", job
+        )
+        self.run_success = p(
+            "leasehold_scheduled_last_success_timestamp_seconds", "The last finished run", job
+        )
+        self.run_due = p(
+            "leasehold_scheduled_success_due_timestamp_seconds",
+            "When a success is overdue (schedule and timeout)",
+            job,
+        )
+        self.logs_newest = p(
+            "leasehold_logs_newest_row_timestamp_seconds", "Newest row of the log table", []
+        )
+        self.logs_read = p(
+            "leasehold_logs_last_success_timestamp_seconds",
+            "When the log table was last read",
+            [],
+        )
 
 
 # --- app --------------------------------------------------------------------------------------
@@ -798,6 +857,81 @@ def create_app(
             finally:
                 await conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (key,))
 
+    run_log = (
+        RunLog(
+            settings.clickhouse_url,
+            settings.clickhouse_user,
+            settings.clickhouse_password,
+            settings.logs_table,
+            settings.env,
+            scheduled_jobs(registry.specs.values()),
+        )
+        if settings.clickhouse_url and settings.logs_table
+        else None
+    )
+
+    async def runs_once() -> None:
+        if run_log is None:
+            return
+        await run_log.refresh()
+        env = settings.env
+        metrics.logs_read.labels(env).set(time.time())
+        if run_log.newest_s is not None:
+            metrics.logs_newest.labels(env).set(run_log.newest_s)
+        for (service, component), st in run_log.states.items():
+            job = run_log.jobs[(service, component)]
+            metrics.run_failed.labels(env, service, component).set(1 if st.last_failed else 0)
+            metrics.run_due.labels(env, service, component).set(st.due_s(job.allowed_s))
+            if st.last_success_s is not None:
+                metrics.run_success.labels(env, service, component).set(st.last_success_s)
+
+    lag_targets = kafka_lag.targets(registry.specs.values(), settings.env)
+    lag_monitor = (
+        kafka_lag.LagMonitor(
+            admin_client(
+                settings.kafka_bootstrap,
+                settings.kafka_username or naming.monitor_principal(settings.env),
+                settings.kafka_password,
+            ),
+            lag_targets,
+            kafka_lag.dead_letter_topics(registry.specs.values(), settings.env),
+        )
+        if settings.kafka_bootstrap and settings.kafka_password
+        else None
+    )
+
+    async def lag_once() -> None:
+        if lag_monitor is None:
+            return
+        r = await asyncio.to_thread(lag_monitor.measure)
+        env, now = settings.env, time.time()
+        for t, readings in r.readings.items():
+            for x in readings:
+                labels = (env, t.group, t.topic, str(x.partition), t.service)
+                metrics.lag.labels(*labels).set(x.lag)
+                metrics.lag_age.labels(*labels).set(x.oldest_unread_s)
+                metrics.lag_retention.labels(*labels).set(x.oldest_unread_s / t.retention_s)
+                metrics.lag_share.labels(*labels).set(x.unread_share)
+                metrics.lag_skipped.labels(*labels).set(x.skipped)
+            metrics.lag_success.labels(env, t.group, t.topic).set(now)
+        for service, offset in r.dead_letters.items():
+            metrics.dead_letters.labels(env, service).set(offset)
+        if r.errors:
+            t, why = next(iter(r.errors.items()))
+            log.warning(
+                "consumer lag: %d groups not measured (%s %s: %s)",
+                len(r.errors), t.group, t.topic, why,
+            )  # fmt: skip
+
+    if lag_monitor is not None:
+        # From now on a group that stays unmeasured counts as such.
+        for t in lag_targets:
+            metrics.lag_success.labels(settings.env, t.group, t.topic).set(time.time())
+            if t.retention_bytes is not None:
+                metrics.retention_bytes.labels(settings.env, t.topic).set(t.retention_bytes)
+    if run_log is not None:
+        metrics.logs_read.labels(settings.env).set(time.time())
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await pool.open(wait=True)
@@ -822,6 +956,8 @@ def create_app(
             ),
             asyncio.create_task(background("proxies", settings.proxy_interval, proxies_once)),
             asyncio.create_task(inbox_table()),
+            asyncio.create_task(background("scheduled runs", settings.runs_interval, runs_once)),
+            asyncio.create_task(background("consumer lag", settings.lag_interval, lag_once)),
         ]
         try:
             yield
@@ -834,6 +970,8 @@ def create_app(
             await pool.close()
             if inbox is not None:
                 await inbox.close()
+            if run_log is not None:
+                await run_log.close()
 
     app = FastAPI(title="leasehold control API", version="1", lifespan=lifespan)
     app.state.settings = settings
@@ -848,6 +986,8 @@ def create_app(
     app.state.dispatcher = dispatcher
     app.state.proxy_admin = admin
     app.state.inbox = inbox
+    app.state.runs_once = runs_once
+    app.state.lag_once = lag_once
 
     @app.exception_handler(AuthError)
     async def _auth_error(request: Request, exc: AuthError):

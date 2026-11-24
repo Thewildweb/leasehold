@@ -10,6 +10,8 @@ environment's namespace:
 - a service's ClickHouse sink principal (``certlog.clickhouse``):
   ``leasehold/<service>/clickhouse-kafka``, keys ``username`` and ``password``. Only
   operators read it; the ClickHouse step puts it in the named collection.
+- the control API's user for the lag measurement (``leasehold.monitor``):
+  ``nomad/jobs/control-api/api``, the same keys as a component's.
 
 ``diff`` decides per principal:
 
@@ -88,6 +90,16 @@ def plan(specs: list[ServiceSpec], env: str) -> list[KafkaCredential]:
                     password_key="password",
                 )
             )
+    if out:
+        out.append(
+            KafkaCredential(
+                principal=naming.monitor_principal(env),
+                namespace=namespace,
+                path=naming.MONITOR_VARIABLE,
+                user_key=KAFKA_USER_KEY,
+                password_key=KAFKA_PASSWORD_KEY,
+            )
+        )
     return sorted(out, key=lambda c: c.principal)
 
 

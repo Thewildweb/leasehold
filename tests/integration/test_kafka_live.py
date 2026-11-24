@@ -222,3 +222,46 @@ def test_config_drift_is_detected_and_corrected(env):
     ]
     apply(admin, d)
     assert _converged_diff(env).empty
+
+
+def test_monitor_measures_lag_with_describe_only(env):
+    from confluent_kafka import Consumer, KafkaException
+    from confluent_kafka.admin import AdminClient
+
+    from leasehold.kafka import lag
+
+    name = env["name"]
+    topic = naming.topic(name, "certwatch", "entries", 1)
+    writer = naming.kafka_principal(name, "certwatch", "worker")
+    for _ in range(3):
+        assert _produce(env, writer, topic) is None
+    monitor = naming.monitor_principal(name)
+    conf = _client_conf(monitor, env["passwords"][monitor])
+    wanted = lag.targets(env["specs"], name)
+    m = lag.LagMonitor(AdminClient(conf), wanted, lag.dead_letter_topics(env["specs"], name))
+    deadline = time.monotonic() + 15
+    while (r := m.measure()).errors and time.monotonic() < deadline:
+        time.sleep(0.5)  # ACLs propagating
+    assert not r.errors
+    assert set(r.readings) == set(wanted)
+    for t, readings in r.readings.items():
+        if t.topic == topic:
+            assert sum(x.lag for x in readings) >= 3
+            assert 0 <= max(x.oldest_unread_s for x in readings) < t.retention_s * 0.05
+    assert r.dead_letters == {"resolver": 0}
+
+    # It may not read the messages it counts.
+    c = Consumer(conf | {"group.id": naming.consumer_group(name, "resolver", "new-domains")})
+    c.subscribe([topic])
+    end = time.monotonic() + 10
+    err = None
+    try:
+        while err is None and time.monotonic() < end:
+            msg = c.poll(1)
+            assert msg is None or msg.error(), "the monitor read a message"
+            err = msg.error() if msg is not None else None
+    except KafkaException as e:
+        err = e.args[0]
+    finally:
+        c.close()
+    assert err is not None

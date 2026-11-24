@@ -146,13 +146,34 @@ def test_hash_follows_content():
     assert a == b != c.rule["annotations"]["leasehold_hash"]
 
 
+WATCHDOG = {
+    "lag-retention-warning", "lag-retention", "lag-data-lost", "lag-not-measured",
+    "replay-loop", "batch-killed", "dead-letter", "batch-slow",
+    "run-failed", "run-overdue", "runs-not-readable",
+}  # fmt: skip
+
+
+def test_watchdog_rules_carry_a_routing_label():
+    rules = {r.rule["labels"]["rule"]: r.rule for r in platform_rules("dev", "f", "p")}
+    labelled = {n: r["labels"]["watchdog"] for n, r in rules.items() if "watchdog" in r["labels"]}
+    assert set(labelled) == WATCHDOG
+    assert labelled["lag-retention"] == "lag"
+    assert labelled["replay-loop"] == labelled["dead-letter"] == "replay"
+    assert labelled["run-failed"] == "runs"
+    pages = {n for n in WATCHDOG if rules[n]["labels"]["priority"] == "page"}
+    assert pages == {"lag-retention", "lag-data-lost", "replay-loop", "dead-letter"}
+    for n in WATCHDOG:
+        expr = rules[n]["data"][0]["model"]["expr"]
+        assert 'env="dev"' in expr and "{{" not in expr
+
+
 def test_platform_rules_one_alert_per_series():
     prod = {r.rule["labels"]["rule"]: r for r in platform_rules("prod", "lhf-prod--platform", "p")}
     assert set(prod) == {
         "proxy-account-state", "proxy-quota-warning", "proxy-usage-poll-failing",
         "proxy-paid-until", "proxy-auto-disabled", "proxy-usage-drift", "proxy-exit-moved",
         "proxy-task-type-stopped",
-    }  # fmt: skip
+    } | WATCHDOG  # fmt: skip
     state = prod["proxy-account-state"].rule
     assert state["uid"] == "lha-prod--platform-proxy-account-state"
     assert state["folderUID"] == "lhf-prod--platform"
@@ -176,7 +197,7 @@ def test_platform_rules_one_alert_per_series():
 def test_platform_rules_on_shared_tables_only_in_prod():
     dev = {r.rule["labels"]["rule"]: r for r in platform_rules("dev", "f", "p")}
     # Account state and quota come from tables every environment shares: prod alerts.
-    assert set(dev) == {"proxy-auto-disabled", "proxy-task-type-stopped"}
+    assert set(dev) == {"proxy-auto-disabled", "proxy-task-type-stopped"} | WATCHDOG
     expr = dev["proxy-task-type-stopped"].rule["data"][0]["model"]["expr"]
     assert expr == 'max by (task_type, account) (leasehold_proxy_stopped{env="dev"}) == 1'
     assert dev["proxy-auto-disabled"].rule["title"] == "platform: proxy exit or pool disabled (dev)"

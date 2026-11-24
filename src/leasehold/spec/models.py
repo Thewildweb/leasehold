@@ -1210,7 +1210,7 @@ class ServiceSpec(_Strict):
                     yield f"{where}: unknown topic {sink.topic!r}; declare it under kafka.produces"
 
         for t in sorted(set(own_topics) & naming.RESERVED_TOPIC_NAMES):
-            yield f"kafka.produces.{t}: the topic name {t!r} is reserved (the plan log)"
+            yield f"kafka.produces.{t}: the topic name {t!r} is reserved for the platform"
         if self.clickhouse:
             reserved = naming.RESERVED_SINK_NAMES
             for name in sorted(self.clickhouse.tables() & reserved):

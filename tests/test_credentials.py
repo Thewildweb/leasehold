@@ -68,6 +68,7 @@ def test_plan(spec):
     assert [(c.principal, c.namespace, c.path) for c in creds] == [
         ("dev.certwatch.clickhouse", "dev", "leasehold/certwatch/clickhouse-kafka"),
         ("dev.certwatch.worker", "dev", "nomad/jobs/certwatch-worker"),
+        ("dev.leasehold.monitor", "dev", "nomad/jobs/control-api/api"),
     ]
     # The planner doesn't use Kafka, so it gets no Kafka credential.
     assert not any("planner" in c.principal for c in creds)
@@ -80,6 +81,7 @@ def test_new_credentials_are_set_in_kafka_and_nomad(spec):
     assert [(c.credential.principal, c.reason) for c in d.changes] == [
         ("certwatch.clickhouse", "new"),
         ("certwatch.worker", "new"),
+        ("leasehold.monitor", "new"),
     ]
     credentials.apply(admin, nomad, d)
     items = nomad.var_get("nomad/jobs/certwatch-worker", "default")["Items"]

@@ -35,7 +35,15 @@ all). Rules on tables every environment shares (the proxy accounts, owned by pro
 rendered in prod only, so they don't fire twice. Levels (90% used, paid_until within 7
 days, ...) are egress settings (``budgets.proxies``): the control API compares against
 them and exports 0/1 gauges, so a changed level needs no re-apply. The outage rule
-(``kafka_up``, ``control_api_up``) and a rule on failed scheduled runs belong here too.
+(``kafka_up``, ``control_api_up``) belongs here too.
+
+The **watchdog** rules are platform rules on stuck and failing pipelines: unread data
+against its topic's retention (``leasehold.kafka.lag``), replay loops, slow batches and
+dead letters (``leasehold.runtime.inflight``) and scheduled runs (``leasehold.api.runs``).
+Those that mean data loss or a stuck component are labelled ``watchdog=<part>`` (``lag``,
+``replay`` or ``runs``), so that routing can pick them in an environment whose other
+alerts don't go to a phone. Kafka's time retention is measured here; for topics with
+``retention_bytes`` the size comes from the broker's JMX exporter (``kafka_log_log_size``).
 
 Every rule is labelled ``managed_by=leasehold``, ``env``, ``service``, ``rule``,
 ``priority``, and ``component`` when it has one (platform rules: ``service=platform``
@@ -251,6 +259,7 @@ class _Builder:
         interval_s: int = 60,
         no_data: str = "OK",
         summary: str | None = None,
+        extra_labels: dict[str, str] | None = None,
     ) -> None:
         service = self.spec.name if self.spec else PLATFORM
         labels = {
@@ -259,6 +268,7 @@ class _Builder:
             "service": service,
             "rule": name,
             "priority": priority,
+            **(extra_labels or {}),
         }
         if component:
             labels["component"] = component
@@ -445,11 +455,165 @@ class PlatformRule:
     description: str
     for_: timedelta | None = None
     owner_only: bool = False  # on tables every environment shares: prod only
+    watchdog: str | None = None  # the label ``watchdog``
 
 
 _ACTIVE = (
     " and on (account) (max by (account) "
     '(leasehold_proxy_account_status{{env="{env}", status!="disabled"}}) == 1)'
+)
+
+
+def _behind(threshold: float) -> str:
+    """Per group and topic: the worst partition's share of retention, above a threshold."""
+    by_time = 'leasehold_kafka_group_retention_used_ratio{{env="{env}"}}'
+    by_size = (
+        'leasehold_kafka_group_unread_share{{env="{env}"}}'
+        " * on (topic, partition) group_left() max by (topic, partition) (kafka_log_log_size)"
+        " / on (topic) group_left() max by (topic) "
+        '(leasehold_kafka_retention_bytes{{env="{env}"}})'
+    )
+    return (
+        f"max by (group, topic) ({by_time}) > {threshold}"
+        f" or max by (group, topic) ({by_size}) > {threshold}"
+    )
+
+
+_PERCENT = "{{ humanizePercentage $values.B.Value }}"
+# Without fresh log rows run outcomes can't be judged: one alert for that, not one per job.
+_LOGS_FRESH = (
+    ' and on () (time() - max(leasehold_logs_newest_row_timestamp_seconds{{env="{env}"}}) < 900)'
+)
+
+WATCHDOG_RULES: tuple[PlatformRule, ...] = (
+    PlatformRule(
+        "lag-retention-warning",
+        "unread data at 25% of retention",
+        _behind(0.25),
+        "warning",
+        "{{ $labels.group }} on {{ $labels.topic }}: unread data at " + _PERCENT + " of retention",
+        "The oldest unread message's share of the topic's retention. At 100% Kafka deletes "
+        "messages this group hasn't read.",
+        for_=timedelta(minutes=10),
+        watchdog="lag",
+    ),
+    PlatformRule(
+        "lag-retention",
+        "unread data at 50% of retention",
+        _behind(0.5),
+        "page",
+        "{{ $labels.group }} on {{ $labels.topic }}: unread data at " + _PERCENT + " of retention",
+        "The oldest unread message's share of the topic's retention. At 100% Kafka deletes "
+        "messages this group hasn't read.",
+        for_=timedelta(minutes=5),
+        watchdog="lag",
+    ),
+    PlatformRule(
+        "lag-data-lost",
+        "Kafka deleted unread messages",
+        "sum by (group, topic) (max_over_time("
+        'leasehold_kafka_group_skipped_messages{{env="{env}"}}[1h])) > 0',
+        "page",
+        "{{ $labels.group }} on {{ $labels.topic }}: {{ $values.B.Value }} messages were deleted "
+        "before they were read",
+        "The group's committed offset is before the first message the partition still has.",
+        watchdog="lag",
+    ),
+    PlatformRule(
+        "lag-not-measured",
+        "consumer lag not measured",
+        "count(time() - leasehold_kafka_lag_last_success_timestamp_seconds"
+        '{{env="{env}"}} > 600)'
+        ' or absent(leasehold_kafka_lag_last_success_timestamp_seconds{{env="{env}"}})',
+        "high",
+        "consumer lag isn't measured ({{ $values.B.Value }} group and topic pairs)",
+        "The control API's lag measurement fails or isn't running; its log says why.",
+        for_=timedelta(minutes=10),
+        watchdog="lag",
+    ),
+    PlatformRule(
+        "replay-loop",
+        "restart loop",
+        "sum by (service, component) (changes("
+        'process_start_time_seconds{{env="{env}", service!=""}}[6h])) > 20',
+        "page",
+        "{{ $labels.service }} {{ $labels.component }} restarted {{ $values.B.Value }} times "
+        "in 6 hours",
+        "Restarts that go on for hours: a processor then replays the same batch. Its log has "
+        "'the previous process died while handling a batch' with the event.",
+        for_=timedelta(minutes=10),
+        watchdog="replay",
+    ),
+    PlatformRule(
+        "batch-killed",
+        "processor died on a batch",
+        "max by (service, component) (max_over_time("
+        'leasehold_processor_batch_kills{{env="{env}"}}[15m])) >= 2',
+        "high",
+        "{{ $labels.service }} {{ $labels.component }} died {{ $values.B.Value }} times on the "
+        "same batch",
+        "After 5 times the batch is handled one event at a time and the event that kills the "
+        "process goes to the dead-letter topic.",
+        watchdog="replay",
+    ),
+    PlatformRule(
+        "dead-letter",
+        "event dead-lettered",
+        'sum by (service) (leasehold_dead_letters_total_offset{{env="{env}"}} - '
+        'min_over_time(leasehold_dead_letters_total_offset{{env="{env}"}}[1h])) > 0',
+        "page",
+        "{{ $labels.service }}: {{ $values.B.Value }} events moved to the dead-letter topic",
+        "Events that killed their processor when handled alone. The message's headers say "
+        "where each came from; kept for 30 days.",
+        watchdog="replay",
+    ),
+    PlatformRule(
+        "batch-slow",
+        "processor batches slow",
+        "histogram_quantile(0.99, sum by (le, service, component) (rate("
+        'leasehold_processor_batch_seconds_bucket{{env="{env}"}}[15m]))) > 30',
+        "warning",
+        "{{ $labels.service }} {{ $labels.component }}: p99 batch time "
+        '{{ printf "%.0f" $values.B.Value }} s',
+        "Batches that finish slowly. One that doesn't finish is in the log ('a batch is slow').",
+        for_=timedelta(minutes=15),
+        watchdog="replay",
+    ),
+    PlatformRule(
+        "run-failed",
+        "scheduled run failed",
+        "max by (service, component) ("
+        'leasehold_scheduled_last_run_failed{{env="{env}"}}) == 1' + _LOGS_FRESH,
+        "warning",
+        "{{ $labels.service }} {{ $labels.component }}: the last run failed",
+        "Resolved by the next run that finishes. The run's log line is 'run failed'.",
+        for_=timedelta(minutes=15),
+        watchdog="runs",
+    ),
+    PlatformRule(
+        "run-overdue",
+        "no successful scheduled run",
+        "time() - max by (service, component) ("
+        'leasehold_scheduled_success_due_timestamp_seconds{{env="{env}"}}) > 0' + _LOGS_FRESH,
+        "high",
+        "{{ $labels.service }} {{ $labels.component }}: no successful run for too long",
+        "Nothing finished in twice the schedule's longest gap plus the timeout (at least 30m): "
+        "failing, killed, or not started.",
+        for_=timedelta(minutes=5),
+        watchdog="runs",
+    ),
+    PlatformRule(
+        "runs-not-readable",
+        "scheduled runs not checked",
+        '(time() - max(leasehold_logs_newest_row_timestamp_seconds{{env="{env}"}}) > 900)'
+        ' or (time() - max(leasehold_logs_last_success_timestamp_seconds{{env="{env}"}}) > 900)'
+        ' or absent(leasehold_logs_last_success_timestamp_seconds{{env="{env}"}})',
+        "high",
+        "run outcomes of scheduled components can't be read",
+        "No new rows in the log table for 15 minutes, or the control API can't query it.",
+        for_=timedelta(minutes=10),
+        watchdog="runs",
+    ),
 )
 
 PLATFORM_RULES: tuple[PlatformRule, ...] = (
@@ -534,6 +698,7 @@ PLATFORM_RULES: tuple[PlatformRule, ...] = (
         "(stop_at_used); resolved when it resumes",
         "The task type's stop_at_used share of the account is used.",
     ),
+    *WATCHDOG_RULES,
 )
 
 
@@ -543,5 +708,6 @@ def platform_rules(env: str, folder_uid: str, prometheus_uid: str) -> list[RuleP
         if r.owner_only and env != naming.PROD:
             continue
         data, cond = _series_rule(r.expr.format(env=env), prometheus_uid)
-        b.add(r.name, r.title, data, cond, r.priority, r.for_, r.description, summary=r.summary)
+        b.add(r.name, r.title, data, cond, r.priority, r.for_, r.description, summary=r.summary,
+              extra_labels={"watchdog": r.watchdog} if r.watchdog else None)  # fmt: skip
     return b.rules

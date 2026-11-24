@@ -37,6 +37,18 @@ The alert inbox (``leasehold.api.alerts``), off when LEASEHOLD_CLICKHOUSE_URL is
     LEASEHOLD_CLICKHOUSE_USER      (default: leasehold)
     LEASEHOLD_CLICKHOUSE_PASSWORD
     LEASEHOLD_ALERTS_DATABASE      (default: leasehold in prod, <env>_leasehold elsewhere)
+
+Scheduled runs (``leasehold.api.runs``), off when unset; needs LEASEHOLD_CLICKHOUSE_URL and
+SELECT on the table:
+
+    LEASEHOLD_LOGS_TABLE           the log table, e.g. logs.app_logs
+
+Consumer lag (``leasehold.kafka.lag``), off without a bootstrap address and a password:
+
+    LEASEHOLD_KAFKA_BOOTSTRAP
+    LEASEHOLD_KAFKA_USERNAME       (default: from naming, <env>.leasehold.monitor)
+    LEASEHOLD_KAFKA_PASSWORD
+    LEASEHOLD_LAG_INTERVAL         seconds between measurements (default: 60)
 """
 
 from __future__ import annotations
@@ -72,6 +84,12 @@ class Settings:
     egress_owner: bool = False
     plan_interval: float = 15.0
     proxy_interval: float = 60.0
+    logs_table: str | None = None
+    runs_interval: float = 300.0
+    kafka_bootstrap: str | None = None
+    kafka_username: str | None = None
+    kafka_password: str | None = None
+    lag_interval: float = 60.0
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
@@ -103,4 +121,9 @@ class Settings:
             egress_owner=e.get("LEASEHOLD_EGRESS_OWNER", "") in ("1", "true", "yes"),
             plan_interval=float(e.get("LEASEHOLD_EGRESS_PLAN_INTERVAL", "15")),
             proxy_interval=float(e.get("LEASEHOLD_PROXY_INTERVAL", "60")),
+            logs_table=e.get("LEASEHOLD_LOGS_TABLE") or None,
+            kafka_bootstrap=e.get("LEASEHOLD_KAFKA_BOOTSTRAP") or None,
+            kafka_username=e.get("LEASEHOLD_KAFKA_USERNAME") or None,
+            kafka_password=e.get("LEASEHOLD_KAFKA_PASSWORD") or None,
+            lag_interval=float(e.get("LEASEHOLD_LAG_INTERVAL", "60")),
         )

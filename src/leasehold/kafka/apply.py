@@ -170,8 +170,13 @@ def diff(admin: AdminClient, plan: KafkaPlan, services: list[str]) -> Diff:
     live_bindings = admin.describe_acls(any_filter, request_timeout=TIMEOUT_S).result()
     managed = _managed_prefixes(plan, services)
     live_acls: set[AclPlan] = set()
+    # The monitor user belongs to every service: its ACLs on other services' topics and
+    # groups (an apply of some services only) are not stale.
+    monitor = f"User:{naming.monitor_principal(plan.env)}"
     for b in live_bindings:
-        if not b.principal.startswith(managed):
+        if not b.principal.startswith(managed) and not (
+            b.principal == monitor and (b.name or "").startswith(topic_prefixes)
+        ):
             continue
         as_plan = _from_binding(b)
         if as_plan is not None:

@@ -25,6 +25,8 @@ def resource_names(spec: ServiceSpec, env: str) -> list[tuple[str, str, str]]:
             )
     for tname in spec.topics():
         rows.append(("topic", tname, naming.topic_for(env, spec.topic_ref(tname))))
+    if any(isinstance(c, Processor) for c in spec.components.values()):
+        rows.append(("topic", "(dead letters)", naming.dead_letter_topic(env, spec.name)))
     for ref in sorted(spec.consumed_topic_refs()):
         rows.append(("reads topic", str(ref), naming.topic_for(env, ref)))
     for tt in spec.frontier.task_types:
