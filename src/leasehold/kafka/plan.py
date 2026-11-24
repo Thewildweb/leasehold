@@ -11,6 +11,9 @@ ACL rules, per environment:
 - An archive sink (component ``archive-<sink>``) is granted like a processor.
 - ClickHouse reads each sink's topic as the service's ``<service>.clickhouse``
   principal, with one consumer group per sink.
+- A service with a processor has a dead-letter topic, which its processors may write.
+- The control API's user (``naming.monitor_principal``) gets DESCRIBE on every topic
+  and every consumer group, to measure lag. It can't read messages or commit offsets.
 
 Everything is a LITERAL resource pattern: no prefix or wildcard ACLs, so each
 grant can be traced to one line in one ``service.yml``.
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 from leasehold import naming
 from leasehold.spec.models import ArchiveComponent, Processor, ServiceSpec
@@ -52,6 +56,9 @@ class KafkaPlan:
     topics: list[TopicPlan] = field(default_factory=list)
     principals: list[str] = field(default_factory=list)  # SCRAM user names, without "User:"
     acls: list[AclPlan] = field(default_factory=list)
+
+
+DEAD_LETTER_RETENTION = timedelta(days=30)
 
 
 def _topic_configs(spec: ServiceSpec, topic_name: str) -> tuple[tuple[str, str], ...]:
@@ -97,6 +104,20 @@ def plan(specs: Iterable[ServiceSpec], env: str) -> KafkaPlan:
                     grant(user, "TOPIC", topic, "READ", "DESCRIBE")
                 group = naming.consumer_group(env, spec.name, cname)
                 grant(user, "GROUP", group, "READ")
+            if isinstance(c, Processor):
+                grant(user, "TOPIC", naming.dead_letter_topic(env, spec.name), "WRITE", "DESCRIBE")
+
+        if any(isinstance(c, Processor) for c in spec.components.values()):
+            result.topics.append(
+                TopicPlan(
+                    name=naming.dead_letter_topic(env, spec.name),
+                    partitions=1,
+                    configs=(
+                        ("cleanup.policy", "delete"),
+                        ("retention.ms", str(int(DEAD_LETTER_RETENTION.total_seconds() * 1000))),
+                    ),
+                )
+            )
 
         if spec.clickhouse:
             user = naming.clickhouse_sink_principal(env, spec.name)
@@ -104,6 +125,14 @@ def plan(specs: Iterable[ServiceSpec], env: str) -> KafkaPlan:
                 ref = spec.sink_topic_ref(sink.topic)
                 grant(user, "TOPIC", naming.topic_for(env, ref), "READ", "DESCRIBE")
                 grant(user, "GROUP", naming.clickhouse_sink_group(env, spec.name, sname), "READ")
+
+    monitor = naming.monitor_principal(env)
+    topics = {t.name for t in result.topics}
+    topics |= {a.resource_name for a in acls if a.resource_type == "TOPIC"}
+    for topic in sorted(topics):
+        grant(monitor, "TOPIC", topic, "DESCRIBE")
+    for group in sorted({a.resource_name for a in acls if a.resource_type == "GROUP"}):
+        grant(monitor, "GROUP", group, "DESCRIBE")
 
     result.topics.sort()
     result.principals = sorted(principals)

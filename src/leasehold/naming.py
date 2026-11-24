@@ -137,6 +137,21 @@ def clickhouse_kafka_variable(service: str) -> str:
     return f"leasehold/{service}/clickhouse-kafka"
 
 
+def dead_letter_topic(env: str, service: str) -> str:
+    return topic(env, service, DEAD_LETTER_TOPIC, DEAD_LETTER_VERSION)
+
+
+# The control API's read-only Kafka user, for the lag measurement (``leasehold.kafka.lag``).
+# Its password is in the Nomad Variable of the control API job's group, which that job may
+# read without a policy: the job is ``control-api`` and its group ``api``.
+PLATFORM_SERVICE = "leasehold"
+MONITOR_VARIABLE = "nomad/jobs/control-api/api"
+
+
+def monitor_principal(env: str) -> str:
+    return f"{_dot_prefix(env)}{PLATFORM_SERVICE}.monitor"
+
+
 RESERVED_COMPONENT_NAMES = frozenset({"clickhouse", "archive", "load"})
 
 # The plan log: a topic per service with a planner, and its two sinks in the service's
@@ -146,7 +161,12 @@ PLAN_LOG_TOPIC = "planned"
 PLAN_LOG_VERSION = 1
 PLAN_LOG_KEYS_SINK = "planned"
 PLAN_LOG_RUNS_SINK = "planner_runs"
-RESERVED_TOPIC_NAMES = frozenset({PLAN_LOG_TOPIC})
+
+# Every service with a processor has one dead-letter topic, for all its processors
+# (``leasehold.runtime.processor``); a message's headers name the consumer group.
+DEAD_LETTER_TOPIC = "dead-letters"
+DEAD_LETTER_VERSION = 1
+RESERVED_TOPIC_NAMES = frozenset({PLAN_LOG_TOPIC, DEAD_LETTER_TOPIC})
 RESERVED_SINK_NAMES = frozenset({PLAN_LOG_KEYS_SINK, PLAN_LOG_RUNS_SINK})
 
 

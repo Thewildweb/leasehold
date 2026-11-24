@@ -39,6 +39,15 @@ What the loop does:
   there is no dead-letter topic yet. ``Event.payload`` is the model's JSON (defaults
   filled in); the models come from ``LEASEHOLD_PAYLOAD_MODELS``.
 - Exports ``leasehold_kafka_consumer_lag{group,topic,partition}`` every 30s.
+- Records the batch in flight in the allocation directory (``leasehold.runtime.inflight``).
+  After a death in ``handle`` (killed by the health check, OOM, segfault) the next process
+  logs the batch and the event, and counts the kill. A ``handle`` that runs longer than
+  ``LEASEHOLD_SLOW_HANDLE_S`` (default 20; 0 = off) is logged while it runs.
+- A batch that was killed ``MAX_KILLS`` times is handled one event at a time, each
+  committed on its own. An event whose handling alone kills the process goes, as it was
+  read, to the service's dead-letter topic (``naming.dead_letter_topic``), with headers
+  saying where it came from, and is committed. An exception is never a reason to
+  dead-letter: it may be an outage.
 - On SIGTERM: finish the current batch, commit, leave the group.
 """
 
@@ -52,7 +61,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 
-from confluent_kafka import Consumer, KafkaException, TopicPartition
+from confluent_kafka import Consumer, KafkaException, Producer, TopicPartition
 from prometheus_client import Counter, Gauge, Histogram
 from pydantic import BaseModel, ValidationError
 
@@ -61,6 +70,7 @@ from leasehold.runtime import claims, payloads
 from leasehold.runtime import log as lh_log
 from leasehold.runtime.context import Context, build
 from leasehold.runtime.events import Event, InvalidEvent, ProduceError, parse
+from leasehold.runtime.inflight import Journal, SlowWatch, Watched, journal_path
 
 log = logging.getLogger("leasehold")
 
@@ -85,6 +95,16 @@ BATCH_CLOSED = Counter(
     ["closed_by"],
 )
 CLAIMS = Counter("leasehold_processor_claims_resolved", "Payloads fetched by claim check")
+BATCH_AGE = Gauge(
+    "leasehold_processor_batch_age_seconds", "How long the current handle call has run (0: none)"
+)
+KILLS = Gauge(
+    "leasehold_processor_batch_kills",
+    "Times a process died on the batch that is now being retried (0: none)",
+)
+DEAD_LETTERS = Counter(
+    "leasehold_processor_dead_letters", "Events moved to the dead-letter topic", ["topic"]
+)
 LAG = Gauge(
     "leasehold_kafka_consumer_lag",
     "Messages behind the end of the partition",
@@ -98,6 +118,8 @@ DEFAULT_BATCH_MAX_BYTES = 64 * 1024 * 1024
 # in ``_pending`` when a batch closes on bytes.
 CONSUME_CHUNK = 50
 CLAIM_ATTEMPTS = 5
+MAX_KILLS = 5
+DEFAULT_SLOW_HANDLE_S = 20.0  # the health check kills a process that holds the GIL after ~30
 
 
 def batch_max_bytes_from_env(default: int | None) -> int:
@@ -146,6 +168,8 @@ class Processor:
         consumer: Consumer | None = None,
         models: dict[str, type[BaseModel]] | None = None,
         objects=None,
+        journal: Journal | None = None,
+        dead_letter_producer=None,
     ):
         """``models``: per consumed topic reference, instead of LEASEHOLD_PAYLOAD_MODELS.
         ``batch_max_bytes``: LEASEHOLD_BATCH_MAX_BYTES wins over it. ``objects``: the
@@ -185,9 +209,17 @@ class Processor:
             | prefetch_conf(self.batch_max_bytes)
         )
         self.next_lag = 0.0
+        self._dlq = dead_letter_producer
+        self.journal = journal if journal is not None else Journal(journal_path())
+        self.slow = SlowWatch(
+            float(os.environ.get("LEASEHOLD_SLOW_HANDLE_S") or DEFAULT_SLOW_HANDLE_S)
+        )
+        BATCH_AGE.set_function(self.slow.age)
+        KILLS.set(self.journal.died.kills if self.journal.died else 0)
 
     def run(self) -> int:
         self.consumer.subscribe(sorted(self.refs), on_revoke=self._on_revoke)
+        self.slow.start()
         log.info(
             "processor started",
             extra={"fields": {"group": self.group, "topics": sorted(self.refs)}},
@@ -201,7 +233,9 @@ class Processor:
             log.error("can't read claimed payloads", extra={"fields": {"error": str(e)}})
             return 1
         finally:
+            self.slow.stop()
             self.consumer.close()
+            self.journal.close()
             log.info("processor stopped")
         return 0
 
@@ -211,14 +245,97 @@ class Processor:
         if batch is None:
             return False
         msgs, events = batch
+        keys = {(e.topic, e.partition, e.offset) for e in events}
+        died = self.journal.matching(keys)
+        if died is not None and died.kills >= MAX_KILLS:
+            return self._isolate(msgs, events)
         if events and not self._handle(events):
             return False
         if msgs:
             self.consumer.commit(offsets=_next_offsets(msgs), asynchronous=False)
             for e in events:
                 EVENTS_IN.labels(e.topic).inc()
+            self._resolve_kills(keys)
         self._lag()
         return True
+
+    def _resolve_kills(self, keys) -> None:
+        self.journal.resolve(keys)
+        if self.journal.died is None:
+            KILLS.set(0)
+
+    def _isolate(self, msgs, events: list[Event]) -> bool:
+        """The batch one event at a time, each committed on its own. The event an earlier
+        process died on while it was handled alone goes to the dead-letter topic."""
+        died = self.journal.died
+        culprit = died.current if died.isolated else None
+        log.error("handling a batch one event at a time", extra={"fields": died.log_fields()})
+        by_key = {(e.topic, e.partition, e.offset): e for e in events}
+        for m in msgs:
+            if self.ctx.stopping.is_set():
+                break  # the rest isn't committed
+            self.ctx.liveness.beat()
+            key = (m.topic(), m.partition(), m.offset())
+            e = by_key.get(key)
+            if e is not None:
+                if key == culprit:
+                    self._dead_letter(m, e, died)
+                elif not self._handle([e], died.kills):
+                    return False
+            self.consumer.commit(offsets=_next_offsets([m]), asynchronous=False)
+            if e is not None:
+                EVENTS_IN.labels(e.topic).inc()
+                if key == culprit:
+                    self._resolve_kills({key})
+        else:
+            # Every event was handled or moved, also when the death left no event behind.
+            self._resolve_kills(set(by_key))
+        self._lag()
+        return True
+
+    def _dead_letter(self, m, e: Event, died) -> None:
+        """The message as it was read, in the dead-letter topic; raises when Kafka doesn't
+        confirm it (nothing is committed then)."""
+        topic = naming.dead_letter_topic(self.ctx.cfg.env, self.ctx.cfg.service)
+        if self._dlq is None:
+            self._dlq = Producer(
+                self.ctx.cfg.kafka_conf()
+                | {
+                    "client.id": f"{self.ctx.cfg.name}:{self.ctx.cfg.instance}",
+                    "enable.idempotence": True,
+                    "acks": "all",
+                    "compression.type": "zstd",
+                    "message.max.bytes": 2 * 1024 * 1024,
+                    "delivery.timeout.ms": 60_000,
+                }
+            )
+        headers = {
+            "group": self.group,
+            "topic": e.topic,
+            "partition": e.partition,
+            "offset": e.offset,
+            "event_id": e.event_id,
+            "kills": died.kills,
+            "version": self.ctx.cfg.version,
+            "reason": "killed the process",
+        }
+        errors: list = []
+        self._dlq.produce(
+            topic,
+            value=m.value(),
+            key=m.key(),
+            headers=[(k, str(v).encode()) for k, v in headers.items()],
+            on_delivery=lambda err, _msg: errors.append(err),
+        )
+        self._dlq.flush(PRODUCE_TIMEOUT)
+        if not errors or errors[0] is not None:
+            why = errors[0] if errors else "no delivery report"
+            raise ProduceError(f"{topic}: {why}")
+        DEAD_LETTERS.labels(e.topic).inc()
+        log.error(
+            "event moved to the dead-letter topic",
+            extra={"fields": headers | {"dead_letter_topic": topic}},
+        )
 
     def _read_batch(self):
         """(messages, events) of the next batch; None when a claim kept failing."""
@@ -337,14 +454,31 @@ class Processor:
             raise InvalidEvent(f"{where}: payload: {payloads.error_summary(err)}") from None
         return dataclasses.replace(e, payload=body)
 
-    def _handle(self, events: list[Event]) -> bool:
+    def _call(self, events: list[Event], ctx, isolated_kills: int | None) -> None:
+        def at(e) -> None:
+            self.journal.current(e)
+            self.slow.current(e)
+
+        self.journal.begin(events, isolated_kills)
+        self.slow.begin(events)
+        try:
+            if isolated_kills is not None:
+                at(events[0])
+                self.handler(list(events), ctx)
+            else:
+                self.handler(Watched(events, at), ctx)
+        finally:
+            self.slow.end()
+            self.journal.end()
+
+    def _handle(self, events: list[Event], isolated_kills: int | None = None) -> bool:
         delay = 1.0
         for attempt in range(1, self.max_attempts + 1):
             ctx = _BatchContext(self.ctx)
             t0 = time.monotonic()
             try:
                 with lh_log.scope(batch_size=len(events)):
-                    self.handler(events, ctx)
+                    self._call(events, ctx, isolated_kills)
                 for d in ctx.deliveries:
                     d.wait(PRODUCE_TIMEOUT)
                 BATCH_SECONDS.observe(time.monotonic() - t0)
@@ -442,7 +576,8 @@ def run_processor(
             batch_max_bytes=batch_max_bytes,
             models=models,
         ).run()
-    except ProduceError:
+    except ProduceError as e:
+        log.error("produce failed", extra={"fields": {"error": str(e)}})
         return 1
     finally:
         ctx.close()
