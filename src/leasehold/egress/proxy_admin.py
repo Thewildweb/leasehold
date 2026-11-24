@@ -67,7 +67,7 @@ def _require_limit(account: dict) -> None:
         return
     raise Conflict(
         f"proxy account {account['name']!r} has no limit: set cap_gb (an account without a "
-        "usage API, or before its first poll), or wait for the usage poll to report one"
+        "usage API), or run `leasehold proxy account poll` to read the vendor's plan size"
     )
 
 

@@ -324,6 +324,7 @@ def add_parser(sub) -> None:
         ("disable", "no routes; running leases end"),
         ("enable", "active and ok again (without a probe)"),
         ("probe", "learn the exits' addresses and probe the account now"),
+        ("poll", "read the vendor's usage and plan size now (also when disabled)"),
     ):
         x = accs.add_parser(action, help=help_)
         x.add_argument("name")

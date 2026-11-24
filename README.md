@@ -68,8 +68,9 @@ proxies only through its `egress:` block in `service.yml`: tiers in escalation o
 (`datacenter`, `isp`, `residential`, `mobile`), each proxy tier naming the accounts or
 pools it may use. A block moves a target to the next tier; a task type without
 `datacenter` never reaches a target from our own addresses. See `leasehold.egress.tiers`,
-`leasehold.egress.proxies` and `leasehold.runtime.proxy`. An account is enabled only with a
-limit (`--cap-gb`, or one its usage API reports). Account states, quota warnings and
+`leasehold.egress.proxies` and `leasehold.runtime.proxy`. An account is drained or enabled only
+with a limit (`--cap-gb`, or one its usage API reports); `leasehold proxy account poll`
+reads the usage API once while the account is still disabled. Account states, quota warnings and
 disabled exits alert through platform rules that `leasehold grafana apply` renders into
 the platform folder, one alert per account (`leasehold.grafana.alerts`).
 
