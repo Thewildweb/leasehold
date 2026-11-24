@@ -63,7 +63,12 @@ FILES = {
         """,
     "budgets.yml": """
         providers: { default: 30 }
-        targets: { interval: 10s, per_kind: { cdn: 15s } }
+        targets:
+          interval: 10s
+          per_kind: { cdn: 15s }
+          overrides:
+            api.fast.example: { interval: 3s }
+            "*.pair.example": { per_hour: 2 }
         pair: { per_hour: 4 }
         """,
 }
@@ -221,6 +226,29 @@ def test_pair_budget_moves_the_target_to_another_egress(setup):
     egress_sql(eg, "UPDATE {e}.target_leases SET expires_at = now() - interval '1 second'")
     assert lease(d, "192.0.2.1", "w1").tasks == []
     assert len(lease(d, "192.0.2.2", "w2").tasks) == 3
+
+
+def test_target_overrides(setup):
+    (env, _), eg = setup
+    d = dispatcher(env, eg)
+    # The interval, and the lease's cap with it (30 s lease); the pair budget stays 4.
+    # The override comes before the provider's kind (cdn: 15 s).
+    upsert(env, [UpsertItem(f"k{i}", group="api.fast.example", provider="example-cdn")
+                 for i in range(9)])  # fmt: skip
+    g = lease(d, "192.0.2.1", "w1")
+    assert (g.targets[0].interval_s, g.targets[0].cap, len(g.tasks)) == (3, 10, 4)
+    # Only the pair budget: the interval stays 10 s. Then another egress takes the target.
+    upsert(env, [UpsertItem(f"p{i}", group="a.pair.example") for i in range(9)])
+    g = lease(d, "192.0.2.1", "w1")
+    assert [(t.target, t.interval_s) for t in g.targets] == [("a.pair.example", 10)]
+    assert len(g.tasks) == 2
+    egress_sql(eg, "UPDATE {e}.target_leases SET expires_at = now() - interval '1 second' "
+                   "WHERE target = 'a.pair.example'")  # fmt: skip
+    assert lease(d, "192.0.2.1", "w1").tasks == []
+    assert len(lease(d, "192.0.2.2", "w2", limit=2).tasks) == 2
+    # Each target a pattern matches has its own limit.
+    upsert(env, [UpsertItem(f"q{i}", group="b.pair.example") for i in range(9)])
+    assert len(lease(d, "192.0.2.1", "w1").tasks) == 2
 
 
 def test_revoke_renew_and_release(setup):

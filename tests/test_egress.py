@@ -196,3 +196,61 @@ def test_range_with_host_bits_is_an_error(tmp_path):
     providers = PROVIDERS.replace("203.0.113.0/24", "203.0.113.5/24")
     with pytest.raises(ConfigError, match="host bits set"):
         config.load(write(tmp_path, providers=providers))
+
+
+TARGETS = (
+    BUDGETS
+    + """
+targets:
+  interval: 5s
+  per_kind: { cdn: 8s }
+  overrides:
+    api.example.com: { interval: 3s }
+    "*.example.com": { interval: 10s, per_hour: 100 }
+    "*.deep.example.com": { per_hour: 50 }
+    192.0.2.7: { interval: 2s }
+    "2001:db8::7": { interval: 4s }
+pair: { per_hour: 600 }
+"""
+)
+
+
+@pytest.mark.parametrize(
+    "target, kind, seconds, per_hour",
+    [
+        ("api.example.com", "cdn", 3, 600),  # exact, not merged with the pattern
+        ("www.example.com", "cdn", 10, 100),
+        ("a.b.example.com", "none", 10, 100),
+        ("x.deep.example.com", "cdn", 8, 50),  # the longest pattern only
+        ("example.com", "none", 5, 600),  # a pattern leaves out the host itself
+        ("notexample.com", "cdn", 8, 600),  # label boundaries
+        ("192.0.2.7", "none", 2, 600),
+        ("2001:db8::7", "none", 4, 600),
+        ("192.0.2.8", "none", 5, 600),
+        ("no-dots", "none", 5, 600),
+    ],
+)
+def test_target_overrides(tmp_path, target, kind, seconds, per_hour):
+    loaded = config.load(write(tmp_path, budgets=TARGETS)).budgets
+    # As stored in Postgres and read back by the dispatcher.
+    for b in (loaded, config.Budgets.model_validate(loaded.model_dump(mode="json"))):
+        assert b.targets.interval_for(kind, target).total_seconds() == seconds
+        assert b.pair_per_hour(target) == per_hour
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        '"api.*.com": { interval: 3s }',
+        '"*": { interval: 3s }',
+        "API.example.com: { interval: 3s }",
+        '"https://api.example.com": { interval: 3s }',
+        "api.example.com: {}",
+        "api.example.com: { interval: 0s }",
+        "api.example.com: { per_hour: 0 }",
+        "api.example.com: { intervall: 3s }",
+    ],
+)
+def test_bad_target_overrides(tmp_path, override):
+    with pytest.raises(ConfigError, match="overrides"):
+        config.load(write(tmp_path, budgets=f"targets:\n  overrides:\n    {override}\n"))
