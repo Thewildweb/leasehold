@@ -363,6 +363,38 @@ def test_planner_job_env():
     assert job.job["TaskGroups"][0]["Tasks"][0]["Templates"]
 
 
+def test_scheduled_job_with_only_clickhouse_reads_gets_its_variable():
+    # A scheduled job with `reads` and no planner uses no Kafka or storage, but its
+    # ClickHouse password is in its own variable: without the template it logs in
+    # without one.
+    import dataclasses
+
+    import yaml
+    from test_kafka_plan import FIXTURES
+
+    from leasehold.nomad import plan as nomad_plan
+    from leasehold.spec import ServiceSpec
+
+    data = yaml.safe_load((FIXTURES / "certwatch" / "service.yml").read_text())
+    data["components"]["report"] = {
+        "kind": "scheduled",
+        "schedule": "@hourly",
+        "node_class": "services",
+        "resources": {"cpu": 100, "memory": 64},
+        "reads": ["certwatch.domains"],
+    }
+    s = ServiceSpec.model_validate(data)
+    p = nomad_plan(
+        [s],
+        "dev",
+        SHA,
+        dataclasses.replace(PLATFORM, clickhouse_url="http://ch:8123", databases={"x": "y"}),
+    )
+    (job,) = [j for j in p.jobs if j.component == "report"]
+    (template,) = job.job["TaskGroups"][0]["Tasks"][0]["Templates"]
+    assert f"nomad/jobs/{job.job['ID']}" in template["EmbeddedTmpl"]
+
+
 def test_agent_socket_for_target_leasing_workers(spec):
     from dataclasses import replace
 
