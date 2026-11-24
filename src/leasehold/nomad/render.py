@@ -320,7 +320,14 @@ def _task(
     if not isinstance(c, Scheduled | SnapshotLoaderComponent):
         config["ports"] = [HTTP_PORT]
 
-    own = uses_kafka(c) or uses_storage(c) or isinstance(c, SnapshotLoaderComponent)
+    # The job's own variable holds its Kafka, storage and ClickHouse credentials: a
+    # scheduled component that only reads ClickHouse needs it too.
+    own = (
+        uses_kafka(c)
+        or uses_storage(c)
+        or isinstance(c, SnapshotLoaderComponent)
+        or (isinstance(c, Scheduled) and bool(c.reads_clickhouse))
+    )
     secret_paths = ([job_variable_path(job_id)] if own else []) + (
         [] if isinstance(c, ArchiveComponent | SnapshotLoaderComponent) else list(spec.secrets)
     )
