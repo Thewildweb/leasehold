@@ -72,6 +72,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from prometheus_client import Counter, Gauge, Histogram
 
 from leasehold.client import (
@@ -80,11 +81,15 @@ from leasehold.client import (
     FailItem,
     LeasedTask,
     LeaseRef,
+    ProxyError,
     ReleaseItem,
+    Route,
+    RouteRef,
     TargetLease,
     Unavailable,
 )
 from leasehold.runtime import log as lh_log
+from leasehold.runtime.bytecount import ByteCount
 from leasehold.runtime.config import ConfigError
 from leasehold.runtime.context import Context, build
 from leasehold.runtime.events import Delivery, ProduceError
@@ -109,16 +114,37 @@ PRODUCE_TIMEOUT = 120.0
 MAX_IDLE_DELAY = 10.0
 
 
+CAUSES = ("challenge", "block", "rate", "retry_after")
+
+
+def _cause(cause: str | None, cooldown: bool) -> str | None:
+    if cause is not None and cause not in CAUSES:
+        raise ValueError(f"cause: one of {', '.join(CAUSES)}")
+    if cause is not None and not cooldown:
+        raise ValueError("a cause is for pushback (cooldown=True)")
+    return cause
+
+
 class Retry(Exception):
-    """Fail this attempt; try again later (after ``after`` seconds, if given)."""
+    """Fail this attempt; try again later (after ``after`` seconds, if given).
+
+    ``cooldown=True``: the target pushed back; ``cause`` says how: ``challenge`` or
+    ``block`` cool the target on its egress tier and move it to the task type's next tier;
+    ``rate`` and ``retry_after`` (the site named its wait) cool it on every tier."""
 
     def __init__(
-        self, reason: str, after: float | timedelta | None = None, *, cooldown: bool = False
+        self,
+        reason: str,
+        after: float | timedelta | None = None,
+        *,
+        cooldown: bool = False,
+        cause: str | None = None,
     ):
         super().__init__(reason)
         self.reason = reason
         self.after = timedelta(seconds=after) if isinstance(after, int | float) else after
         self.cooldown = cooldown  # the target pushed back: cool it fleet-wide for ``after``
+        self.cause = _cause(cause, cooldown)
 
 
 class Defer(Exception):
@@ -126,11 +152,19 @@ class Defer(Exception):
     again after ``after``. For tasks the worker chose not to start, e.g. because
     their target is cooling down; emit no event for them."""
 
-    def __init__(self, reason: str, after: float | timedelta, *, cooldown: bool = False):
+    def __init__(
+        self,
+        reason: str,
+        after: float | timedelta,
+        *,
+        cooldown: bool = False,
+        cause: str | None = None,
+    ):
         super().__init__(reason)
         self.reason = reason
         self.after = timedelta(seconds=after) if isinstance(after, int | float) else after
         self.cooldown = cooldown  # the target pushed back: cool it fleet-wide for ``after``
+        self.cause = _cause(cause, cooldown)
 
 
 class TargetLost(Defer):
@@ -139,6 +173,28 @@ class TargetLost(Defer):
 
     def __init__(self, reason: str):
         super().__init__(f"target lost: {reason}", after=0)
+
+
+class ProxyFailure(Defer):
+    """The proxy failed before the target answered (``leasehold.runtime.proxy``).
+
+    A refusal or connect failure: the task goes back untried, and the control API counts
+    it against the route's exit, pool or account, not the target. A gateway answer
+    (502/503/504) may be a dead target as well as a bad exit: the attempt counts, with the
+    task type's backoff, and the API counts it against the exit only once several distinct
+    targets fail on it."""
+
+    def __init__(self, error: ProxyError):
+        super().__init__(f"proxy {error.kind}: {error.status or ''} {error.excerpt}".strip(), 0)
+        self.error = error
+
+
+class NoRoute(Defer):
+    """A task of a type that may only use proxies arrived without a route: a bug in the
+    lease, not a failure of the target. It goes back untried."""
+
+    def __init__(self, task_type: str):
+        super().__init__(f"{task_type} may only use proxies, and the task has no route", 60)
 
 
 class Permanent(Exception):
@@ -160,6 +216,9 @@ class Task:
     provider: str = ""
     target: str = ""  # with target leases: the target this task's requests go to
     lost: threading.Event = field(default_factory=threading.Event)
+    route: Route | None = field(default=None, repr=False)  # a proxy route, with credentials
+    tier: str = "datacenter"
+    target_lease_id: uuid.UUID | None = None
 
     @property
     def is_lost(self) -> bool:
@@ -175,6 +234,28 @@ class TaskContext:
         self.log = ctx.log
         self.deliveries: list[Delivery] = []
         self._token_fn = token_fn
+        self.bytes = ByteCount()
+
+    @property
+    def route(self) -> Route | None:
+        """The proxy route for this task's target, or None (our own address)."""
+        return self.task.route
+
+    def http(self, **kw) -> httpx.Client:
+        """A client for this task's requests through its route (see
+        ``leasehold.runtime.proxy.proxied_client``); bytes are counted for the account.
+        Raises ``ValueError`` without a route: direct fetches use the service's own
+        client, bound to the machine's egress."""
+        from leasehold.runtime.proxy import proxied_client
+
+        if self.task.route is None:
+            raise ValueError("this task has no proxy route")
+        return proxied_client(self.task.route, self.bytes, **kw)
+
+    def add_bytes(self, n: int) -> None:
+        """For a client of the service's own (e.g. a browser) that goes through the
+        route: bytes to count for the account."""
+        self.bytes.add(n)
 
     def token(self, cost: int = 1) -> None:
         """Wait for leave to send one more request to this task's target (after the first,
@@ -187,6 +268,8 @@ class TaskContext:
     def emit(self, topic: str, payload: Any, **kw) -> uuid.UUID:
         kw.setdefault("task_type", self.task.task_type)
         kw.setdefault("task_key", self.task.key)
+        if self.task.route is not None:
+            kw.setdefault("route", self.task.route)
         d = self._ctx.emit(topic, payload, **kw)
         self.deliveries.append(d)
         return d.event_id
@@ -223,6 +306,7 @@ class _Target:
     next_start: float = 0.0  # monotonic: the next task may start then
     busy: bool = False
     lost: str | None = None
+    route: Route | None = field(default=None, repr=False)
 
 
 def _stop_at(expires: datetime, now: datetime) -> float:
@@ -256,11 +340,19 @@ class Worker:
         self.task_types = sorted(comp.consumes_tasks)
         own = ctx.cfg.spec.frontier.task_types
         self.targeted = {t for t in self.task_types if t in own and own[t].target_leases}
+        # Task types whose tiers leave out datacenter: only through a proxy route, never
+        # from this machine's address.
+        self.proxy_only = {
+            t
+            for t in self.targeted
+            if own[t].egress is not None and "datacenter" not in own[t].egress.tiers
+        }
         self.egress = ctx.cfg.egress_ip
         self.via_agent = bool(getattr(self.client, "via_agent", False))
-        if self.targeted and not self.egress and not self.via_agent:
+        direct = self.targeted - self.proxy_only
+        if direct and not self.egress and not self.via_agent:
             raise ConfigError(
-                f"{', '.join(sorted(self.targeted))} use target leases: set LEASEHOLD_EGRESS_IP "
+                f"{', '.join(sorted(direct))} use target leases: set LEASEHOLD_EGRESS_IP "
                 "(the node's meta.egress_ip)"
             )
         self.targets: dict[uuid.UUID, _Target] = {}
@@ -403,10 +495,13 @@ class Worker:
                     expires=tl.expires_at,
                     duration=max(tl.expires_at - now, timedelta(seconds=10)),
                     stop_at=_stop_at(tl.expires_at, now),
+                    route=tl.route,
                 )
             elif not have.lost:
                 have.expires = max(have.expires, tl.expires_at)
                 have.stop_at = _stop_at(have.expires, now)
+                if tl.route is not None:
+                    have.route = tl.route
         for t in leased:
             self.queued.append(
                 _Held(
@@ -459,13 +554,33 @@ class Worker:
                 self.defers.append(ReleaseItem(held.leased.ref))
                 TASKS.labels(held.task.task_type, "target_lost").inc()
                 continue
+            if held.task.task_type in self.proxy_only and t.route is None:
+                # Never from our own address: a lease bug, not the target's failure.
+                log.error(
+                    "task of a proxy-only type without a route; given back",
+                    extra={"fields": {"task_type": held.task.task_type}},
+                )
+                e = NoRoute(held.task.task_type)
+                self.defers.append(ReleaseItem(held.leased.ref, e.after, reason=e.reason))
+                TASKS.labels(held.task.task_type, "no_route").inc()
+                continue
+            held.task.route = t.route
+            held.task.tier = t.lease.tier
+            held.task.target_lease_id = tid
             if len(self.running) >= self.concurrency or t.busy or now < t.next_start:
                 kept.append(held)
                 continue
             if self.via_agent:
                 # The agent paces the target for every worker on the machine.
                 try:
-                    r = self.client.agent_token(tid, held.task.task_type, first=True)
+                    r = self.client.agent_token(
+                        tid,
+                        held.task.task_type,
+                        first=True,
+                        credentials_fp=t.route.credentials_fp if t.route else None,
+                    )
+                    if r.get("route"):
+                        t.route = held.task.route = Route.parse(r["route"])
                 except (Unavailable, ClientError) as e:
                     self._api_error("agent_token", e)
                     kept.append(held)
@@ -542,32 +657,68 @@ class Worker:
     def _attempt(
         self, task: Task, tctx: TaskContext
     ) -> tuple[AckItem | FailItem | ReleaseItem, str]:
+        b = (lambda: tctx.bytes.total) if task.route is not None else (lambda: None)
+        rr = RouteRef.of(task.target_lease_id, task.route)
         try:
             self.handler(task, tctx)
             for d in tctx.deliveries:
                 d.wait(PRODUCE_TIMEOUT)
             event_id = tctx.first_event_id or uuid.uuid4()
-            return AckItem(task.ref, event_id), "acked"
+            return AckItem(task.ref, event_id, bytes=b(), route=rr), "acked"
+        except ProxyFailure as e:
+            self._confirm_quietly(tctx)
+            if e.error.kind == "gateway":
+                # Maybe the target: an attempt, with the task type's backoff, so a dead
+                # site doesn't cycle through the exits.
+                return FailItem(
+                    task.ref,
+                    e.reason[:1000],
+                    tctx.first_event_id,
+                    bytes=b(),
+                    proxy_error=e.error,
+                    route=rr,
+                ), "proxy_error"
+            # The proxy, not the target: no attempt, no cooldown, and never retried
+            # without the proxy.
+            return ReleaseItem(
+                task.ref, None, reason=e.reason[:500], bytes=b(), proxy_error=e.error, route=rr
+            ), "proxy_error"
         except Defer as e:
             self._confirm_quietly(tctx)
-            return ReleaseItem(task.ref, e.after, e.cooldown, e.reason), "deferred"
+            return ReleaseItem(
+                task.ref, e.after, e.cooldown, e.reason, cause=e.cause, bytes=b(), route=rr
+            ), "deferred"
         except Retry as e:
             self._confirm_quietly(tctx)
             return FailItem(
-                task.ref, e.reason, tctx.first_event_id, e.after, cooldown=e.cooldown
+                task.ref,
+                e.reason,
+                tctx.first_event_id,
+                e.after,
+                cooldown=e.cooldown,
+                cause=e.cause,
+                bytes=b(),
+                route=rr,
             ), "retry"
         except Permanent as e:
             self._confirm_quietly(tctx)
             return FailItem(
-                task.ref, str(e) or "permanent", tctx.first_event_id, permanent=True
+                task.ref,
+                str(e) or "permanent",
+                tctx.first_event_id,
+                permanent=True,
+                bytes=b(),
+                route=rr,
             ), "permanent"
         except ProduceError as e:
             log.error("event not delivered", extra={"fields": {"error": str(e)}})
-            return FailItem(task.ref, f"produce failed: {e}"), "produce_failed"
+            return FailItem(task.ref, f"produce failed: {e}", bytes=b(), route=rr), "produce_failed"
         except Exception as e:  # noqa: BLE001 - a handler bug fails the attempt, not the worker
             log.exception("handler failed")
             self._confirm_quietly(tctx)
-            return FailItem(task.ref, f"{type(e).__name__}: {e}", tctx.first_event_id), "error"
+            return FailItem(
+                task.ref, f"{type(e).__name__}: {e}", tctx.first_event_id, bytes=b()
+            ), "error"
 
     @staticmethod
     def _confirm_quietly(tctx: TaskContext) -> None:
@@ -592,6 +743,13 @@ class Worker:
                 if getattr(outcome, "cooldown", False) and not t.lost:
                     # Stop here at once; the API cools the target for every egress.
                     self._target_lost(tid, "pushback")
+                elif (
+                    getattr(outcome, "proxy_error", None) is not None
+                    and outcome.proxy_error.kind != "gateway"
+                    and not t.lost
+                ):
+                    # The API releases the target lease; another route comes with a new one.
+                    self._target_lost(tid, "proxy error")
             if isinstance(outcome, AckItem):
                 self.acks.append(outcome)
             elif isinstance(outcome, ReleaseItem):
@@ -647,7 +805,7 @@ class Worker:
         return {"egress": self.egress} if self.targeted else {}
 
     def _renew_targets(self) -> None:
-        if not self.targets or self.egress is None or self.via_agent:
+        if not self.targets or self.via_agent:
             return  # with an agent, the agent renews and gives back target leases
         now = _now()
         active = {
@@ -657,9 +815,10 @@ class Worker:
         if not due and not self.release_targets:
             return
         release = sorted(self.release_targets)
+        routes: dict[uuid.UUID, Route] = {}
         try:
             renewed, lost = self.client.renew_targets(
-                self.egress, sorted(active), release, worker_id=self.worker_id
+                self.egress, sorted(active), release, worker_id=self.worker_id, routes=routes
             )
         except (Unavailable, ClientError) as e:
             self._api_error("renew_targets", e)
@@ -679,6 +838,10 @@ class Worker:
                 t.stop_at = _stop_at(expires, now)
         for i, why in lost.items():
             self._target_lost(i, why)
+        for i, route in routes.items():
+            t = self.targets.get(i)
+            if t is not None and not t.lost:
+                t.route = route  # new credentials: tasks started from now use them
 
     def _target_lost(self, lease_id: uuid.UUID, why: str) -> None:
         t = self.targets.get(lease_id)

@@ -15,11 +15,17 @@ Endpoints (all under ``/v1`` need a bearer token):
                                    ``cooldown`` cools the task's target fleet-wide)
     POST /v1/targets/renew         extend target leases, give some back; lists lost ones
     POST /v1/targets/{target}/revoke   stop a target lease (admin)
+    POST /v1/targets/{target}/clear    lift a target's cooldown (targets:clear scope)
+    POST /v1/targets/{target}/escalate move a target to its next egress tier
+                                       (targets:escalate scope)
     POST /v1/targets/spend         tokens for requests beyond a task's first (agents)
     GET  /v1/task-types            settings and counts per task type
     POST /v1/task-types/{name}/pause   stop leasing; release current leases (admin)
     POST /v1/task-types/{name}/resume  (admin)
     GET  /v1/egress/providers      provider rules and the shared-IP setting, for tagging
+    GET  /v1/egress/accounts       proxy accounts: state, remaining quota (no credentials)
+    /v1/admin/proxies/...          proxy accounts, pools and exits (admin; the schema
+                                   owner's API only): see ``leasehold.api.proxy_routes``
     GET  /v1/whoami                the caller, as the API sees it
     POST /v1/alerts                Grafana webhook: store alert notifications (alerts token)
     GET  /v1/alerts                alert incidents with their latest state (admin)
@@ -59,10 +65,21 @@ from leasehold.api.auth import (
     Registry,
     load_tokens,
 )
+from leasehold.api.proxy_routes import redact_text, register_proxy_routes
 from leasehold.api.settings import Settings
-from leasehold.egress.dispatch import Cooling, Dispatcher, EgressRefused
+from leasehold.egress import tiers
+from leasehold.egress.dispatch import ClearRefused, Cooling, Dispatcher, EgressRefused
 from leasehold.egress.planner import Planner, effective_class, publish_demand
+from leasehold.egress.probe import Prober
+from leasehold.egress.proxies import STATES as PROXY_STATES
+from leasehold.egress.proxies import load_accounts, proxy_tables_exist
+from leasehold.egress.proxy_admin import ProxyAdmin, UsageRow, account_view
+from leasehold.egress.quota import QuotaKeeper
+from leasehold.egress.schema import LATEST as EGRESS_LATEST
+from leasehold.egress.secrets import Keyring
 from leasehold.egress.store import EgressNotReady, provider_rules
+from leasehold.egress.store import _version as egress_version
+from leasehold.egress.usage import load_adapters
 from leasehold.frontier import schema
 from leasehold.frontier.store import (
     AckItem,
@@ -173,6 +190,15 @@ class TargetLeaseOut(_Model):
     provider: str
     cap: int
     granted: int
+    tier: str = "datacenter"
+    route: dict | None = Field(
+        default=None,
+        description="For a target on a proxy tier: the proxy to reach it through, with "
+        "credentials (leasehold.egress.proxies.render_route)",
+    )
+
+    def __repr__(self) -> str:
+        return f"TargetLeaseOut(target={self.target!r}, lease_id={self.lease_id}, tier={self.tier})"
 
 
 class LeaseResponse(_Model):
@@ -181,7 +207,11 @@ class LeaseResponse(_Model):
 
 
 class TargetRenewRequest(_Model):
-    egress: str = Field(max_length=64)
+    egress: str | None = Field(
+        default=None,
+        max_length=64,
+        description="The holder's own egress; none for a holder with routed leases only",
+    )
     worker_id: str | None = Field(default=None, max_length=200)
     leases: list[UUID] = Field(default_factory=list, max_length=MAX_REFS)
     release: list[UUID] = Field(
@@ -199,9 +229,18 @@ class LostTarget(_Model):
     reason: str
 
 
+class RouteUpdate(_Model):
+    lease_id: UUID
+    route: dict
+
+
 class TargetRenewResponse(_Model):
     renewed: list[RenewedTarget]
     lost: list[LostTarget] = Field(description="Stop sending to these targets now")
+    routes: list[RouteUpdate] = Field(
+        default_factory=list,
+        description="New routes for renewed leases whose proxy credentials changed",
+    )
 
 
 class SpendRequest(_Model):
@@ -232,8 +271,35 @@ class RenewResponse(_Model):
     lost: list[Ref] = Field(description="Stop working on these")
 
 
+Cause = Literal["challenge", "block", "rate", "retry_after"]
+
+
+class ProxyErrorIn(_Model):
+    kind: Literal["refused", "gateway", "connect"] = Field(
+        description="refused: the proxy answered the CONNECT with a 4xx; gateway: with "
+        "502/503/504 (it couldn't reach the target; sent with a fail, the attempt counts); "
+        "connect: the proxy couldn't be reached, or the tunnel failed before the target "
+        "answered"
+    )
+    status: int | None = Field(default=None, ge=100, le=599)
+    excerpt: str = Field(default="", max_length=200, description="Redacted; no credentials")
+
+
+class RouteRefIn(_Model):
+    """The route a task ran on: bytes and proxy errors are charged to it."""
+
+    lease_id: UUID = Field(description="The target lease")
+    account: str = Field(max_length=100)
+    egress: str = Field(max_length=100, description="The exit address or pool:<name>")
+    credentials_fp: str | None = Field(default=None, max_length=64)
+
+
 class AckTask(Ref):
     event_id: UUID
+    bytes: int | None = Field(
+        default=None, ge=0, description="Bytes through the proxy (routed tasks)"
+    )
+    route: RouteRefIn | None = None
 
 
 class AckRequest(_Model):
@@ -252,6 +318,16 @@ class ReleaseRef(Ref):
         description="The target pushed back: no egress gets it for after_s (target leases)",
     )
     reason: str | None = Field(default=None, max_length=500)
+    cause: Cause | None = Field(
+        default=None,
+        description="What the pushback was: challenge and block cool the target's tier and "
+        "move it to the next; rate and retry_after cool every tier",
+    )
+    bytes: int | None = Field(default=None, ge=0)
+    proxy_error: ProxyErrorIn | None = Field(
+        default=None, description="The proxy failed, not the target: no cooldown, no attempt"
+    )
+    route: RouteRefIn | None = None
 
 
 class ReleaseRequest(_Model):
@@ -270,6 +346,12 @@ class FailTask(Ref):
         default=False,
         description="The target pushed back: no egress gets it for retry_after_s (target leases)",
     )
+    cause: Cause | None = None
+    bytes: int | None = Field(default=None, ge=0)
+    proxy_error: ProxyErrorIn | None = Field(
+        default=None, description="A gateway answer (502/503/504) on the route"
+    )
+    route: RouteRefIn | None = None
 
 
 class FailRequest(_Model):
@@ -284,6 +366,18 @@ class AppliedResponse(_Model):
 
 class PauseRequest(_Model):
     reason: str = Field(min_length=1, max_length=500)
+
+
+class ClearRequest(_Model):
+    source: Literal["health", "classifier", "admin"]
+    reason: str = Field(min_length=1, max_length=500)
+    evidence: Any = None
+
+
+class EscalateRequest(_Model):
+    task_type: str
+    reason: str = Field(min_length=1, max_length=500)
+    evidence: Any = None
 
 
 def _refs(refs: list[LeaseRef]) -> list[Ref]:
@@ -333,6 +427,91 @@ class Metrics:
             ["env"],
             registry=self.registry,
         )
+        c = lambda name, doc, labels: Counter(name, doc, ["env", *labels], registry=self.registry)  # noqa: E731
+        p = lambda name, doc, labels: Gauge(name, doc, ["env", *labels], registry=self.registry)  # noqa: E731
+        self.clears = c("leasehold_target_clears", "Cooldowns lifted", ["source", "cause"])
+        self.clears_refused = c(
+            "leasehold_target_clears_refused", "Clears refused by cause", ["source", "cause"]
+        )
+        self.recooled = c(
+            "leasehold_target_recooled_after_clear",
+            "Targets cooled again within an hour of a clear (clears that were wrong)",
+            ["source", "cause"],
+        )
+        self.escalations = c(
+            "leasehold_target_escalations", "Targets moved to a higher tier", ["task_type", "tier"]
+        )
+        self.waiting = c(
+            "leasehold_dispatch_waiting",
+            "Targets the dispatcher couldn't grant, by why (no egress on the tier, cooling, ...)",
+            ["reason"],
+        )
+        self.proxy_bytes = c(
+            "leasehold_proxy_bytes", "Bytes through proxy accounts", ["account", "task_type"]
+        )
+        self.proxy_errors = c(
+            "leasehold_proxy_errors", "Proxy errors reported by workers", ["account", "kind"]
+        )
+        self.proxy_disabled = c(
+            "leasehold_proxy_auto_disabled",
+            "Exits and pools disabled by connect failures",
+            ["account"],
+        )
+        self.proxy_moves = c(
+            "leasehold_proxy_exit_moves", "Fixed exits seen at a new address by the probe", []
+        )
+        self.proxy_state = p(
+            "leasehold_proxy_account_state",
+            "1 for the account's current state",
+            ["account", "vendor", "state"],
+        )
+        self.proxy_status = p(
+            "leasehold_proxy_account_status", "1 for the account's status", ["account", "status"]
+        )
+        self.proxy_remaining = p(
+            "leasehold_proxy_remaining_ratio", "Share of the binding quota left", ["account"]
+        )
+        self.proxy_remaining_bytes = p(
+            "leasehold_proxy_remaining_bytes", "Bytes of the binding quota left", ["account"]
+        )
+        self.proxy_warn = p(
+            "leasehold_proxy_quota_warning",
+            "1 when an account is at the warning share used or below warn_remaining_gb",
+            ["account", "vendor"],
+        )
+        self.proxy_paid_days = p(
+            "leasehold_proxy_paid_until_days", "Days until paid_until", ["account"]
+        )
+        self.proxy_paid_warn = p(
+            "leasehold_proxy_paid_until_warning",
+            "1 when paid_until is within proxies.paid_until_warn",
+            ["account", "vendor"],
+        )
+        self.proxy_drift_warn = p(
+            "leasehold_proxy_usage_drift_warning",
+            "1 when our byte count and the vendor's differ by more than proxies.drift_warn",
+            ["account", "vendor"],
+        )
+        self.proxy_poll_failing = p(
+            "leasehold_proxy_usage_poll_failing",
+            "1 when the vendor's usage API has failed for longer than the warning time",
+            ["account"],
+        )
+        self.proxy_drift = p(
+            "leasehold_proxy_usage_drift_ratio",
+            "(our byte count - the vendor's) / the vendor's limit",
+            ["account"],
+        )
+        self.proxy_stopped = p(
+            "leasehold_proxy_stopped",
+            "1 while a task type's stop_at_used keeps it off an account",
+            ["task_type", "account"],
+        )
+        self.proxy_egresses = p(
+            "leasehold_proxy_egresses",
+            "Exits and pools per account and state",
+            ["account", "kind", "state"],
+        )
 
 
 # --- app --------------------------------------------------------------------------------------
@@ -344,7 +523,12 @@ def load_registry(settings: Settings) -> Registry:
 
 
 def create_app(
-    settings: Settings, registry: Registry | None = None, authenticator: Authenticator | None = None
+    settings: Settings,
+    registry: Registry | None = None,
+    authenticator: Authenticator | None = None,
+    keyring: Keyring | None = None,
+    adapters: dict | None = None,
+    probe_transport=None,
 ) -> FastAPI:
     registry = registry or load_registry(settings)
     auth = authenticator or Authenticator(
@@ -356,8 +540,11 @@ def create_app(
         issuer=settings.jwt_issuer,
     )
     frontier = Frontier(settings.env)
-    dispatcher = Dispatcher(settings.env, frontier.schema, settings.egress_schema)
+    keyring = keyring if keyring is not None else Keyring.from_env()
+    dispatcher = Dispatcher(settings.env, frontier.schema, settings.egress_schema, keyring)
     planner = Planner(settings.egress_schema)
+    admin = ProxyAdmin(settings.egress_schema, settings.env, keyring)
+    adapters = adapters if adapters is not None else load_adapters()
     metrics = Metrics(settings.env)
     # jit off: the lease query runs as a prepared statement, and its generic plan's
     # cost crosses jit_above_cost, so Postgres would JIT-compile it on every call
@@ -497,6 +684,119 @@ def create_app(
                 metrics.dead.labels(settings.env, s.task_type).set(s.dead)
                 metrics.paused.labels(settings.env, s.task_type).set(1 if s.paused else 0)
                 metrics.rows.labels(settings.env, s.task_type).set(s.rows_estimate)
+            await proxy_stats(conn)
+
+    async def proxy_stats(conn) -> None:
+        if not await proxy_tables_exist(conn, settings.egress_schema):
+            return
+        env = settings.env
+        accounts = await load_accounts(conn, settings.egress_schema)
+        for name, a in accounts.items():
+            for st in PROXY_STATES:
+                metrics.proxy_state.labels(env, name, a.vendor, st).set(1 if a.state == st else 0)
+            for st in ("active", "drain", "disabled"):
+                metrics.proxy_status.labels(env, name, st).set(1 if a.status == st else 0)
+            if a.remaining.ratio is not None:
+                metrics.proxy_remaining.labels(env, name).set(a.remaining.ratio)
+            if a.remaining.bytes is not None:
+                metrics.proxy_remaining_bytes.labels(env, name).set(a.remaining.bytes)
+            h = quota_health.get(name)
+            if h is not None:
+                metrics.proxy_warn.labels(env, name, a.vendor).set(1 if h.warn else 0)
+                metrics.proxy_poll_failing.labels(env, name).set(1 if h.poll_failing else 0)
+                metrics.proxy_paid_warn.labels(env, name, a.vendor).set(
+                    1 if h.paid_until_warn else 0
+                )
+                metrics.proxy_drift_warn.labels(env, name, a.vendor).set(1 if h.drift_warn else 0)
+                if h.paid_until_days is not None:
+                    metrics.proxy_paid_days.labels(env, name).set(h.paid_until_days)
+                if h.drift_ratio is not None:
+                    metrics.proxy_drift.labels(env, name).set(h.drift_ratio)
+        for tt, spec in registry.egress_specs.items():
+            if spec is None:
+                continue
+            resolved = spec.resolve(env)
+            for tier, stop in resolved["stop_at_used"].items():
+                for n in tiers.names_for(resolved, tier):
+                    a = accounts.get(n)
+                    if a is None or a.remaining.used_ratio is None:
+                        continue
+                    stopped = a.remaining.used_ratio >= stop
+                    g = metrics.proxy_stopped.labels(env, tt, n)
+                    was = g._value.get()  # noqa: SLF001
+                    g.set(1 if stopped else 0)
+                    if stopped != bool(was):
+                        log.info(
+                            "task type %s %s account %s (stop at %.0f%% used, %.0f%% used)",
+                            tt,
+                            "stopped on" if stopped else "resumed on",
+                            n,
+                            stop * 100,
+                            a.remaining.used_ratio * 100,
+                        )
+        for r in await admin._rows(
+            conn,
+            "SELECT account, 'exit' AS kind, coalesce(override_status, status) AS state, "
+            "count(*) AS n FROM {e}.egresses WHERE account IS NOT NULL AND removed_at IS NULL "
+            "GROUP BY 1, 2, 3 UNION ALL SELECT account, 'pool', "
+            "coalesce(override_status, status), count(*) FROM {e}.proxy_pools "
+            "WHERE removed_at IS NULL GROUP BY 1, 2, 3",
+        ):
+            metrics.proxy_egresses.labels(env, r["account"], r["kind"], r["state"]).set(r["n"])
+
+    quota_health: dict = {}
+    proxy_due: dict[str, float] = {}
+
+    async def proxies_once() -> None:
+        # Usage polls, exit address checks and probes: the schema owner only, one API
+        # instance at a time.
+        if not settings.egress_owner or not keyring.configured:
+            return
+        key = f"leasehold-proxies:{settings.egress_schema}"
+        async with pool.connection() as conn:
+            if not await proxy_tables_exist(conn, settings.egress_schema):
+                return
+            got = (
+                await (
+                    await conn.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (key,))
+                ).fetchone()
+            )[0]
+            if not got:
+                return
+            try:
+                cfg = (await dispatcher.budgets(conn)).proxies
+                keeper = QuotaKeeper(
+                    admin,
+                    adapters,
+                    cfg.warn_used,
+                    cfg.usage_poll_warn_after,
+                    cfg.paid_until_warn,
+                    cfg.drift_warn,
+                )
+                prober = Prober(admin, cfg.echo_url, transport=probe_transport)
+                now = asyncio.get_running_loop().time()
+
+                def due(job: str, every: timedelta) -> bool:
+                    if now < proxy_due.get(job, 0):
+                        return False
+                    proxy_due[job] = now + every.total_seconds()
+                    return True
+
+                if due("usage", cfg.usage_poll):
+                    await keeper.poll(conn)
+                ev = await keeper.evaluate(conn)
+                quota_health.clear()
+                quota_health.update(ev.health)
+                if due("exits", min(cfg.exit_recheck, timedelta(minutes=5))):
+                    counts = await prober.recheck_exits(
+                        conn, due_after_s=cfg.exit_recheck.total_seconds()
+                    )
+                    if counts.get("moved"):
+                        metrics.proxy_moves.labels(settings.env).inc(counts["moved"])
+                if due("probe", cfg.probe_interval):
+                    await prober.probe_unhealthy(conn)
+            finally:
+                await conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (key,))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -520,6 +820,7 @@ def create_app(
             asyncio.create_task(
                 background("egress planner", settings.plan_interval, plan_once, wait_first=True)
             ),
+            asyncio.create_task(background("proxies", settings.proxy_interval, proxies_once)),
             asyncio.create_task(inbox_table()),
         ]
         try:
@@ -543,6 +844,9 @@ def create_app(
     app.state.purge_once = purge_once
     app.state.egress_sweep_once = egress_sweep_once
     app.state.plan_once = plan_once
+    app.state.proxies_once = proxies_once
+    app.state.dispatcher = dispatcher
+    app.state.proxy_admin = admin
     app.state.inbox = inbox
 
     @app.exception_handler(AuthError)
@@ -558,6 +862,14 @@ def create_app(
     @app.exception_handler(EgressRefused)
     async def _egress_refused(request: Request, exc: EgressRefused):
         return JSONResponse({"detail": str(exc)}, status_code=403)
+
+    @app.exception_handler(EgressNotReady)
+    async def _not_ready(request: Request, exc: EgressNotReady):
+        return JSONResponse({"detail": str(exc)}, status_code=503)
+
+    @app.exception_handler(ClearRefused)
+    async def _clear_refused(request: Request, exc: ClearRefused):
+        return JSONResponse({"detail": str(exc), "causes": exc.causes}, status_code=409)
 
     @app.exception_handler(UnknownTaskType)
     async def _unknown(request: Request, exc: UnknownTaskType):
@@ -630,16 +942,18 @@ def create_app(
         holder = leased_by = f"{c.name}:{instance}"
         if c.via:
             # The machine's agent holds the target leases for all its workers.
-            holder = f"{c.via}@{req.egress}"
+            holder = f"{c.via}@{req.egress or 'routed'}"
         targeted = types & registry.target_leased
         plain = types - targeted
-        if targeted and not req.egress:
-            # Fail closed: without its egress, a worker can't be given targets.
-            raise HTTPException(400, f"{', '.join(sorted(targeted))} need the worker's egress")
+        direct = targeted & registry.needs_egress
+        if direct and not req.egress:
+            # Fail closed: without its egress, a worker can't be given datacenter targets.
+            raise HTTPException(400, f"{', '.join(sorted(direct))} need the worker's egress")
         rows: list[dict] = []
         targets = []
         async with pool.connection() as conn:
             if targeted:
+                await egress_ready(conn)
                 grant = await dispatcher.lease(
                     conn,
                     sorted(targeted),
@@ -651,6 +965,8 @@ def create_app(
                 )
                 rows += grant.tasks
                 targets = grant.targets
+                for why, n in grant.waiting.items():
+                    metrics.waiting.labels(settings.env, why).inc(n)
             if plain and len(rows) < req.max:
                 rows += await frontier.lease(
                     conn, sorted(plain), req.max - len(rows), leased_by, req.per_group, req.held
@@ -662,19 +978,37 @@ def create_app(
             targets=[TargetLeaseOut(**t.__dict__) for t in targets],
         )
 
+    egress_checked: list[float] = [0.0]
+
+    async def egress_ready(conn) -> None:
+        """The egress schema is migrated (checked once a minute): the dispatcher's queries
+        need the latest version."""
+        now = asyncio.get_running_loop().time()
+        if now - egress_checked[0] < 60:
+            return
+        if await egress_version(conn, settings.egress_schema) < EGRESS_LATEST:
+            raise EgressNotReady(
+                f"schema {settings.egress_schema} is not migrated; run `leasehold egress migrate`"
+            )
+        egress_checked[0] = now
+
     @app.post("/v1/targets/renew", response_model=TargetRenewResponse)
     async def renew_targets(req: TargetRenewRequest, c: CallerDep):
         if c.agent:
-            holder = f"{c.name}@{req.egress}"
+            holder = f"{c.name}@{req.egress or 'routed'}"
         elif registry.leasable(c) & registry.target_leased:
             holder = f"{c.name}:{c.instance or req.worker_id or 'unknown'}"
         else:
             raise Forbidden(f"{c.name} consumes no task types with target leases")
+        routes: dict = {}
         async with pool.connection() as conn:
-            ok, lost = await dispatcher.renew(conn, req.egress, holder, req.leases, req.release)
+            ok, lost = await dispatcher.renew(
+                conn, req.egress, holder, req.leases, req.release, routes=routes
+            )
         return TargetRenewResponse(
             renewed=[RenewedTarget(lease_id=i, expires_at=e) for i, e in ok.items()],
             lost=[LostTarget(lease_id=i, reason=r) for i, r in lost.items()],
+            routes=[RouteUpdate(lease_id=i, route=r) for i, r in routes.items()],
         )
 
     @app.post("/v1/targets/spend", response_model=SpendResponse)
@@ -696,19 +1030,174 @@ def create_app(
             revoked = await dispatcher.revoke(conn, target, req.reason)
         return {"revoked": revoked}
 
-    async def _cool(conn, items: list[tuple[str, str, float, str]], egress: str | None) -> None:
-        """items: (task_type, key, seconds, reason) of tasks whose target pushed back."""
+    @app.post("/v1/targets/{target}/clear")
+    async def clear_target(target: str, req: ClearRequest, c: CallerDep):
+        if not c.may("targets:clear"):
+            raise Forbidden(f"{c.name} may not clear cooldowns (scope targets:clear)")
+        if (req.source == "admin") != c.admin:
+            raise Forbidden("source admin is for admin tokens, and admins clear as admin")
+        async with pool.connection() as conn:
+            await egress_ready(conn)
+            try:
+                cleared = await dispatcher.clear(
+                    conn, target, req.source, req.reason, req.evidence, c.name
+                )
+            except ClearRefused as e:
+                for cause in e.causes:
+                    metrics.clears_refused.labels(settings.env, req.source, str(cause)).inc()
+                raise
+        for r in cleared:
+            metrics.clears.labels(settings.env, req.source, str(r["cause"])).inc()
+        log.info(
+            "cooldown cleared",
+            extra={
+                "fields": {
+                    "target": target,
+                    "source": req.source,
+                    "by": c.name,
+                    "cleared": len(cleared),
+                }
+            },
+        )
+        if not cleared:
+            return {"cleared": 0, "detail": "the target is not cooling down"}
+        return {
+            "cleared": len(cleared),
+            "cooldowns": [
+                {"tier": r["tier"], "cause": r["cause"], "until": r["until"], "reason": r["reason"]}
+                for r in cleared
+            ],
+        }
+
+    @app.post("/v1/targets/{target}/escalate")
+    async def escalate_target(target: str, req: EscalateRequest, c: CallerDep):
+        if not c.may("targets:escalate"):
+            raise Forbidden(f"{c.name} may not escalate targets (scope targets:escalate)")
+        if req.task_type not in registry.target_leased:
+            raise UnknownTaskType(req.task_type)
+        async with pool.connection() as conn:
+            await egress_ready(conn)
+            was, now = await dispatcher.escalate(
+                conn, target, req.task_type, f"{c.name}: {req.reason}", req.evidence
+            )
+        if now is not None:
+            metrics.escalations.labels(settings.env, req.task_type, now).inc()
+        return {"target": target, "from": was, "to": now}
+
+    async def _cool(conn, items: list[tuple], egress: str | None) -> None:
+        """items: (task_type, key, seconds, reason, cause) of tasks whose target pushed back."""
         items = [i for i in items if i[0] in registry.target_leased and i[2] > 0]
         if not items:
             return
-        targets = await dispatcher.targets_of(conn, [(a, b) for a, b, _, _ in items])
+        targets = await dispatcher.targets_of(conn, [(i[0], i[1]) for i in items])
         budgets = await dispatcher.budgets(conn)
         cooling = [
-            Cooling(targets[(tt, key)], timedelta(seconds=s), reason)
-            for tt, key, s, reason in items
+            Cooling(targets[(tt, key)], timedelta(seconds=s), reason, cause, tt)
+            for tt, key, s, reason, cause in items
             if (tt, key) in targets
         ]
-        await dispatcher.cool(conn, cooling, egress, budgets.cooldown.max)
+        escalated: list = []
+        await dispatcher.cool(conn, cooling, egress, budgets.cooldown.max, escalated=escalated)
+        for r in await dispatcher.recent_clears(conn, [x.target for x in cooling]):
+            metrics.recooled.labels(settings.env, r["source"], str(r["cooldown_cause"])).inc()
+        for _target, tier, task_type in escalated:
+            metrics.escalations.labels(settings.env, task_type, tier).inc()
+
+    async def _outcomes(conn, c: Caller, items: list) -> None:
+        """Bytes and proxy errors that came with acks, fails and releases of routed
+        tasks: usage per account, connect failures, account states.
+
+        Each is charged to the route the task ran on, as the worker reports it (target
+        lease, account, egress), not to what the target holds by now. An error from a route
+        that is no longer current (the exit or pool removed, or the account's credentials
+        rotated since the route was rendered) says nothing about the exit or account: it
+        isn't counted, and the task goes back for a fresh route."""
+        routed = [
+            i
+            for i in items
+            if i.bytes is not None
+            or getattr(i, "proxy_error", None)
+            or getattr(i, "route", None) is not None
+        ]
+        routed = [i for i in routed if i.task_type in registry.target_leased]
+        if not routed or not await proxy_tables_exist(conn, settings.egress_schema):
+            return
+        targets = await dispatcher.targets_of(conn, [(i.task_type, i.key) for i in routed])
+        legacy = [i for i in routed if getattr(i, "route", None) is None]
+        leases = await dispatcher.leases_of(
+            conn,
+            sorted(
+                {targets[(i.task_type, i.key)] for i in legacy if (i.task_type, i.key) in targets}
+            ),
+        )
+        states = await admin.route_states(
+            conn,
+            {(i.route.account, i.route.egress) for i in routed if getattr(i, "route", None)},
+        )
+        usage = []
+        ok_accounts: set[str] = set()
+        release: list[tuple[str, UUID]] = []
+        cfg = None
+        for i in routed:
+            t = targets.get((i.task_type, i.key))
+            r = getattr(i, "route", None)
+            stale = False
+            if r is not None:
+                st = states.get((r.account, r.egress))
+                if st is None:
+                    log.warning(
+                        "outcome for an unknown route",
+                        extra={"fields": {"account": r.account, "egress": r.egress}},
+                    )
+                    continue
+                account, key, lease_id = r.account, r.egress, r.lease_id
+                stale = not st["current"] or (
+                    r.credentials_fp is not None and r.credentials_fp != st["fp"]
+                )
+            else:
+                lease = leases.get(t) if t else None
+                if lease is None or lease["account"] is None:
+                    continue
+                account, key, lease_id = lease["account"], lease["egress"], lease["lease_id"]
+            if i.bytes:
+                usage.append(UsageRow(account, key, i.task_type, i.bytes))
+                metrics.proxy_bytes.labels(settings.env, account, i.task_type).inc(i.bytes)
+            err = getattr(i, "proxy_error", None)
+            if err is None:
+                if not stale:
+                    ok_accounts.add(account)
+                    await admin.record_success(conn, account, key)
+                continue
+            if stale:
+                metrics.proxy_errors.labels(settings.env, account, "stale_route").inc()
+                if t and err.kind != "gateway":
+                    release.append((t, lease_id))
+                continue
+            cfg = cfg or (await dispatcher.budgets(conn)).proxies
+            what = await admin.record_proxy_error(
+                conn,
+                account,
+                key,
+                err.status,
+                redact_text(err.excerpt),
+                kind=err.kind,
+                target=t,
+                max_failures=cfg.max_connect_failures,
+                unreachable_refs=cfg.unreachable_exits,
+                window_s=cfg.unreachable_window.total_seconds(),
+                gateway_targets=cfg.gateway_targets,
+                gateway_window_s=cfg.gateway_window.total_seconds(),
+            )
+            metrics.proxy_errors.labels(settings.env, account, what).inc()
+            if what == "disabled":
+                metrics.proxy_disabled.labels(settings.env, account).inc()
+            # A refusal or connect failure: released, not cooled (the target did nothing
+            # wrong). A gateway answer keeps the lease: the task failed with its backoff.
+            if t and err.kind != "gateway":
+                release.append((t, lease_id))
+        await dispatcher.release_targets(conn, release)
+        await admin.record_usage(conn, usage)
+        await admin.clear_failures(conn, ok_accounts)
 
     def _check_refs(c: Caller, refs) -> None:
         registry.require_lease(c, {r.task_type for r in refs})
@@ -728,6 +1217,7 @@ def create_app(
         items = [AckItem(t.to_store(), t.event_id) for t in req.tasks]
         async with pool.connection() as conn:
             n, unknown = await frontier.ack(conn, items)
+            await _outcomes(conn, c, req.tasks)
         _count_applied(req.tasks, unknown, "acked")
         return AppliedResponse(applied=n, unknown=_refs(unknown))
 
@@ -745,11 +1235,14 @@ def create_app(
             for t in req.tasks
         ]
         cool = [
-            (t.task_type, t.key, t.retry_after_s or 0, t.reason) for t in req.tasks if t.cooldown
+            (t.task_type, t.key, t.retry_after_s or 0, t.reason, t.cause)
+            for t in req.tasks
+            if t.cooldown
         ]
         async with pool.connection() as conn:
             n, unknown = await frontier.fail(conn, items)
             await _cool(conn, cool, req.egress)
+            await _outcomes(conn, c, req.tasks)
         _count_applied(req.tasks, unknown, "failed")
         return AppliedResponse(applied=n, unknown=_refs(unknown))
 
@@ -758,15 +1251,16 @@ def create_app(
         _check_refs(c, req.leases)
         after = {r.to_store(): r.after_s for r in req.leases if r.after_s is not None}
         cool = [
-            (r.task_type, r.key, r.after_s or 0, r.reason or "pushback")
+            (r.task_type, r.key, r.after_s or 0, r.reason or "pushback", r.cause)
             for r in req.leases
-            if r.cooldown
+            if r.cooldown and r.proxy_error is None
         ]
         async with pool.connection() as conn:
             n, unknown = await frontier.release(
                 conn, [r.to_store() for r in req.leases], after=after
             )
             await _cool(conn, cool, req.egress)
+            await _outcomes(conn, c, req.leases)
         _count_applied(req.leases, unknown, "released")
         return AppliedResponse(applied=n, unknown=_refs(unknown))
 
@@ -832,6 +1326,22 @@ def create_app(
                 return await provider_rules(conn, settings.egress_schema)
             except EgressNotReady as e:
                 raise HTTPException(503, str(e)) from None
+
+    @app.get("/v1/egress/accounts")
+    async def egress_accounts(c: CallerDep):
+        async with pool.connection() as conn:
+            if not await proxy_tables_exist(conn, settings.egress_schema):
+                raise HTTPException(503, "the egress schema has no proxy tables yet")
+            accounts = await load_accounts(conn, settings.egress_schema)
+        return {
+            "accounts": [
+                account_view(a) for name, a in sorted(accounts.items()) if settings.env in a.envs
+            ]
+        }
+
+    register_proxy_routes(
+        app, pool, admin, dispatcher, registry, settings, caller, keyring, probe_transport
+    )
 
     @app.get("/v1/whoami")
     async def whoami(c: CallerDep):

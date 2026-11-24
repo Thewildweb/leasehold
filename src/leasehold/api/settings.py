@@ -23,6 +23,14 @@ API the same for ``dev``.
     LEASEHOLD_EGRESS_PLAN_INTERVAL  seconds between demand updates and planning checks
                               (default: 15; the planner plans each window once)
 
+Proxy credentials (``leasehold.egress.secrets``); without a key no route through a proxy
+is given and proxy credentials can't be stored:
+
+    LEASEHOLD_SECRETS_KEY     32 bytes, base64: the key credentials are encrypted with
+    LEASEHOLD_SECRETS_KEYS    instead, several as id:base64,id:base64 (the last encrypts)
+    LEASEHOLD_PROXY_INTERVAL  seconds between checks for due proxy jobs: usage polls,
+                              exit address checks, probes (default: 60; schema owner only)
+
 The alert inbox (``leasehold.api.alerts``), off when LEASEHOLD_CLICKHOUSE_URL is unset:
 
     LEASEHOLD_CLICKHOUSE_URL       ClickHouse HTTP interface, e.g. http://clickhouse:8123
@@ -63,6 +71,7 @@ class Settings:
     egress_schema: str = "egress"
     egress_owner: bool = False
     plan_interval: float = 15.0
+    proxy_interval: float = 60.0
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
@@ -93,4 +102,5 @@ class Settings:
             egress_schema=e.get("LEASEHOLD_EGRESS_SCHEMA") or "egress",
             egress_owner=e.get("LEASEHOLD_EGRESS_OWNER", "") in ("1", "true", "yes"),
             plan_interval=float(e.get("LEASEHOLD_EGRESS_PLAN_INTERVAL", "15")),
+            proxy_interval=float(e.get("LEASEHOLD_PROXY_INTERVAL", "60")),
         )

@@ -281,6 +281,62 @@ class Cooldown(_Strict):
     )
 
 
+class Proxies(_Strict):
+    """Proxy accounts, exits and pools (leasehold.egress.proxies)."""
+
+    tier_ttl: Duration = Field(
+        default=timedelta(days=30),
+        description="A target escalated to a higher tier starts at the first again after this",
+    )
+    max_connect_failures: int = Field(
+        default=5, ge=1, description="Connect failures in a row that disable an exit or pool"
+    )
+    unreachable_exits: int = Field(
+        default=3,
+        ge=2,
+        description="Exits or pools of one account failing within unreachable_window, with no "
+        "success between: the account is unreachable",
+    )
+    unreachable_window: Duration = timedelta(seconds=60)
+    gateway_targets: int = Field(
+        default=3,
+        ge=2,
+        description="A proxy answering CONNECT with 502/503/504 counts as a connect failure "
+        "of the exit or pool only once this many distinct targets got it within "
+        "gateway_window (one dead site is the site, not the exit)",
+    )
+    gateway_window: Duration = timedelta(minutes=10)
+    exit_recheck: Duration = Field(
+        default=timedelta(hours=1), description="How often each fixed exit's address is checked"
+    )
+    probe_interval: Duration = Field(
+        default=timedelta(minutes=10), description="How often an account that isn't ok is probed"
+    )
+    usage_poll: Duration = Field(
+        default=timedelta(minutes=15), description="How often vendors' usage APIs are read"
+    )
+    usage_poll_warn_after: Duration = Field(
+        default=timedelta(hours=1), description="A usage poll failing this long is a warning"
+    )
+    echo_url: str = Field(
+        default="https://api.ipify.org",
+        description="IP echo: answers with the caller's address as text",
+    )
+    remove_after: Duration = Field(
+        default=timedelta(days=30), description="Removed exits and pools are deleted after this"
+    )
+    warn_used: float = Field(default=0.9, gt=0, lt=1, description="Warning: share of quota used")
+    paid_until_warn: Duration = Field(
+        default=timedelta(days=7), description="Warning: an account's paid_until is this close"
+    )
+    drift_warn: float = Field(
+        default=0.10,
+        gt=0,
+        lt=1,
+        description="Info: our byte count and the vendor's differ by this share of the plan",
+    )
+
+
 class Budgets(_Strict):
     planning: Planning = Planning()
     classes: Classes = Classes()
@@ -290,6 +346,7 @@ class Budgets(_Strict):
     targets: Targets = Targets()
     pair: Pair = Pair()
     cooldown: Cooldown = Cooldown()
+    proxies: Proxies = Proxies()
 
 
 # --- loading ----------------------------------------------------------------------------------

@@ -59,6 +59,26 @@ uv run leasehold egress migrate --yes
 uv run leasehold egress apply path/to/egress          # dry run
 ```
 
+Proxies are live data in the same schema, not files: proxy accounts (one contract with
+one vendor, with its credentials, quota and state), fixed exits (an egress with its own
+address, reached through the proxy) and rotating pools (a gateway, keyed `pool:<name>`).
+They are managed through the control API with `leasehold proxy ...`; credentials are
+encrypted with a key only the control API has (`LEASEHOLD_SECRETS_KEY`). A task type uses
+proxies only through its `egress:` block in `service.yml`: tiers in escalation order
+(`datacenter`, `isp`, `residential`, `mobile`), each proxy tier naming the accounts or
+pools it may use. A block moves a target to the next tier; a task type without
+`datacenter` never reaches a target from our own addresses. See `leasehold.egress.tiers`,
+`leasehold.egress.proxies` and `leasehold.runtime.proxy`. An account is enabled only with a
+limit (`--cap-gb`, or one its usage API reports). Account states, quota warnings and
+disabled exits alert through platform rules that `leasehold grafana apply` renders into
+the platform folder, one alert per account (`leasehold.grafana.alerts`).
+
+```bash
+pass proxies/example-isp | uv run leasehold proxy account set-credentials example-isp
+uv run leasehold proxy import --account example-isp --kind isp --country NL < list.txt
+uv run leasehold proxy list
+```
+
 `run_processor` hands its handler batches of at most `batch_size` events or
 `batch_max_bytes` bytes (default 64 MB; `LEASEHOLD_BATCH_MAX_BYTES` overrides it),
 whichever comes first; a single larger message is a batch of its own. Kafka's prefetch

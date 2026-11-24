@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from leasehold.grafana.alerts import AlertSpecError, render_when, service_rules
+from leasehold.grafana import plan
+from leasehold.grafana.alerts import AlertSpecError, platform_rules, render_when, service_rules
 from leasehold.spec import ServiceSpec
 
 BASE = {
@@ -143,3 +144,46 @@ def test_hash_follows_content():
     changed = BASE["components"]["worker"] | {"count": {"min": 3, "max": 4}}
     c = rules(spec(components=BASE["components"] | {"worker": changed}))["worker-below-min"]
     assert a == b != c.rule["annotations"]["leasehold_hash"]
+
+
+def test_platform_rules_one_alert_per_series():
+    prod = {r.rule["labels"]["rule"]: r for r in platform_rules("prod", "lhf-prod--platform", "p")}
+    assert set(prod) == {
+        "proxy-account-state", "proxy-quota-warning", "proxy-usage-poll-failing",
+        "proxy-paid-until", "proxy-auto-disabled", "proxy-usage-drift", "proxy-exit-moved",
+        "proxy-task-type-stopped",
+    }  # fmt: skip
+    state = prod["proxy-account-state"].rule
+    assert state["uid"] == "lha-prod--platform-proxy-account-state"
+    assert state["folderUID"] == "lhf-prod--platform"
+    assert state["labels"] == {
+        "managed_by": "leasehold", "env": "prod", "service": "platform",
+        "rule": "proxy-account-state", "priority": "page", "page": "true",
+    }  # fmt: skip
+    expr = state["data"][0]["model"]["expr"]
+    # The series themselves, not count(): each account and state is its own alert.
+    assert expr.startswith("max by (account, vendor, state) (leasehold_proxy_account_state{")
+    assert 'env="prod", state!="ok"' in expr and "count(" not in expr
+    assert 'status!="disabled"' in expr
+    assert state["data"][2]["model"] == {"refId": "C", "type": "math", "expression": "$B == $B"}
+    assert "{{ $labels.account }}" in state["annotations"]["summary"]
+    assert prod["proxy-quota-warning"].rule["labels"]["priority"] == "warning"
+    assert "$values.B.Value" in prod["proxy-quota-warning"].rule["annotations"]["summary"]
+    assert prod["proxy-usage-drift"].rule["for"] == "1h"
+    assert prod["proxy-task-type-stopped"].rule["labels"]["priority"] == "info"
+
+
+def test_platform_rules_on_shared_tables_only_in_prod():
+    dev = {r.rule["labels"]["rule"]: r for r in platform_rules("dev", "f", "p")}
+    # Account state and quota come from tables every environment shares: prod alerts.
+    assert set(dev) == {"proxy-auto-disabled", "proxy-task-type-stopped"}
+    expr = dev["proxy-task-type-stopped"].rule["data"][0]["model"]["expr"]
+    assert expr == 'max by (task_type, account) (leasehold_proxy_stopped{env="dev"}) == 1'
+    assert dev["proxy-auto-disabled"].rule["title"] == "platform: proxy exit or pool disabled (dev)"
+
+
+def test_plan_puts_platform_rules_in_the_platform_folder():
+    p = plan([(spec(), {})], "prod")
+    platform = [r for r in p.rules if r.service == "platform"]
+    assert platform and {r.folder_uid for r in platform} == {"lhf-prod--platform"}
+    assert any(r.service == "jobs" for r in p.rules)

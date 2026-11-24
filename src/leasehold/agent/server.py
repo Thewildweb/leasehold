@@ -23,6 +23,10 @@ What it does:
   (``POST /v1/targets/spend``), including what a higher class lends in the window.
 - **Fails closed**: without the control API it stops handing out tokens once leases
   reach their stop time.
+- **Proxy routes**: a target on a proxy tier comes with a route (leasehold.egress.proxies);
+  the lease response passes through to the worker unchanged. Its extra tokens are spent
+  on the route's egress (the exit or pool), and when a renewal brings a new route (the
+  account's credentials changed), the next token answer carries it to the worker.
 
 Settings (environment):
 
@@ -103,6 +107,7 @@ class _Target:
     next_at: float = 0.0  # monotonic: the next token
     lost: str | None = None
     tasks: dict[tuple[str, str], datetime] = field(default_factory=dict)  # task → expiry
+    route: dict | None = field(default=None, repr=False)  # a proxy route, with credentials
 
 
 def _stop_at(expires: datetime, now: datetime) -> float:
@@ -118,6 +123,9 @@ class TokenRequest(BaseModel):
     task_type: str
     cost: int = Field(default=1, ge=0, le=1000)
     first: bool = False
+    credentials_fp: str | None = Field(
+        default=None, description="The route the worker has; a newer one comes back with the token"
+    )
 
 
 class Agent:
@@ -159,6 +167,7 @@ class Agent:
                     expires=exp,
                     duration=max(exp - now, timedelta(seconds=10)),
                     stop_at=_stop_at(exp, now),
+                    route=t.get("route"),
                 )
             elif not have.lost:
                 have.expires = max(have.expires, exp)
@@ -192,6 +201,12 @@ class Agent:
                     del t.tasks[k]
                     if it.get("cooldown") and not t.lost:
                         t.lost = "pushback"
+                    elif (
+                        it.get("proxy_error")
+                        and it["proxy_error"].get("kind") != "gateway"
+                        and not t.lost
+                    ):
+                        t.lost = "proxy error"
 
     async def maintain(self) -> None:
         """Renew target leases that have tasks, give back those without, forget lost
@@ -245,6 +260,10 @@ class Agent:
                 t = self.targets.get(UUID(x["lease_id"]))
                 if t is not None:
                     t.lost = x["reason"]
+            for x in data.get("routes") or []:
+                t = self.targets.get(UUID(x["lease_id"]))
+                if t is not None:
+                    t.route = x["route"]
 
     # --- tokens -------------------------------------------------------------------------------
 
@@ -263,13 +282,21 @@ class Agent:
             # Reserve the slot before spending, so two workers can't both take it.
             t.next_at = mono + t.interval_s
             provider = t.provider
+            route = t.route
+        extra: dict = {}
+        if (
+            route is not None
+            and req.credentials_fp is not None
+            and route.get("credentials_fp") != req.credentials_fp
+        ):
+            extra["route"] = route
         if not req.first and req.cost > 0 and provider:
             try:
                 r = await self.call(
                     "POST",
                     "/v1/targets/spend",
                     {
-                        "egress": self.s.egress,
+                        "egress": route["egress"] if route else self.s.egress,
                         "provider": provider,
                         "task_type": req.task_type,
                         "n": req.cost,
@@ -283,7 +310,7 @@ class Agent:
                 # Partial spends are not returned: the window's budget is small and
                 # handing tokens back would let a busy class drain the rest.
                 return {"granted": False, "wait_s": 10.0, "reason": "no budget left"}
-        return {"granted": True, "interval_s": t.interval_s}
+        return {"granted": True, "interval_s": t.interval_s, **extra}
 
 
 def create_app(settings: AgentSettings, transport: httpx.AsyncBaseTransport | None = None):

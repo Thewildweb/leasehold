@@ -6,7 +6,10 @@ creates it; ``leasehold egress apply <dir>`` writes the configuration files into
 (``leasehold.egress.config``).
 
 Applying never deletes an egress: one that is no longer in the registry is set to
-``disabled``, so allocations and usage that refer to it stay valid.
+``disabled``, so allocations and usage that refer to it stay valid. It reads and writes
+only registry rows (``source = 'registry'``): fixed proxy exits (``source = 'live'``),
+pools and accounts are managed through the control API (``leasehold.egress.proxies``),
+and an operator's ``override_status`` on a registry row is left alone.
 
 These functions use a synchronous psycopg connection; they run from the CLI.
 """
@@ -166,16 +169,266 @@ MIGRATIONS.append(
     )
 )
 
+MIGRATIONS.append(
+    (
+        4,
+        [
+            # What the pushback was (the worker's cause): what a clear may lift, and
+            # whether it escalates the target to the next tier. NULL: from before.
+            """
+            ALTER TABLE {s}.target_cooldowns ADD COLUMN cause text
+              CHECK (cause IN ('challenge', 'block', 'rate', 'retry_after'))
+            """,
+            # One row per clear request (POST /v1/targets/{target}/clear), refused ones too.
+            """
+            CREATE TABLE {s}.target_clears (
+              id              bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+              target          text        NOT NULL,
+              cleared         boolean     NOT NULL,
+              refused         text,
+              cooldown_until  timestamptz,
+              cooldown_reason text,
+              cooldown_cause  text,
+              cooldown_egress text,
+              cooldown_env    text,
+              source          text        NOT NULL,
+              reason          text        NOT NULL,
+              evidence        jsonb,
+              caller          text        NOT NULL,
+              env             text        NOT NULL,
+              at              timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX target_clears_target ON {s}.target_clears (target, at)",
+        ],
+    )
+)
+
+MIGRATIONS.append(
+    (
+        5,
+        [
+            # Proxies (leasehold.egress.proxies). An account is one contract with one
+            # vendor: its credentials (encrypted, leasehold.egress.secrets), plan and
+            # state. `state` is what the account does, `status` what the operator wants.
+            """
+            CREATE TABLE {s}.proxy_accounts (
+              name                   text        PRIMARY KEY,
+              vendor                 text        NOT NULL,
+              adapter                text        NOT NULL DEFAULT 'generic',
+              adapter_config         jsonb       NOT NULL DEFAULT '{{}}',
+              credentials            bytea,
+              key_id                 text,
+              credentials_fp         text,
+              credentials_updated_at timestamptz,
+              usage_credentials      bytea,
+              usage_key_id           text,
+              usage_fp               text,
+              usage_updated_at       timestamptz,
+              cap_gb                 numeric     CHECK (cap_gb > 0),
+              cap_period             text        NOT NULL DEFAULT 'month'
+                                     CHECK (cap_period IN ('month', 'day')),
+              period_anchor          int         NOT NULL DEFAULT 1
+                                     CHECK (period_anchor BETWEEN 1 AND 28),
+              paid_until             date,
+              concurrency            int         CHECK (concurrency > 0),
+              warn_remaining_gb      numeric     CHECK (warn_remaining_gb > 0),
+              state                  text        NOT NULL DEFAULT 'ok'
+                                     CHECK (state IN ('ok', 'quota_exhausted', 'payment_failed',
+                                                      'suspended', 'auth_failed', 'unreachable')),
+              state_reason           text,
+              state_since            timestamptz NOT NULL DEFAULT now(),
+              status                 text        NOT NULL DEFAULT 'disabled'
+                                     CHECK (status IN ('active', 'drain', 'disabled')),
+              envs                   text[]      NOT NULL DEFAULT '{{prod,dev}}',
+              vendor_used_bytes      bigint,
+              vendor_limit_bytes     bigint,
+              vendor_remaining_bytes bigint,
+              vendor_period_end      timestamptz,
+              vendor_seen_at         timestamptz,
+              vendor_error           text,
+              vendor_error_since     timestamptz,
+              notified               jsonb       NOT NULL DEFAULT '{{}}',
+              created_at             timestamptz NOT NULL DEFAULT now(),
+              updated_at             timestamptz NOT NULL DEFAULT now(),
+              removed_at             timestamptz
+            )
+            """,
+            # Fixed exits: a vendor's endpoints (host:port), each one exit IP that the
+            # probe learns; the egress row (below) is made once the address is known.
+            """
+            CREATE TABLE {s}.proxy_exits (
+              id              bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+              account         text        NOT NULL REFERENCES {s}.proxy_accounts (name),
+              endpoint        text        NOT NULL UNIQUE,
+              kind            text        NOT NULL
+                              CHECK (kind IN ('datacenter', 'residential', 'isp', 'mobile')),
+              country         text,
+              task_types      text[],
+              address         inet,
+              address_seen_at timestamptz,
+              last_error      text,
+              created_at      timestamptz NOT NULL DEFAULT now(),
+              updated_at      timestamptz NOT NULL DEFAULT now(),
+              removed_at      timestamptz
+            )
+            """,
+            # Rotating gateways: no address before the request; keyed `pool:<name>`.
+            """
+            CREATE TABLE {s}.proxy_pools (
+              name                 text        PRIMARY KEY,
+              account              text        NOT NULL REFERENCES {s}.proxy_accounts (name),
+              kind                 text        NOT NULL
+                                   CHECK (kind IN ('datacenter', 'residential', 'isp', 'mobile')),
+              endpoint             text        NOT NULL,
+              username_template    text        NOT NULL DEFAULT '{{user}}',
+              sticky               boolean     NOT NULL DEFAULT false,
+              max_sticky_ttl_s     int         CHECK (max_sticky_ttl_s > 0),
+              countries            text[]      NOT NULL DEFAULT '{{}}',
+              cost_per_gb          numeric,
+              concurrency          int         CHECK (concurrency > 0),
+              egress_weight        int         NOT NULL DEFAULT 4 CHECK (egress_weight > 0),
+              exit_ip_header       text,
+              status               text        NOT NULL DEFAULT 'active'
+                                   CHECK (status IN ('active', 'drain', 'disabled')),
+              override_status      text        CHECK (override_status IN ('drain', 'disabled')),
+              override_reason      text,
+              consecutive_failures int         NOT NULL DEFAULT 0,
+              task_types           text[],
+              source               text        NOT NULL DEFAULT 'live' CHECK (source = 'live'),
+              created_at           timestamptz NOT NULL DEFAULT now(),
+              updated_at           timestamptz NOT NULL DEFAULT now(),
+              removed_at           timestamptz
+            )
+            """,
+            # Bytes and requests through each account, per pool or exit (`ref`), env,
+            # task type and day; workers report bytes with their outcomes.
+            """
+            CREATE TABLE {s}.proxy_usage (
+              account   text   NOT NULL,
+              ref       text   NOT NULL,
+              env       text   NOT NULL,
+              task_type text   NOT NULL,
+              day       date   NOT NULL,
+              bytes     bigint NOT NULL DEFAULT 0,
+              requests  bigint NOT NULL DEFAULT 0,
+              PRIMARY KEY (account, day, ref, env, task_type)
+            )
+            """,
+            # Connect failures through an account's exits and pools, for the correlation
+            # rule (several exits failing together is the account, not the exits).
+            # `gateway`: the proxy answered CONNECT with 502/503/504, recorded with the
+            # target; it counts only once several distinct targets fail on one exit.
+            """
+            CREATE TABLE {s}.proxy_failures (
+              account text        NOT NULL,
+              ref     text        NOT NULL,
+              env     text        NOT NULL,
+              kind    text        NOT NULL DEFAULT 'connect'
+                                  CHECK (kind IN ('connect', 'gateway')),
+              target  text,
+              at      timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX proxy_failures_account ON {s}.proxy_failures (account, at)",
+            "CREATE INDEX proxy_failures_ref ON {s}.proxy_failures (ref, at)",
+            """
+            CREATE TABLE {s}.proxy_audit (
+              id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+              at          timestamptz NOT NULL DEFAULT now(),
+              actor       text        NOT NULL,
+              env         text        NOT NULL,
+              action      text        NOT NULL,
+              object_type text        NOT NULL,
+              object      text        NOT NULL,
+              changes     jsonb       NOT NULL DEFAULT '{{}}'
+            )
+            """,
+            "CREATE INDEX proxy_audit_object ON {s}.proxy_audit (object_type, object, at)",
+            # The tier a target is on after a block escalated it (leasehold.egress.tiers);
+            # no row: the task type's first tier.
+            """
+            CREATE TABLE {s}.target_tiers (
+              target    text        PRIMARY KEY,
+              tier      text        NOT NULL,
+              since     timestamptz NOT NULL DEFAULT now(),
+              reason    text        NOT NULL,
+              evidence  jsonb,
+              task_type text        NOT NULL,
+              env       text        NOT NULL
+            )
+            """,
+            "CREATE INDEX target_tiers_since ON {s}.target_tiers (since)",
+            # Egresses: registry rows (VPSes) and live rows (fixed proxy exits).
+            "ALTER TABLE {s}.egresses DROP CONSTRAINT egresses_kind_check",
+            """
+            ALTER TABLE {s}.egresses ADD CONSTRAINT egresses_kind_check
+              CHECK (kind IN ('datacenter', 'residential', 'isp', 'mobile'))
+            """,
+            """
+            ALTER TABLE {s}.egresses
+              ADD COLUMN source text NOT NULL DEFAULT 'registry'
+                CHECK (source IN ('registry', 'live')),
+              ADD COLUMN account text REFERENCES {s}.proxy_accounts (name),
+              ADD COLUMN endpoint text,
+              ADD COLUMN exit_id bigint REFERENCES {s}.proxy_exits (id),
+              ADD COLUMN override_status text CHECK (override_status IN ('drain', 'disabled')),
+              ADD COLUMN override_reason text,
+              ADD COLUMN consecutive_failures int NOT NULL DEFAULT 0,
+              ADD COLUMN removed_at timestamptz,
+              ADD CONSTRAINT egresses_proxy_fields
+                CHECK ((account IS NULL) = (endpoint IS NULL))
+            """,
+            # The egress key becomes text: an address, or `pool:<name>` for a pool.
+            "ALTER TABLE {s}.target_leases ALTER COLUMN egress TYPE text USING host(egress)",
+            "ALTER TABLE {s}.target_cooldowns ALTER COLUMN egress TYPE text USING host(egress)",
+            "ALTER TABLE {s}.pair_usage ALTER COLUMN egress TYPE text USING host(egress)",
+            "ALTER TABLE {s}.allocations ALTER COLUMN egress TYPE text USING host(egress)",
+            # A routed target lease: the proxy account, its tier, the sticky session with
+            # its TTL, the country the route was planned for and the credentials
+            # fingerprint the route was rendered with (a refresh renders the same route).
+            """
+            ALTER TABLE {s}.target_leases
+              ADD COLUMN account text,
+              ADD COLUMN tier text NOT NULL DEFAULT 'datacenter',
+              ADD COLUMN session text,
+              ADD COLUMN session_ttl_s int,
+              ADD COLUMN country text,
+              ADD COLUMN route_fp text
+            """,
+            "CREATE INDEX target_leases_account ON {s}.target_leases (account) "
+            "WHERE account IS NOT NULL",
+            # Cooldowns per tier: a block cools the target on the tier it happened on;
+            # rate pushback ('*') on every tier.
+            "ALTER TABLE {s}.target_cooldowns ADD COLUMN tier text NOT NULL DEFAULT '*'",
+            "ALTER TABLE {s}.target_cooldowns DROP CONSTRAINT target_cooldowns_pkey",
+            "ALTER TABLE {s}.target_cooldowns ADD PRIMARY KEY (target, tier)",
+        ],
+    )
+)
+
 # Tables the dispatchers of every environment write; the schema owner grants them to
 # the other environments' roles (`leasehold egress migrate --writer <role>`).
 # Allocations only take spending (`used`): other environments never create or resize them.
+# Proxy rows are changed through the owner's API; other environments only record what
+# their workers report (usage, failures, account and exit health).
 SHARED_WRITE = {
     "target_leases": "INSERT, UPDATE",
     "target_cooldowns": "INSERT, UPDATE",
     "pair_usage": "INSERT, UPDATE",
     "demand": "INSERT, UPDATE",
     "allocations": "UPDATE (used)",
+    "target_clears": "INSERT",
+    "target_tiers": "INSERT, UPDATE",
+    "proxy_usage": "INSERT, UPDATE",
+    "proxy_failures": "INSERT, DELETE",  # a success clears the route's failures
+    "proxy_audit": "INSERT",
+    "proxy_accounts": "UPDATE (state, state_reason, state_since, updated_at)",
+    "proxy_pools": "UPDATE (consecutive_failures, override_status, override_reason, updated_at)",
+    "egresses": "UPDATE (consecutive_failures, override_status, override_reason, updated_at)",
 }
+# Columns a read-only role (Grafana) may not select: the ciphertexts.
+SECRET_COLUMNS = {"proxy_accounts": ("credentials", "usage_credentials")}
 SHARED_WRITE_TABLES = tuple(SHARED_WRITE)
 
 LATEST = MIGRATIONS[-1][0]
@@ -193,6 +446,34 @@ def grant_writers(conn: psycopg.Connection, roles: list[str], schema: str = SCHE
             conn.execute(
                 sql.SQL("GRANT {} ON {}.{} TO {}").format(
                     sql.SQL(privileges), s, sql.Identifier(t), r
+                )
+            )
+        conn.execute(sql.SQL("GRANT USAGE ON ALL SEQUENCES IN SCHEMA {} TO {}").format(s, r))
+
+
+def grant_readers(conn: psycopg.Connection, roles: list[str], schema: str = SCHEMA) -> None:
+    """Let read-only roles (dashboards) read the schema, except the credential columns.
+    Idempotent; run after every migration."""
+    for role in roles:
+        r = sql.Identifier(role)
+        s = sql.Identifier(schema)
+        conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(s, r))
+        conn.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(s, r))
+        for table, secret in SECRET_COLUMNS.items():
+            t = sql.Identifier(table)
+            cols = [
+                c[0]
+                for c in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+                    (schema, table),
+                )
+                if c[0] not in secret
+            ]
+            conn.execute(sql.SQL("REVOKE SELECT ON {}.{} FROM {}").format(s, t, r))
+            conn.execute(
+                sql.SQL("GRANT SELECT ({}) ON {}.{} TO {}").format(
+                    sql.SQL(", ").join(map(sql.Identifier, cols)), s, t, r
                 )
             )
 
@@ -305,6 +586,7 @@ def _settings_rows(cfg: EgressConfig) -> dict[str, dict]:
             "targets",
             "pair",
             "cooldown",
+            "proxies",
         )
     }
 
@@ -327,7 +609,9 @@ def diff(conn: psycopg.Connection, cfg: EgressConfig, schema: str = SCHEMA) -> E
     cols = ", ".join(_EGRESS_COLS)
     have = {
         str(r[0]): dict(zip(_EGRESS_COLS, r[1:], strict=True))
-        for r in conn.execute(_q(f"SELECT address, {cols} FROM {{s}}.egresses", schema))
+        for r in conn.execute(
+            _q(f"SELECT address, {cols} FROM {{s}}.egresses WHERE source = 'registry'", schema)
+        )
     }
     want = {e.address: e.model_dump() for e in cfg.egresses}
     for addr, w in sorted(want.items()):
@@ -396,7 +680,7 @@ def apply(conn: psycopg.Connection, d: EgressDiff, schema: str = SCHEMA) -> None
                 conn.execute(
                     _q(
                         "UPDATE {s}.egresses SET status = 'disabled', updated_at = now() "
-                        "WHERE address = %s",
+                        "WHERE address = %s AND source = 'registry'",
                         schema,
                     ),
                     (addr,),
@@ -410,6 +694,7 @@ def apply(conn: psycopg.Connection, d: EgressDiff, schema: str = SCHEMA) -> None
                     ON CONFLICT (address) DO UPDATE SET
                       {", ".join(f"{c} = EXCLUDED.{c}" for c in _EGRESS_COLS)},
                       updated_at = now()
+                    WHERE egresses.source = 'registry'
                     """,
                     schema,
                 ),

@@ -9,6 +9,10 @@ Every message on every topic is one JSON object:
       "worker": "<instance>",      Nomad allocation ID
       "task_type": "…", "task_key": "…",     when produced while handling a task
       "target": "…", "egress_ip": "…",       when the event is about a fetch
+      "egress": "…", "proxy_account": "…", "proxy_session": "…"
+                                   only for a fetch through a proxy route: the egress key
+                                   (exit address or pool:<name>); egress_ip is then the
+                                   exit's address when known
       "ts": "2026-11-11T12:00:00.123Z",
       "payload": { … },
       "payload_ref": null          a claim check: see below
@@ -162,9 +166,13 @@ class EventProducer:
         target: str | None = None,
         egress_ip: str | None = None,
         event_id: uuid.UUID | None = None,
+        route: Any = None,
     ) -> Delivery:
         """Produce one event to one of this service's topics (by its name in
-        service.yml, e.g. ``entries``)."""
+        service.yml, e.g. ``entries``). ``route``: the proxy route the fetch went
+        through (``leasehold.client.Route``); the envelope then names the egress, the
+        account and the session, and ``egress_ip`` is the exit's address (or None when
+        unknown), never this machine's."""
         if topic not in self.allowed:
             raise ProduceError(
                 f"{self.cfg.name} may not produce to {topic!r}; add it to `produces`"
@@ -193,6 +201,11 @@ class EventProducer:
             "payload": body,
             "payload_ref": None,
         }
+        if route is not None:
+            envelope["egress"] = route.egress
+            envelope["egress_ip"] = egress_ip if egress_ip is not None else route.exit_ip
+            envelope["proxy_account"] = route.account
+            envelope["proxy_session"] = route.session
         value = json.dumps(envelope, separators=(",", ":"), default=str).encode()
         if len(value) > MAX_PAYLOAD_BYTES:
             value = self._claim(topic, spec, envelope, len(value))

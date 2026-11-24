@@ -179,6 +179,40 @@ def plan_window(
     return out
 
 
+def plan_proxies(
+    exits: list[EgressRow],
+    pools: dict[str, int],
+    budgets_per_egress: dict[str, int],
+    demand: dict[tuple[str, str], int],
+    budgets: Budgets,
+) -> list[Allocation]:
+    """Allocations for proxy egresses: fixed exits (with the network level among them)
+    and pools (``pools``: ``pool:<name>`` → its egress weight, no network level: subnet
+    and ASN are unknown before the request). Proxies serve targets escalated to their
+    tier, which DC demand doesn't predict, so each gets its full capacity per provider
+    with demand, in class ``*``."""
+    window_min = budgets.planning.window / timedelta(minutes=1)
+    wanted = {p for (p, _), n in demand.items() if n > 0}
+    out: list[Allocation] = []
+    for provider in sorted(wanted):
+        if provider.startswith(SHARED_IP_PREFIX):
+            if budgets.shared_ip is None:
+                continue
+            per = budgets.shared_ip.per_egress
+        elif provider in budgets_per_egress:
+            per = budgets_per_egress[provider]
+        else:
+            continue
+        caps = capacities(exits, per, budgets) if exits else {}
+        for key, weight in pools.items():
+            caps[key] = per * window_min * weight
+        for key, cap in sorted(caps.items()):
+            n = math.floor(cap)
+            if n > 0:
+                out.append(Allocation(key, provider, ANY_CLASS, n))
+    return out
+
+
 # --- database ---------------------------------------------------------------------------------
 
 
@@ -234,13 +268,15 @@ class Planner:
             )
             if done:
                 return 0
+            proxies = await _proxy_tables(conn, self.schema)
+            own = "AND account IS NULL AND override_status IS NULL" if proxies else ""
             egresses = [
                 EgressRow(r["address"], r["subnet"], r["asn"])
                 for r in await self._rows(
                     conn,
                     "SELECT host(address) AS address, subnet::text AS subnet, asn "
                     "FROM {e}.egresses WHERE status = 'active' AND kind = 'datacenter' "
-                    "ORDER BY address",
+                    f"{own} ORDER BY address",
                 )
             ]
             per_egress = {
@@ -260,17 +296,44 @@ class Planner:
             ):
                 demand[(r["provider"], r["class"])] += r["due"]
             allocations = plan_window(egresses, per_egress, demand, budgets)
+            if proxies:
+                exits = [
+                    EgressRow(r["address"], r["subnet"], r["asn"])
+                    for r in await self._rows(
+                        conn,
+                        """
+                        SELECT host(x.address) AS address, x.subnet::text AS subnet, x.asn
+                        FROM {e}.egresses x JOIN {e}.proxy_accounts a ON a.name = x.account
+                        WHERE x.status = 'active' AND x.override_status IS NULL
+                          AND x.removed_at IS NULL AND a.status = 'active' AND a.state = 'ok'
+                        ORDER BY x.address
+                        """,
+                    )
+                ]
+                pools = {
+                    "pool:" + r["name"]: r["egress_weight"]
+                    for r in await self._rows(
+                        conn,
+                        """
+                        SELECT p.name, p.egress_weight
+                        FROM {e}.proxy_pools p JOIN {e}.proxy_accounts a ON a.name = p.account
+                        WHERE p.status = 'active' AND p.override_status IS NULL
+                          AND p.removed_at IS NULL AND a.status = 'active' AND a.state = 'ok'
+                        """,
+                    )
+                }
+                allocations += plan_proxies(exits, pools, per_egress, demand, budgets)
             if allocations:
                 await conn.execute(
                     self._q(
                         """
-                        INSERT INTO {e}.allocations
+                        INSERT INTO {{e}}.allocations
                           (window_start, window_end, egress, provider, class, tokens)
-                        SELECT %(start)s, %(start)s + %(len)s, a.egress::inet, a.provider,
+                        SELECT %(start)s, %(start)s + %(len)s, a.egress{cast}, a.provider,
                                a.class, a.tokens
                         FROM jsonb_to_recordset(%(rows)s::jsonb)
                           AS a(egress text, provider text, class text, tokens int)
-                        """
+                        """.format(cast="" if proxies else "::inet")
                     ),
                     {
                         "start": window_start,
@@ -295,6 +358,15 @@ class Planner:
             self._q("DELETE FROM {e}.allocations WHERE window_end < now() - %s"), (keep,)
         )
         return cur.rowcount
+
+
+async def _proxy_tables(conn: AsyncConnection, schema: str) -> bool:
+    cur = await conn.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = %s AND table_name = 'proxy_accounts'",
+        (schema,),
+    )
+    return await cur.fetchone() is not None
 
 
 async def publish_demand(

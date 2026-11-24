@@ -11,7 +11,8 @@ Per environment, ``plan`` produces:
   - the service's **own dashboards** (``dashboards.files``);
 - the **cockpit** in a platform folder: one row per service with its instance count,
   its backlog and dead tasks, and its cockpit tiles;
-- per service its **alert rules** (``alerts.py``), in the service's folder;
+- per service its **alert rules** (``alerts.py``), in the service's folder, and the
+  **platform rules** (proxy accounts) in the platform folder;
 - the **alert inbox** in the platform folder (``inbox.py``): the control API's alerts
   table, filterable by status, service and priority;
 - in prod only, the **fleet** dashboard in the platform folder (``fleet.py``): capacity,
@@ -733,9 +734,9 @@ def plan(
         dashboards.append(
             DashboardPlan(fleet["uid"], fleet["title"], platform.uid, None, "fleet", fleet)
         )
-    from leasehold.grafana.alerts import service_rules
+    from leasehold.grafana.alerts import platform_rules, service_rules
 
-    rules = []
+    rules = platform_rules(env, platform.uid, ds.prometheus)
     for spec, files in sorted(services, key=lambda x: x[0].name):
         folder = FolderPlan(_uid("lhf", env, spec.name), spec.name + _suffix(env))
         folders.append(folder)

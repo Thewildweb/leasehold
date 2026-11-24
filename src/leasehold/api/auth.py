@@ -16,12 +16,18 @@ Two kinds of credentials, both sent as ``Authorization: Bearer <token>``:
         {"sha256": "<hex>", "agent": "egress-agent"}
       ]}
 
-  ``leasehold api token`` creates a token and prints its entry.
+  ``leasehold api token`` creates a token and prints its entry. A component token may
+  carry ``"scopes"`` (below).
 
 Permissions come from ``service.yml``: a task-worker may lease the task types in its
 ``consumes_tasks``; a component may create the task types in its ``creates_tasks``.
 Admins may create any task type and pause or resume task types. An ``alerts`` token
 (for Grafana's webhook) may only post alert notifications.
+
+Scopes add permissions to a component: ``targets:clear`` (lift a target's cooldown) and
+``targets:escalate`` (move a target to its next egress tier), for a health consumer or a
+classifier. A component gets them from ``api_scopes`` in its ``service.yml`` or from
+``scopes`` on its static token. Admins have them all.
 
 An ``agent`` token is the egress agent on a machine (``leasehold.agent``). It calls on
 behalf of the workers on that machine: their own credential comes in the header
@@ -32,6 +38,7 @@ holds the target leases; the tasks and events stay the worker's.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -65,6 +72,10 @@ class Caller:
     agent: bool = False  # an egress agent: calls on behalf of its machine's workers
     instance: str | None = None  # Nomad allocation ID, when known
     via: str | None = None  # the agent this worker's call came through
+    scopes: frozenset[str] = frozenset()  # extra permissions: targets:clear, targets:escalate
+
+    def may(self, scope: str) -> bool:
+        return self.admin or scope in self.scopes
 
 
 class Registry:
@@ -86,11 +97,29 @@ class Registry:
             for name, tt in s.frontier.task_types.items()
             if tt.target_leases
         }
+        # Task types whose tiers include datacenter (the default): leasing them needs the
+        # worker's own egress.
+        self.needs_egress = {
+            name
+            for s in specs
+            for name, tt in s.frontier.task_types.items()
+            if tt.target_leases and (tt.egress is None or "datacenter" in tt.egress.tiers)
+        }
+        self.egress_specs = {
+            name: tt.egress
+            for s in specs
+            for name, tt in s.frontier.task_types.items()
+            if tt.target_leases
+        }
 
     def component(self, caller: Caller) -> Component | None:
         if caller.service is None or caller.component is None:
             return None
         return self.components.get((caller.service, caller.component))
+
+    def scopes(self, caller: Caller) -> frozenset[str]:
+        c = self.component(caller)
+        return frozenset(c.api_scopes) if c else frozenset()
 
     def leasable(self, caller: Caller) -> set[str]:
         c = self.component(caller)
@@ -140,10 +169,14 @@ def load_tokens(path: Path | None) -> list[_StaticEntry]:
         elif "agent" in t:
             caller = Caller(name=f"agent:{t['agent']}", agent=True)
         elif "service" in t and "component" in t:
+            scopes = t.get("scopes", [])
+            if not isinstance(scopes, list) or set(scopes) - SCOPES:
+                raise ValueError(f"{path}: token {i}: scopes are {', '.join(sorted(SCOPES))}")
             caller = Caller(
                 name=f"{t['service']}.{t['component']}",
                 service=t["service"],
                 component=t["component"],
+                scopes=frozenset(scopes),
             )
         else:
             raise ValueError(
@@ -154,6 +187,8 @@ def load_tokens(path: Path | None) -> list[_StaticEntry]:
         out.append(_StaticEntry(t["sha256"], caller))
     return out
 
+
+SCOPES = {"targets:clear", "targets:escalate"}
 
 # Periodic and dispatched jobs run as child jobs: 'certlog-planner/periodic-1731300000'.
 _CHILD_JOB = re.compile(r"/(periodic|dispatch)-[^/]+$")
@@ -195,6 +230,8 @@ class Authenticator:
                 c = entry.caller
                 if not (c.admin or c.alerts or c.agent) and self.registry.component(c) is None:
                     raise AuthError(f"token for unknown component {c.name}")
+                if c.service is not None:
+                    c = dataclasses.replace(c, scopes=c.scopes | self.registry.scopes(c))
                 return c
         raise AuthError("unknown token")
 
@@ -223,9 +260,10 @@ class Authenticator:
         if found is None:
             raise AuthError(f"job {job!r} is not a component of any service")
         service, component = found
-        return Caller(
+        c = Caller(
             name=f"{service}.{component}",
             service=service,
             component=component,
             instance=claims.get("nomad_allocation_id"),
         )
+        return dataclasses.replace(c, scopes=self.registry.scopes(c))

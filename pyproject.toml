@@ -24,6 +24,8 @@ server = [
     "uvicorn>=0.30",
     "psycopg[binary,pool]>=3.3.9",
     "pyjwt[crypto]>=2.15.1",
+    # Proxy credentials at rest (leasehold.egress.secrets).
+    "cryptography>=44",
 ]
 # The archive sink: Kafka topic -> Parquet in a bucket.
 archive = [
