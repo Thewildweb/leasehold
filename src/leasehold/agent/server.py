@@ -208,6 +208,44 @@ class Agent:
                     ):
                         t.lost = "proxy error"
 
+    async def _check_target(self, lease_id: UUID) -> str | None:
+        """Before a task's extra request: why the target's lease is lost, or None. ``maintain``
+        renews at half the duration, so a revoke would otherwise be known only then. When
+        the API can't be reached the target goes on until its lease ends."""
+        now = datetime.now(UTC)
+        body = {"egress": self.s.egress, "leases": [str(lease_id)], "release": []}
+        data: dict = {}
+        try:
+            r = await self.call("POST", "/v1/targets/renew", body)
+            r.raise_for_status()
+            data = r.json()
+        except httpx.HTTPError as e:
+            log.warning("target check failed", extra={"fields": {"error": str(e)}})
+        async with self.lock:
+            self._record_targets(data, now)
+            t = self.targets.get(lease_id)
+            if t is None:
+                return "unknown target lease"
+            if not t.lost and time.monotonic() >= t.stop_at:
+                return "target lease ends"
+            return t.lost
+
+    def _record_targets(self, data: dict, now: datetime) -> None:
+        """A target renewal's answer (with the lock held)."""
+        for x in data.get("renewed") or []:
+            t = self.targets.get(UUID(x["lease_id"]))
+            if t is not None and not t.lost:
+                t.expires = _time(x["expires_at"])
+                t.stop_at = _stop_at(t.expires, now)
+        for x in data.get("lost") or []:
+            t = self.targets.get(UUID(x["lease_id"]))
+            if t is not None:
+                t.lost = x["reason"]
+        for x in data.get("routes") or []:
+            t = self.targets.get(UUID(x["lease_id"]))
+            if t is not None:
+                t.route = x["route"]
+
     async def maintain(self) -> None:
         """Renew target leases that have tasks, give back those without, forget lost
         ones. Called every few seconds."""
@@ -251,19 +289,7 @@ class Agent:
                 if t is not None and not t.tasks:
                     del self.targets[i]
             self.release.difference_update(release)
-            for x in data["renewed"]:
-                t = self.targets.get(UUID(x["lease_id"]))
-                if t is not None and not t.lost:
-                    t.expires = _time(x["expires_at"])
-                    t.stop_at = _stop_at(t.expires, now)
-            for x in data["lost"]:
-                t = self.targets.get(UUID(x["lease_id"]))
-                if t is not None:
-                    t.lost = x["reason"]
-            for x in data.get("routes") or []:
-                t = self.targets.get(UUID(x["lease_id"]))
-                if t is not None:
-                    t.route = x["route"]
+            self._record_targets(data, now)
 
     # --- tokens -------------------------------------------------------------------------------
 
@@ -282,6 +308,11 @@ class Agent:
             # Reserve the slot before spending, so two workers can't both take it.
             t.next_at = mono + t.interval_s
             provider = t.provider
+            route = t.route
+        if not req.first:
+            lost = await self._check_target(req.target_lease_id)
+            if lost is not None:
+                return {"granted": False, "lost": lost}
             route = t.route
         extra: dict = {}
         if (

@@ -235,6 +235,65 @@ def test_defer_with_cooldown():
     }
 
 
+def requests_until_lost(sent, ready, n=4):
+    """A handler that sends requests, and after the second lets the test act."""
+
+    def handle(task, ctx):
+        for i in range(n):
+            if i:
+                ctx.token()
+            sent.append(task.key)
+            if i == 1 and ready is not None:
+                ready(task)
+        ctx.emit("results", {"id": task.key, "n": 1})
+
+    return handle
+
+
+def test_pause_between_two_tokens_stops_the_task():
+    """The leases are long, so no renewal in the main loop is due."""
+    sent = []
+    control = TargetControl(["a:1"], interval_s=0.05)
+    pause = lambda task: control.lost_on_renew.add(task.key)  # noqa: E731
+    w = make(requests_until_lost(sent, pause), control)
+    run_until(w, lambda: control.released)
+    assert len(sent) == 2 and not control.acked and not control.failed
+    (r,) = control.released
+    assert r.ref.key == "a:1" and r.reason == "target lost: lease lost"
+
+
+def test_revoke_between_two_tokens_stops_the_task():
+    sent = []
+    control = TargetControl(["a:1", "a:2"], interval_s=0.05)
+    w = make(requests_until_lost(sent, lambda task: control.lost_targets.add("a")), control)
+    run_until(w, lambda: len(control.released) == 2)
+    # The running task stops at its next request, the queued one never starts.
+    assert sent == ["a:1", "a:1"] and not control.acked
+    assert "target lost: revoked: test" in [r.reason for r in control.released]
+
+
+def test_api_down_between_two_tokens():
+    """The task goes on while its lease lasts, and stops when it has expired."""
+    sent = []
+    control = TargetControl(["a:1"], interval_s=0.05)
+    w = make(requests_until_lost(sent, lambda task: setattr(control, "down", True)), control)
+    run_until(w, lambda: len(sent) == 4)
+    control.down = False
+    run_until(w, lambda: control.acked)
+
+    sent.clear()
+    control = TargetControl(["a:1"], interval_s=0.05)
+
+    def down(task):
+        control.down = True
+        for h in w.running.values():
+            h.expires = datetime.now(UTC)
+
+    w = make(requests_until_lost(sent, down), control)
+    run_until(w, lambda: w.defers)
+    assert len(sent) == 2
+
+
 # --- with the machine's agent -----------------------------------------------------------------
 
 
@@ -313,6 +372,15 @@ def test_extra_token_without_budget_gives_the_task_back(monkeypatch):
     run_until(w, lambda: control.released)
     (r,) = control.released
     assert r.after == timedelta(0) and not r.cooldown
+
+
+def test_agent_mode_pause_between_two_tokens():
+    sent = []
+    control = AgentControl(["a:1"], interval_s=0.05)
+    pause = lambda task: control.lost_on_renew.add(task.key)  # noqa: E731
+    w = make(requests_until_lost(sent, pause), control, egress=None)
+    run_until(w, lambda: control.released)
+    assert len(sent) == 2 and not control.acked
 
 
 def test_unreachable_agent_waits_and_never_falls_back(tmp_path):

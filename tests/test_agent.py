@@ -145,6 +145,33 @@ def test_maintain_renews_releases_and_learns_lost(agent):
     assert token(agent, first=True) == {"granted": False, "lost": "revoked: operator"}
 
 
+def test_extra_token_checks_the_target_lease(agent):
+    lease(agent)
+    t = agent.state.targets[uuid.UUID(agent.api.lease_id)]
+    renews = lambda: [c for c in agent.api.calls if c[0] == "/v1/targets/renew"]  # noqa: E731
+    assert token(agent, first=True)["granted"] is True
+    assert renews() == []  # the lease call covers the first request
+    t.next_at = 0
+    assert token(agent)["granted"] is True
+    assert renews()[-1][1]["leases"] == [agent.api.lease_id]
+    # Revoked: the next extra token is refused, and no budget is spent on it.
+    agent.api.lost = [{"lease_id": agent.api.lease_id, "reason": "revoked: operator"}]
+    t.next_at = 0
+    spent = [c[0] for c in agent.api.calls].count("/v1/targets/spend")
+    assert token(agent) == {"granted": False, "lost": "revoked: operator"}
+    assert [c[0] for c in agent.api.calls].count("/v1/targets/spend") == spent
+
+
+def test_extra_token_while_the_api_is_down(agent):
+    """The target goes on until its lease ends (a token without budget needs no spend)."""
+    lease(agent)
+    agent.api.down = True
+    t = agent.state.targets[uuid.UUID(agent.api.lease_id)]
+    assert token(agent, cost=0)["granted"] is True
+    t.next_at = t.stop_at = 0
+    assert token(agent, cost=0) == {"granted": False, "lost": "target lease ends"}
+
+
 def test_done_tasks_give_the_target_back(agent):
     lease(agent)
     agent.post("/v1/tasks/ack", json={"tasks": [
