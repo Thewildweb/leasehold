@@ -134,7 +134,9 @@ class ClickHouse:
         resp = self._http.post("/", params={"default_format": "JSONEachRow"}, files=fields)
         if resp.status_code != 200:
             raise ClickHouseError(resp.text.strip()[:500])
-        return [json.loads(line) for line in resp.text.splitlines() if line]
+        # Split on "\n" only: ClickHouse escapes it inside values, but writes U+0085 and
+        # other characters str.splitlines() also breaks on as they are.
+        return [json.loads(line) for line in resp.text.split("\n") if line]
 
     def close(self) -> None:
         self._http.close()

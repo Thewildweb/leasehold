@@ -272,3 +272,20 @@ def test_tagger_from_the_control_api(monkeypatch):
         ("b.nl", "b.nl", "ip:192.0.2.50"),
         ("c.nl", "192.0.2.1", ""),
     ]
+
+
+def test_clickhouse_query_keeps_rows_with_line_separators_whole():
+    # ClickHouse writes U+0085 (and U+2028 in some formats) unescaped inside JSONEachRow
+    # strings; str.splitlines() breaks on them, which cut a row in two.
+    import httpx
+
+    from leasehold.runtime.planner import ClickHouse
+
+    text = "a\x85b c d\x1ce\x0bf\x0cg"
+    body = json.dumps({"t": text}, ensure_ascii=False) + "\n" + json.dumps({"t": "x"}) + "\n"
+    ch = ClickHouse("http://ch", "u", "p")
+    ch._http = httpx.Client(
+        base_url="http://ch",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, text=body)),
+    )
+    assert ch.query("SELECT 1") == [{"t": text}, {"t": "x"}]
