@@ -1,4 +1,4 @@
-// Public Suffix List from publicsuffixlist 1.1.2.20261118, written by leasehold.keys.clickhouse_suffix_list.
+// Public Suffix List from publicsuffixlist 1.1.2.20261120, written by leasehold.keys.clickhouse_suffix_list.
 // Rules with non-ASCII labels are repeated as punycode.
 ac
 com.ac
@@ -9275,6 +9275,9 @@ fbxos.fr
 freebox-os.fr
 freeboxos.fr
 freedesktop.org
+pvf.cc
+kz.ci
+xyz.ci
 freemyip.com
 *.frusky.de
 wien.funkfeuer.at
@@ -10310,6 +10313,7 @@ postman-echo.com
 pstmn.io
 mock.pstmn.io
 httpbin.org
+*.prairielearn-user-content.com
 prequalifyme.today
 xen.prgmr.com
 priv.at
