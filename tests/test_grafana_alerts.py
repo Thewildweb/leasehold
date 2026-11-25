@@ -167,6 +167,19 @@ def test_watchdog_rules_carry_a_routing_label():
         assert 'env="dev"' in expr and "{{" not in expr
 
 
+def test_rules_about_a_component_keep_the_series_service():
+    """A rule's label wins over the series': services' parsers would be one alert."""
+    rules = {r.rule["labels"]["rule"]: r.rule for r in platform_rules("dev", "f", "p")}
+    for rule in rules.values():
+        if (
+            "service, component)" in rule["data"][0]["model"]["expr"]
+            or "by (service)" in (rule["data"][0]["model"]["expr"])
+        ):
+            assert "service" not in rule["labels"]
+    assert sum("service" not in r["labels"] for r in rules.values()) == 6
+    assert rules["lag-retention"]["labels"]["service"] == "platform"
+
+
 def test_platform_rules_one_alert_per_series():
     prod = {r.rule["labels"]["rule"]: r for r in platform_rules("prod", "lhf-prod--platform", "p")}
     assert set(prod) == {

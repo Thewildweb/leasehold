@@ -389,3 +389,15 @@ def test_missing_topic_is_an_error_not_a_zero():
     t = Target("g", "dev.other.v1", "jobs", 3600.0)
     r = LagMonitor(FakeAdmin(10, 0), [t]).measure()
     assert t in r.errors and not r.readings
+
+
+def test_monitor_settings():
+    from leasehold.api.settings import Settings
+
+    base = {"LEASEHOLD_ENV": "dev", "LEASEHOLD_DSN": "d", "LEASEHOLD_SERVICES": "/s"}
+    s = Settings.from_env(base)
+    assert s.monitor_services is None and s.paused_runs == frozenset()
+    s = Settings.from_env(
+        base | {"LEASEHOLD_MONITOR_SERVICES": "a, b", "LEASEHOLD_PAUSED_RUNS": "a.planner"}
+    )
+    assert s.monitor_services == {"a", "b"} and s.paused_runs == {"a.planner"}

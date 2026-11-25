@@ -857,6 +857,16 @@ def create_app(
             finally:
                 await conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (key,))
 
+    # The specs of every service are in the image; only the deployed ones have topics.
+    monitored = [
+        s
+        for s in registry.specs.values()
+        if settings.monitor_services is None or s.name in settings.monitor_services
+    ]
+    unknown = (settings.monitor_services or frozenset()) - set(registry.specs)
+    unknown |= settings.paused_runs - {f"{s}.{c}" for s, c in registry.components}
+    if unknown:
+        raise ValueError(f"monitoring settings name unknown services: {sorted(unknown)}")
     run_log = (
         RunLog(
             settings.clickhouse_url,
@@ -864,7 +874,11 @@ def create_app(
             settings.clickhouse_password,
             settings.logs_table,
             settings.env,
-            scheduled_jobs(registry.specs.values()),
+            [
+                j
+                for j in scheduled_jobs(monitored)
+                if f"{j.service}.{j.component}" not in settings.paused_runs
+            ],
         )
         if settings.clickhouse_url and settings.logs_table
         else None
@@ -885,7 +899,7 @@ def create_app(
             if st.last_success_s is not None:
                 metrics.run_success.labels(env, service, component).set(st.last_success_s)
 
-    lag_targets = kafka_lag.targets(registry.specs.values(), settings.env)
+    lag_targets = kafka_lag.targets(monitored, settings.env)
     lag_monitor = (
         kafka_lag.LagMonitor(
             admin_client(
@@ -894,7 +908,7 @@ def create_app(
                 settings.kafka_password,
             ),
             lag_targets,
-            kafka_lag.dead_letter_topics(registry.specs.values(), settings.env),
+            kafka_lag.dead_letter_topics(monitored, settings.env),
         )
         if settings.kafka_bootstrap and settings.kafka_password
         else None

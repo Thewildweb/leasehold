@@ -46,11 +46,11 @@ alerts don't go to a phone. Kafka's time retention is measured here; for topics 
 ``retention_bytes`` the size comes from the broker's JMX exporter (``kafka_log_log_size``).
 
 Every rule is labelled ``managed_by=leasehold``, ``env``, ``service``, ``rule``,
-``priority``, and ``component`` when it has one (platform rules: ``service=platform``
-and the series' own labels); ``priority: page`` adds
-``page="true"``, which Grafana's routing sends to a phone (prod only, outside this
-module). The annotation ``leasehold_hash`` records the rendered rule, so ``apply``
-updates a rule only when the hash changes.
+``priority``, and ``component`` when it has one. Platform rules have ``service=platform``,
+or the series' own ``service`` when they are about one, and the series' other labels.
+``priority: page`` adds ``page="true"``, which Grafana's routing sends to a phone (prod
+only, outside this module). The annotation ``leasehold_hash`` records the rendered rule, so
+``apply`` updates a rule only when the hash changes.
 """
 
 from __future__ import annotations
@@ -260,6 +260,7 @@ class _Builder:
         no_data: str = "OK",
         summary: str | None = None,
         extra_labels: dict[str, str] | None = None,
+        series_service: bool = False,
     ) -> None:
         service = self.spec.name if self.spec else PLATFORM
         labels = {
@@ -270,6 +271,8 @@ class _Builder:
             "priority": priority,
             **(extra_labels or {}),
         }
+        if series_service:
+            del labels["service"]
         if component:
             labels["component"] = component
         if priority == "page":
@@ -456,6 +459,10 @@ class PlatformRule:
     for_: timedelta | None = None
     owner_only: bool = False  # on tables every environment shares: prod only
     watchdog: str | None = None  # the label ``watchdog``
+    # The series' own ``service`` label is kept. A rule's label wins over a series' label
+    # of the same name, so with ``service=platform`` two services' components of one name
+    # would become one alert.
+    series_service: bool = False
 
 
 _ACTIVE = (
@@ -543,6 +550,7 @@ WATCHDOG_RULES: tuple[PlatformRule, ...] = (
         "'the previous process died while handling a batch' with the event.",
         for_=timedelta(minutes=10),
         watchdog="replay",
+        series_service=True,
     ),
     PlatformRule(
         "batch-killed",
@@ -555,6 +563,7 @@ WATCHDOG_RULES: tuple[PlatformRule, ...] = (
         "After 5 times the batch is handled one event at a time and the event that kills the "
         "process goes to the dead-letter topic.",
         watchdog="replay",
+        series_service=True,
     ),
     PlatformRule(
         "dead-letter",
@@ -566,6 +575,7 @@ WATCHDOG_RULES: tuple[PlatformRule, ...] = (
         "Events that killed their processor when handled alone. The message's headers say "
         "where each came from; kept for 30 days.",
         watchdog="replay",
+        series_service=True,
     ),
     PlatformRule(
         "batch-slow",
@@ -578,6 +588,7 @@ WATCHDOG_RULES: tuple[PlatformRule, ...] = (
         "Batches that finish slowly. One that doesn't finish is in the log ('a batch is slow').",
         for_=timedelta(minutes=15),
         watchdog="replay",
+        series_service=True,
     ),
     PlatformRule(
         "run-failed",
@@ -589,6 +600,7 @@ WATCHDOG_RULES: tuple[PlatformRule, ...] = (
         "Resolved by the next run that finishes. The run's log line is 'run failed'.",
         for_=timedelta(minutes=15),
         watchdog="runs",
+        series_service=True,
     ),
     PlatformRule(
         "run-overdue",
@@ -601,6 +613,7 @@ WATCHDOG_RULES: tuple[PlatformRule, ...] = (
         "failing, killed, or not started.",
         for_=timedelta(minutes=5),
         watchdog="runs",
+        series_service=True,
     ),
     PlatformRule(
         "runs-not-readable",
@@ -709,5 +722,6 @@ def platform_rules(env: str, folder_uid: str, prometheus_uid: str) -> list[RuleP
             continue
         data, cond = _series_rule(r.expr.format(env=env), prometheus_uid)
         b.add(r.name, r.title, data, cond, r.priority, r.for_, r.description, summary=r.summary,
-              extra_labels={"watchdog": r.watchdog} if r.watchdog else None)  # fmt: skip
+              extra_labels={"watchdog": r.watchdog} if r.watchdog else None,
+              series_service=r.series_service)  # fmt: skip
     return b.rules
