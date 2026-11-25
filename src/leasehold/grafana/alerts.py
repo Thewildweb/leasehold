@@ -492,6 +492,18 @@ _LOGS_FRESH = (
     ' and on () (time() - max(leasehold_logs_newest_row_timestamp_seconds{{env="{env}"}}) < 900)'
 )
 
+
+def _subject(aggregate: str, expr: str, *labels: str) -> str:
+    """An aggregation of control API metrics by the service (and component) they are
+    about. The scrape target has labels of the same names (the API itself), so Prometheus
+    stores the metric's own as ``exported_<label>``; the result has them as ``<label>``."""
+    out = f"{aggregate} by ({', '.join(f'exported_{x}' for x in labels)}) ({expr})"
+    for x in labels:
+        out = f'label_replace({out}, "{x}", "$1", "exported_{x}", "(.*)")'
+    # without the exported_* names, so the rule's series are labelled like the others
+    return f"max by ({', '.join(labels)}) ({out})"
+
+
 WATCHDOG_RULES: tuple[PlatformRule, ...] = (
     PlatformRule(
         "lag-retention-warning",
@@ -568,8 +580,13 @@ WATCHDOG_RULES: tuple[PlatformRule, ...] = (
     PlatformRule(
         "dead-letter",
         "event dead-lettered",
-        'sum by (service) (leasehold_dead_letters_total_offset{{env="{env}"}} - '
-        'min_over_time(leasehold_dead_letters_total_offset{{env="{env}"}}[1h])) > 0',
+        _subject(
+            "sum",
+            'leasehold_dead_letters_total_offset{{env="{env}"}} - '
+            'min_over_time(leasehold_dead_letters_total_offset{{env="{env}"}}[1h])',
+            "service",
+        )
+        + " > 0",
         "page",
         "{{ $labels.service }}: {{ $values.B.Value }} events moved to the dead-letter topic",
         "Events that killed their processor when handled alone. The message's headers say "
@@ -593,8 +610,11 @@ WATCHDOG_RULES: tuple[PlatformRule, ...] = (
     PlatformRule(
         "run-failed",
         "scheduled run failed",
-        "max by (service, component) ("
-        'leasehold_scheduled_last_run_failed{{env="{env}"}}) == 1' + _LOGS_FRESH,
+        _subject(
+            "max", 'leasehold_scheduled_last_run_failed{{env="{env}"}}', "service", "component"
+        )
+        + " == 1"
+        + _LOGS_FRESH,
         "warning",
         "{{ $labels.service }} {{ $labels.component }}: the last run failed",
         "Resolved by the next run that finishes. The run's log line is 'run failed'.",
@@ -605,8 +625,15 @@ WATCHDOG_RULES: tuple[PlatformRule, ...] = (
     PlatformRule(
         "run-overdue",
         "no successful scheduled run",
-        "time() - max by (service, component) ("
-        'leasehold_scheduled_success_due_timestamp_seconds{{env="{env}"}}) > 0' + _LOGS_FRESH,
+        "time() - "
+        + _subject(
+            "max",
+            'leasehold_scheduled_success_due_timestamp_seconds{{env="{env}"}}',
+            "service",
+            "component",
+        )
+        + " > 0"
+        + _LOGS_FRESH,
         "high",
         "{{ $labels.service }} {{ $labels.component }}: no successful run for too long",
         "Nothing finished in twice the schedule's longest gap plus the timeout (at least 30m): "
