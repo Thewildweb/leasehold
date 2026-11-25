@@ -9,7 +9,8 @@ dataset's named collection. One run:
 2. **Another run?** A ``started`` row of this dataset younger than the timeout without
    an end: exit 0.
 3. **Clean up** what a crashed run left: ``_staging_*`` tables of the dataset's tables,
-   and partitions of snapshots that never became current.
+   and partitions of snapshots that never became current. What belongs to a live run
+   (``started``, no end, younger than the timeout) stays.
 4. **Find work:** the complete manifests in the bucket newer than the current snapshot,
    not failed ``max_attempts`` times. A dataset with only replace tables loads the
    newest. One with append tables loads them in order, so a snapshot that fails holds
@@ -178,6 +179,17 @@ class Loader:
         )
         return {r[0]: int(r[1]) for r in rows}
 
+    def empty_tables(self, snapshot: str) -> set[str]:
+        """The tables the snapshot's latest ``current`` row recorded with 0 rows: they
+        have no partition. A table the row doesn't name isn't one of them."""
+        rows = self.ch.rows(
+            "SELECT arrayJoin(mapKeys(mapFilter((k, v) -> v = 0, r))) FROM ("
+            f"SELECT argMax(rows, at) AS r FROM {self.loads} "
+            f"WHERE dataset = {_q(self.s.dataset)} AND snapshot = {_q(snapshot)} "
+            "AND status = 'current')"
+        )
+        return {r[0] for r in rows}
+
     def partitions(self, table: str) -> set[str]:
         st = naming.snapshot_table(table)
         rows = self.ch.rows(
@@ -189,27 +201,48 @@ class Loader:
     # --- steps --------------------------------------------------------------------------
 
     def other_run_active(self) -> bool:
-        n = self._scalar(
-            f"SELECT count() FROM (SELECT run_id, groupArray(status) AS s, min(at) AS t "
-            f"FROM {self.loads} WHERE dataset = {_q(self.s.dataset)} "
-            f"AND at > now64(3, 'UTC') - INTERVAL {int(self.s.timeout_s)} SECOND "
-            "GROUP BY run_id) WHERE has(s, 'started') AND NOT hasAny(s, ['current', 'failed'])"
+        return any(dataset == self.s.dataset for dataset, _, _ in self.live_loads())
+
+    def live_loads(self) -> set[tuple[str, str, str]]:
+        """(dataset, run id, snapshot) of every load in this database that started within
+        the timeout and has no end. Per snapshot: one run can load several."""
+        rows = self.ch.rows(
+            f"SELECT dataset, run_id, snapshot FROM {self.loads} "
+            f"WHERE at > now64(3, 'UTC') - INTERVAL {int(self.s.timeout_s)} SECOND "
+            "GROUP BY dataset, run_id, snapshot "
+            "HAVING countIf(status = 'started') > countIf(status IN ('current', 'failed'))"
         )
-        return int(n or 0) > 0
+        return {(r[0], r[1], r[2]) for r in rows}
 
     def clean_up(self) -> None:
+        # What exists first, then the live loads, then what was ever current: a load is
+        # recorded before it creates anything and becomes current before it stops being
+        # live, so a load that starts or ends in between keeps its tables and partitions.
         prefix = naming.SNAPSHOT_STAGING_PREFIX
-        for t in self.s.tables:
-            rows = self.ch.rows(
-                f"SELECT name FROM system.tables WHERE database = {_q(self.s.database)} "
-                f"AND startsWith(name, {_q(f'{prefix}{t}_')})"
-            )
-            for (name,) in rows:
+        staging = {
+            t: [
+                name
+                for (name,) in self.ch.rows(
+                    f"SELECT name FROM system.tables WHERE database = {_q(self.s.database)} "
+                    f"AND startsWith(name, {_q(f'{prefix}{t}_')})"
+                )
+            ]
+            for t in self.s.tables
+        }
+        partitions = {t: self.partitions(t) for t in self.s.tables}
+        live = self.live_loads()
+        # Any dataset's run: a table name can be the prefix of another dataset's.
+        live_runs = tuple(f"_{run_id}" for _, run_id, _ in live)
+        live_snapshots = {sid for dataset, _, sid in live if dataset == self.s.dataset}
+        for names in staging.values():
+            for name in names:
+                if live_runs and name.endswith(live_runs):
+                    continue
                 log.info("dropping a staging table left behind", extra={"fields": {"table": name}})
                 self.ch.execute(f"DROP TABLE IF EXISTS {self.s.database}.{name} SYNC")
         ever = self.ever_current()
         for t in self.s.tables:
-            for p in self.partitions(t) - ever:
+            for p in partitions[t] - live_snapshots - ever:
                 log.info(
                     "dropping a partition that never became current",
                     extra={"fields": {"table": t, "snapshot": p}},
@@ -320,7 +353,7 @@ class Loader:
             self.verify(m)
             rows: dict[str, int] = {}
             for t, spec in sorted(s.tables.items()):
-                staging = f"{s.database}.{naming.snapshot_staging_table(t, sid)}"
+                staging = f"{s.database}.{naming.snapshot_staging_table(t, sid, self.run_id)}"
                 self.ch.execute(f"DROP TABLE IF EXISTS {staging} SYNC")
                 self.ch.execute(
                     f"CREATE TABLE {staging} AS {s.database}.{naming.snapshot_table(t)}"
@@ -346,7 +379,7 @@ class Loader:
                 rows[t] = n
             self.check(rows, current)
             for t in sorted(s.tables):
-                staging = f"{s.database}.{naming.snapshot_staging_table(t, sid)}"
+                staging = f"{s.database}.{naming.snapshot_staging_table(t, sid, self.run_id)}"
                 self.ch.execute(
                     f"ALTER TABLE {s.database}.{naming.snapshot_table(t)} "
                     f"REPLACE PARTITION {_q(sid)} FROM {staging}"
@@ -395,6 +428,11 @@ class Loader:
                 )
         if sid in self.ever_current():
             return  # a reload of a snapshot that was current: its partitions stay
+        if any(
+            (dataset, snapshot) == (self.s.dataset, sid) and run_id != self.run_id
+            for dataset, run_id, snapshot in self.live_loads()
+        ):
+            return  # another run is loading it: the partitions may be its own
         for t in attached:
             try:
                 self._drop_partition(t, sid)
@@ -469,7 +507,8 @@ def rollback(ch: ClickHouse, s: Settings, to: str, loader: str = "") -> None:
     ld = Loader(ch, s, loader)
     if to not in ld.ever_current():
         raise LoadError(f"{to} was never current; load it instead")
-    missing = [t for t in s.tables if to not in ld.partitions(t)]
+    empty = ld.empty_tables(to)
+    missing = [t for t in s.tables if t not in empty and to not in ld.partitions(t)]
     if missing:
         raise LoadError(
             f"{to} is no longer kept in {', '.join(missing)}; load it again with "

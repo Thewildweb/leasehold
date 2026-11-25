@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from leasehold import steps
+from leasehold import naming, steps
 from leasehold.clickhouse.apply import ClickHouse, ClickHouseError
 from leasehold.nomad.apply import Nomad
 from leasehold.snapshots import loader as lh_loader
@@ -304,6 +304,112 @@ def test_load_check_switch_rollback(world):
     assert ld.run(force=True, snapshot="s6") == 0
     assert (ld.current(), ld.held()) == ("s6", "")
     ld.ch.close()
+
+
+def test_rollback_to_a_snapshot_with_an_empty_table(world):
+    name, base, ch, nomad = world
+    db = f"{ENV}_{name}"
+    spec = _spec(name)
+    _apply(spec, base)
+    ld = _loader(nomad, name, base, spec)
+    _publish(nomad, name, base, "s1", adressen=4, mutaties=0)
+    assert ld.run() == 0
+    _publish(nomad, name, base, "s2", adressen=5, mutaties=2)
+    assert ld.run() == 0
+    assert ld.partitions("mutaties") == {"s2"}  # an empty table has no partition
+    assert ld.empty_tables("s1") == {"mutaties"} and ld.empty_tables("s2") == set()
+
+    lh_loader.rollback(ch, ld.s, "s1")
+    assert ld.current() == "s1"
+    assert _count(ch, f"SELECT count() FROM {db}.adressen") == 4
+    assert _count(ch, f"SELECT count() FROM {db}.mutaties") == 0
+
+    # A table with recorded rows must still have its partition.
+    lh_loader.rollback(ch, ld.s, "s2")
+    ch.execute(f"ALTER TABLE {db}.adressen__snapshots DROP PARTITION 's1'")
+    with pytest.raises(lh_loader.LoadError, match="no longer kept in adressen"):
+        lh_loader.rollback(ch, ld.s, "s1")
+    ld.ch.close()
+
+
+def test_reload_of_the_same_snapshot_replaces_its_rows(world):
+    name, base, ch, nomad = world
+    db = f"{ENV}_{name}"
+    spec = _spec(name)
+    _apply(spec, base)
+    ld = _loader(nomad, name, base, spec)
+
+    def rows(table):
+        n = f"SELECT count(), uniqExact(snapshot, id) FROM {db}.{table}"
+        return [tuple(map(int, ch.rows(n)[0])) for n in (n, n + "__snapshots")]
+
+    _publish(nomad, name, base, "s1", adressen=4, mutaties=3)
+    assert ld.run() == 0
+    # The same files again: the same rows, once.
+    assert ld.run(force=True, snapshot="s1") == 0
+    assert rows("adressen") == [(4, 4)] * 2
+    assert rows("mutaties") == [(3, 3)] * 2
+    # A rollback to it and a reload.
+    _publish(nomad, name, base, "s2", adressen=4, mutaties=1)
+    assert ld.run() == 0
+    lh_loader.rollback(ch, ld.s, "s1")
+    assert ld.run(force=True, snapshot="s1") == 0
+    assert rows("adressen") == [(4, 4), (8, 8)]
+    assert rows("mutaties") == [(3, 3), (4, 4)]
+    # Published again with fewer rows, and none in mutaties: the old rows go.
+    _publish(nomad, name, base, "s1", adressen=3, mutaties=0)
+    assert ld.run(force=True, snapshot="s1") == 0
+    assert rows("adressen") == [(3, 3), (7, 7)]
+    assert rows("mutaties") == [(0, 0), (1, 1)]
+    assert ld.partitions("mutaties") == {"s2"}
+    ld.ch.close()
+
+
+def test_two_runs_leave_each_other_alone(world):
+    name, base, ch, nomad = world
+    db = f"{ENV}_{name}"
+    spec = _spec(name)
+    _apply(spec, base)
+    one, two = _loader(nomad, name, base, spec), _loader(nomad, name, base, spec)
+    _publish(nomad, name, base, "s1", adressen=4, mutaties=1)
+
+    # Run one has finished another snapshot and is loading s1: staging and a partition.
+    for status in ("started", "current"):
+        one._record("s0", status)
+    one._record("s1", "started")
+    assert two.other_run_active()
+    assert two.run(force=True) == 0
+    assert two.current() == "s0"  # nothing loaded
+    mine = naming.snapshot_staging_table("adressen", "s1", one.run_id)
+    ch.execute(f"CREATE TABLE {db}.{mine} AS {db}.adressen__snapshots")
+    stale = naming.snapshot_staging_table("adressen", "s1", "0" * 32)
+    ch.execute(f"CREATE TABLE {db}.{stale} AS {db}.adressen__snapshots")
+    ch.execute(f"INSERT INTO {db}.adressen__snapshots VALUES ('s1', 'x', '1234AB')")
+    ch.execute(f"INSERT INTO {db}.adressen__snapshots VALUES ('zz', 'x', '1234AB')")
+
+    def staging():
+        q = f"SELECT name FROM system.tables WHERE database = '{db}' AND name LIKE '\\_staging%'"
+        return {r[0] for r in ch.rows(q)}
+
+    two.clean_up()
+    assert staging() == {mine}
+    assert two.partitions("adressen") == {"s1"}
+    # Both passed the check at the same moment: run two's failure leaves run one's
+    # partition, its load doesn't touch run one's staging table.
+    two._record("s1", "started")
+    two._undo("s1", [], ["adressen"])
+    two._record("s1", "failed")
+    assert two.partitions("adressen") == {"s1"}
+    two.load(two.manifests()[0])
+    assert staging() == {mine}
+    assert _count(ch, f"SELECT count() FROM {db}.adressen") == 4
+    # Run one ends: its staging table is a leftover.
+    one._record("s1", "failed")
+    two.clean_up()
+    assert staging() == set()
+    assert two.partitions("adressen") == {"s1"}
+    one.ch.close()
+    two.ch.close()
 
 
 def test_clickhouse_reads_only_its_bucket(world):

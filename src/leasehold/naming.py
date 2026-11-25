@@ -325,12 +325,15 @@ def check_snapshot_id(snapshot: str) -> str:
     return snapshot
 
 
-def snapshot_staging_table(table: str, snapshot: str) -> str:
-    """Where one snapshot of a table is loaded before it is attached, e.g.
-    ``_staging_adressen_2026_11_08``. The loader's grants cover only this prefix."""
+def snapshot_staging_table(table: str, snapshot: str, run_id: str) -> str:
+    """Where one run loads one snapshot of a table before it is attached, e.g.
+    ``_staging_adressen_2026_11_08_<run id>``. The run id keeps two runs apart. The
+    loader's grants cover only this prefix."""
     _check(table, SNAPSHOT_TABLE_NAME_RE, "snapshot table name")
     sid = re.sub(r"[^0-9A-Za-z]", "_", check_snapshot_id(snapshot))
-    return f"{SNAPSHOT_STAGING_PREFIX}{table}_{sid}"
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise NamingError(f"invalid run id {run_id!r}: 32 hex digits")
+    return f"{SNAPSHOT_STAGING_PREFIX}{table}_{sid}_{run_id}"
 
 
 def snapshot_manifest_key(dataset: str, snapshot: str) -> str:
