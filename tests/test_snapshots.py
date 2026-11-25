@@ -144,7 +144,13 @@ def test_schema_errors(broken, message):
 def test_names():
     assert naming.snapshot_loader_component("bag") == "load-bag"
     assert naming.snapshot_table("adressen") == "adressen__snapshots"
-    assert naming.snapshot_staging_table("adressen", "2026-11-08") == "_staging_adressen_2026_11_08"
+    run = "0123456789abcdef" * 2
+    assert (
+        naming.snapshot_staging_table("adressen", "2026-11-08", run)
+        == f"_staging_adressen_2026_11_08_{run}"
+    )
+    with pytest.raises(naming.NamingError):
+        naming.snapshot_staging_table("adressen", "2026-11-08", "x")
     assert naming.snapshot_manifest_key("bag", "2026-11-08") == "bag/2026-11-08/manifest.json"
     assert naming.snapshot_loader_user("dev", "bag", "bag") == "dev.bag.load-bag"
     assert naming.clickhouse_definer_user("prod", "bag") == "bag.clickhouse.definer"
