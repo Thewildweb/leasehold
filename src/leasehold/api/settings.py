@@ -48,6 +48,10 @@ Consumer lag (``leasehold.kafka.lag``), off without a bootstrap address and a pa
     LEASEHOLD_KAFKA_BOOTSTRAP
     LEASEHOLD_KAFKA_USERNAME       (default: from naming, <env>.leasehold.monitor)
     LEASEHOLD_KAFKA_PASSWORD
+    LEASEHOLD_MONITOR_SERVICES     services deployed in this environment, comma-separated:
+                                   only these are measured (default: every service)
+    LEASEHOLD_PAUSED_RUNS          scheduled components that are stopped on purpose
+                                   (service.component, comma-separated): not checked
     LEASEHOLD_LAG_INTERVAL         seconds between measurements (default: 60)
 """
 
@@ -62,6 +66,10 @@ from leasehold import naming
 
 class SettingsError(ValueError):
     pass
+
+
+def _names(value: str | None) -> frozenset[str]:
+    return frozenset(x.strip() for x in (value or "").split(",") if x.strip())
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,8 @@ class Settings:
     kafka_username: str | None = None
     kafka_password: str | None = None
     lag_interval: float = 60.0
+    monitor_services: frozenset[str] | None = None
+    paused_runs: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
@@ -125,5 +135,7 @@ class Settings:
             kafka_bootstrap=e.get("LEASEHOLD_KAFKA_BOOTSTRAP") or None,
             kafka_username=e.get("LEASEHOLD_KAFKA_USERNAME") or None,
             kafka_password=e.get("LEASEHOLD_KAFKA_PASSWORD") or None,
+            monitor_services=_names(e.get("LEASEHOLD_MONITOR_SERVICES")) or None,
+            paused_runs=_names(e.get("LEASEHOLD_PAUSED_RUNS")),
             lag_interval=float(e.get("LEASEHOLD_LAG_INTERVAL", "60")),
         )
