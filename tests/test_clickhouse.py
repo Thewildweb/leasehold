@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from leasehold import clickhouse
-from leasehold.clickhouse.apply import apply, diff
+from leasehold.clickhouse.apply import apply, apply_derived, diff
 from leasehold.clickhouse.schema import SchemaFileError, parse, parse_derived, split_statements
 from leasehold.spec import SpecError, load_spec
 
@@ -294,6 +294,8 @@ def test_derived_plan_and_diff(derived_spec):
     (c,) = d.derived
     assert c.create_table and c.recreate_view
     apply(ch, d, "kafka:9092", {"dev.certwatch.clickhouse": "pw"})
+    assert not any("counts" in sql for sql in ch.executed)  # only after the snapshot views
+    apply_derived(ch, d)
     assert ch.executed[-2:] == ["DROP TABLE IF EXISTS dev_certwatch.counts_refresh SYNC", view]
 
     # Unchanged: nothing to do. A new interval recreates only the view.
