@@ -254,7 +254,10 @@ def apply(
     passwords: dict[str, str],
     prune: bool = False,
 ) -> None:
-    """``passwords``: per sink principal."""
+    """Databases, sinks and, with ``prune``, stale objects. Derived tables come last in the
+    step (``apply_derived``): their SELECTs may read snapshot views.
+
+    ``passwords``: per sink principal."""
     for db in d.new_databases:
         ch.execute(db.create_sql())
     for db in d.errors_tables:
@@ -275,6 +278,17 @@ def apply(
             )
             ch.execute(s.create_mv_sql(c._pipeline_comment))
             ch.execute(s.create_errors_mv_sql(c._pipeline_comment))
+    if prune:
+        # Views before Kafka tables; target tables are never dropped here.
+        stale = sorted(d.stale, key=lambda x: (x[1] != "MaterializedView", x[0]))
+        for name, engine in stale:
+            if engine in ("MaterializedView", "Kafka"):
+                ch.execute(f"DROP TABLE IF EXISTS {name} SYNC")
+
+
+def apply_derived(ch: ClickHouse, d: ClickHouseDiff) -> None:
+    """After the sinks and the snapshot views: ClickHouse refuses a refresh view whose SELECT
+    names a table that doesn't exist."""
     for c in d.derived:
         dp = c.derived
         if c.create_table:
@@ -284,9 +298,3 @@ def apply(
         if c.recreate_view:
             ch.execute(f"DROP TABLE IF EXISTS {dp.view} SYNC")
             ch.execute(dp.create_view_sql())
-    if prune:
-        # Views before Kafka tables; target tables are never dropped here.
-        stale = sorted(d.stale, key=lambda x: (x[1] != "MaterializedView", x[0]))
-        for name, engine in stale:
-            if engine in ("MaterializedView", "Kafka"):
-                ch.execute(f"DROP TABLE IF EXISTS {name} SYNC")

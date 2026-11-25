@@ -424,3 +424,32 @@ def test_clickhouse_reads_only_its_bucket(world):
             "format = 'One')"
         )
     ld.ch.close()
+
+
+DERIVED = """
+CREATE TABLE {table} (postcode String, n UInt64) ENGINE = MergeTree ORDER BY postcode;
+SELECT postcode, count() AS n FROM {database}.adressen GROUP BY postcode;
+"""
+
+
+def test_derived_table_reads_a_snapshot_view(world):
+    """In one apply on an empty environment: the snapshot view exists before the derived
+    table's refresh view."""
+    name, base, ch, nomad = world
+    db = f"{ENV}_{name}"
+    (base / "counts.sql").write_text(DERIVED)
+    spec = _spec(name)
+    data = spec.model_dump(mode="json", by_alias=True, exclude_unset=True)
+    data["clickhouse"]["derived"] = {"counts": {"schema_file": "counts.sql", "refresh": "1h"}}
+    spec = ServiceSpec.model_validate(data)
+
+    s, c, out = _apply(spec, base)
+    assert c.applied, out
+    s, c, out = _apply(spec, base, yes=False)
+    assert (s.changes, c.changes) == (0, 0), out
+
+    _publish(nomad, name, base, "s1", adressen=4, mutaties=1)
+    assert _loader(nomad, name, base, spec).run() == 0
+    ch.execute(f"SYSTEM REFRESH VIEW {db}.counts_refresh")
+    ch.execute(f"SYSTEM WAIT VIEW {db}.counts_refresh")
+    assert ch.rows(f"SELECT postcode, n FROM {db}.counts") == [["1234AB", "4"]]

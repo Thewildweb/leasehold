@@ -214,7 +214,7 @@ def clickhouse(
     """
     from leasehold import clickhouse as lh_clickhouse
     from leasehold.clickhouse import users as lh_users
-    from leasehold.clickhouse.apply import ClickHouse, apply, diff
+    from leasehold.clickhouse.apply import ClickHouse, apply, apply_derived, diff
     from leasehold.nomad.apply import Nomad
     from leasehold.snapshots import apply as lh_snapshots_apply
     from leasehold.snapshots import plan as lh_snapshots_plan
@@ -303,6 +303,7 @@ def clickhouse(
                 ch, nomad, sd, loader_profile_missing and bool(snapshot_plans),
                 clickhouse_endpoint=clickhouse_endpoint, prune=prune,
             )  # fmt: skip
+            apply_derived(ch, d)
             r.applied = True
     finally:
         ch.close()
