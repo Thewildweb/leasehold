@@ -215,5 +215,12 @@ class Response(BaseModel):
         description="body left empty because the event would exceed the size limit; "
         "body_b64 has the bytes",
     )
+    body_ref_event: str = Field(
+        default="",
+        description="Event id of an earlier response with the same body bytes, status and "
+        "final_url; body and body_b64 are then empty, body_bytes and body_sha256 describe "
+        "the referenced body. Readers that judge the body (the classifier) skip such "
+        "events and use the referenced event's result; '' when the body is in this event",
+    )
 
     hops: list[Hop] = Field(default_factory=list)
