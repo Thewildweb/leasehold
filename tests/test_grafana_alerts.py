@@ -221,3 +221,15 @@ def test_plan_puts_platform_rules_in_the_platform_folder():
     platform = [r for r in p.rules if r.service == "platform"]
     assert platform and {r.folder_uid for r in platform} == {"lhf-prod--platform"}
     assert any(r.service == "jobs" for r in p.rules)
+
+
+def test_control_api_rules_group_by_the_metrics_own_labels():
+    """Prometheus stores them as exported_*: the scrape target has the same names."""
+    from leasehold.grafana.alerts import WATCHDOG_RULES
+
+    own = ("leasehold_scheduled_", "leasehold_dead_letters_")
+    rules = [r for r in WATCHDOG_RULES if any(m in r.expr for m in own)]
+    assert len(rules) == 3
+    for r in rules:
+        assert "by (exported_service" in r.expr
+        assert '"service", "$1", "exported_service"' in r.expr
