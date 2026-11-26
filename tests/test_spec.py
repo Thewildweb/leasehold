@@ -555,6 +555,18 @@ def test_sandbox_refuses_bad_sizes(certwatch, size):
     assert "expected a size" in errors_of(with_sandbox(certwatch, sb))
 
 
+def test_sandbox_tasks_need_their_own_user_and_group(certwatch):
+    sb = sandbox_block()
+    sb["tasks"]["browser"]["user"] = 10001
+    assert "share user 10001" in errors_of(with_sandbox(certwatch, sb))
+    sb = sandbox_block()
+    sb["tasks"]["gateway"]["group"] = 10000  # the component's user, so its group
+    assert "share group 10000" in errors_of(with_sandbox(certwatch, sb))
+    sb = sandbox_block()
+    sb["tasks"]["browser"]["group"] = 20001  # its own: fine
+    ServiceSpec.model_validate(with_sandbox(certwatch, sb))
+
+
 def test_sandbox_refuses_reserved_and_clashing_task_names(certwatch):
     sb = sandbox_block()
     sb["tasks"]["netfilter"] = sb["tasks"].pop("gateway")

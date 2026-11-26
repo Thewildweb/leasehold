@@ -267,6 +267,21 @@ class Sandbox(_RunsAs):
                 "a sandbox with extra tasks needs a netfilter task: bridge mode alone "
                 "doesn't keep them off the host, the private network or the internet"
             )
+        # The packet filter tells the tasks apart by user, and files and sockets by user
+        # and group: two tasks sharing either would share what the other may reach.
+        runs_as = {"(the component)": self} | dict(self.tasks)
+        for what, ids in (
+            ("user", {n: t.user for n, t in runs_as.items()}),
+            ("group", {n: t.group if t.group is not None else t.user for n, t in runs_as.items()}),
+        ):
+            seen: dict[int, str] = {}
+            for name, i in ids.items():
+                if i in seen:
+                    raise ValueError(
+                        f"sandbox tasks {seen[i]} and {name} share {what} {i}: each task "
+                        f"needs its own {what}"
+                    )
+                seen[i] = name
         return self
 
 
