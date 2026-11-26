@@ -256,6 +256,18 @@ def _cmd_exit_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_gateway_serve(args: argparse.Namespace) -> int:
+    from leasehold.gateway.server import GatewaySettings, serve
+
+    try:
+        settings = GatewaySettings.from_env()
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+    serve(settings)
+    return 0
+
+
 def _cmd_exit_key(args: argparse.Namespace) -> int:
     import ipaddress
 
@@ -1000,6 +1012,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     exk.add_argument("--egress", required=True, help="the exit's registry address")
     exk.set_defaults(func=_cmd_exit_key)
+
+    gw = sub.add_parser(
+        "gateway", help="the local CONNECT proxy between a sandboxed browser and the exits"
+    )
+    gwsub = gw.add_subparsers(dest="gateway_command", required=True)
+    gws = gwsub.add_parser(
+        "serve",
+        help="serve on LEASEHOLD_GATEWAY_LISTEN with the control socket on "
+        "LEASEHOLD_GATEWAY_CONTROL (settings from the environment, see leasehold.gateway.server)",
+    )
+    gws.set_defaults(func=_cmd_gateway_serve)
 
     gr = sub.add_parser("grafana", help="dashboards derived from service.yml")
     grsub = gr.add_subparsers(dest="grafana_command", required=True)
