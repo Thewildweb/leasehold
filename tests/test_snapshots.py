@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -10,15 +12,19 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from leasehold import naming
+from leasehold.clickhouse.apply import ClickHouseError
+from leasehold.clickhouse.plan import _quote, marker_of
 from leasehold.clickhouse.schema import SchemaFileError
 from leasehold.nomad.render import Platform
 from leasehold.nomad.render import plan as nomad_plan
+from leasehold.snapshots import apply as snap_apply
 from leasehold.snapshots import plan as sp
 from leasehold.snapshots.loader import LoadError, Settings, Window, _brace
 from leasehold.snapshots.manifest import Manifest, SnapshotWriter
 from leasehold.snapshots.schema import parse_snapshot
 from leasehold.spec import ServiceSpec
 from leasehold.storage import plan as storage_plan
+from leasehold.storage.plan import ACCESS_KEY, SECRET_KEY
 
 TABLE_SQL = """
 CREATE TABLE {table}
@@ -382,3 +388,160 @@ def test_disk_becomes_ephemeral_disk(base):
     jobs = {j.job_id: j for j in nomad_plan([spec], "dev", "0123abc", platform).jobs}
     assert jobs["bag-extract"].job["TaskGroups"][0]["EphemeralDisk"] == {"SizeMB": 30000}
     assert "EphemeralDisk" not in jobs["bag-load-bag"].job["TaskGroups"][0]
+
+
+# --- apply: named collections ------------------------------------------------------------------
+
+
+class FakeCH:
+    """Enough of ClickHouse for ``snapshots.apply``: system tables, and CREATE NAMED
+    COLLECTION refused for a name that exists, as ClickHouse does (Code 670)."""
+
+    def __init__(self, collections=(), tables=None):
+        self.collections = set(collections)
+        self.tables_by_db = tables or {}
+        self.executed: list[str] = []
+
+    def rows(self, sql):
+        if "system.named_collections" in sql:
+            return [[c] for c in sorted(self.collections)]
+        return []
+
+    def database_exists(self, db):
+        return db in self.tables_by_db
+
+    def tables(self, db):
+        return dict(self.tables_by_db.get(db, {}))
+
+    def execute(self, sql, secret=None):
+        self.executed.append(sql)
+        m = re.match(r"CREATE NAMED COLLECTION `([^`]+)`", sql)
+        if m:
+            if m[1] in self.collections:
+                raise ClickHouseError("ClickHouse 500: Code: 670. NAMED_COLLECTION_ALREADY_EXISTS")
+            self.collections.add(m[1])
+        return ""
+
+
+class FakeVars:
+    def __init__(self, vars=None):
+        self.vars = vars or {}
+        self.puts: list[tuple[str, dict]] = []
+
+    def var_get(self, path, namespace):
+        return self.vars.get(path)
+
+    def var_put(self, path, namespace, items, modify_index):
+        self.puts.append((path, items))
+        self.vars[path] = {"Items": items, "ModifyIndex": modify_index + 1}
+
+
+ENDPOINT = "http://minio:9000"
+
+
+@pytest.fixture
+def two_datasets() -> ServiceSpec:
+    d = spec_dict()
+    second = copy.deepcopy(d["snapshots"]["bag"])
+    second["tables"] = {"panden": {"schema_file": "adressen.sql"}}
+    second["checks"] = []
+    d["snapshots"]["bag2"] = second
+    return ServiceSpec.model_validate(d)
+
+
+def _storage(p, **extra) -> FakeVars:
+    items = {ACCESS_KEY: "key", SECRET_KEY: "secret"} | extra
+    return FakeVars({p.storage_variable: {"Items": items, "ModifyIndex": 3}})
+
+
+def _diff(ch, nomad, plans):
+    return snap_apply.diff(
+        ch, nomad, plans, env="dev", services=["bag"], clickhouse_endpoint=ENDPOINT
+    )
+
+
+def test_one_collection_for_datasets_on_one_bucket(two_datasets, base):
+    plans = sp.plan([(two_datasets, base)], "dev")
+    (p,) = plans
+    assert {dp.collection for dp in p.datasets} == {"leasehold_dev_bag_snapshots"}
+    ch, nomad = FakeCH(), _storage(p)
+    d, profile_missing = _diff(ch, nomad, plans)
+    lines = [line for c in d.changes for line in c.lines()]
+    assert [x for x in lines if x.startswith("named collection")] == [
+        "named collection leasehold_dev_bag_snapshots: create"
+    ]
+    snap_apply.apply(ch, nomad, d, profile_missing, clickhouse_endpoint=ENDPOINT)
+    assert sum(x.startswith("CREATE NAMED COLLECTION") for x in ch.executed) == 1
+    storage_puts = [items for path, items in nomad.puts if path == p.storage_variable]
+    assert len(storage_puts) == 1
+    url = sp.collection_url(ENDPOINT, "dev-bag-snapshots")
+    fp = sp.collection_fingerprint("leasehold_dev_bag_snapshots", url, "key", "secret")
+    assert storage_puts[0]["clickhouse_collection_leasehold_dev_bag_snapshots"] == fp
+
+    # Planned again with the collection in place and its fingerprint stored: nothing.
+    d, _ = _diff(ch, nomad, plans)
+    assert not any(c.collections for c in d.changes)
+
+
+def test_changed_collection_is_altered_once(two_datasets, base):
+    plans = sp.plan([(two_datasets, base)], "dev")
+    (p,) = plans
+    ch = FakeCH(collections={"leasehold_dev_bag_snapshots"})
+    nomad = _storage(p, clickhouse_collection_leasehold_dev_bag_snapshots="old")
+    d, profile_missing = _diff(ch, nomad, plans)
+    lines = [line for c in d.changes for line in c.lines()]
+    assert [x for x in lines if x.startswith("named collection")] == [
+        "named collection leasehold_dev_bag_snapshots: update"
+    ]
+    snap_apply.apply(ch, nomad, d, profile_missing, clickhouse_endpoint=ENDPOINT)
+    assert [
+        x.split(" SET ")[0] for x in ch.executed if x.startswith(("CREATE NAMED", "ALTER NAMED"))
+    ] == ["ALTER NAMED COLLECTION `leasehold_dev_bag_snapshots`"]
+    assert len([1 for path, _ in nomad.puts if path == p.storage_variable]) == 1
+
+
+# --- apply: the shared view's comment ----------------------------------------------------------
+
+
+def _as_applied(p) -> dict:
+    """The service's database as apply leaves it."""
+    tables = {
+        "snapshot_loads": ("MergeTree", "leasehold: snapshot loads"),
+        "snapshot_current": ("View", p.current_comment()),
+    }
+    for dp in p.datasets:
+        for t in dp.tables:
+            tables[t.storage_table.split(".", 1)[1]] = ("MergeTree", t.storage_comment())
+            tables[t.name] = ("View", t.view_comment(p.definer))
+    return {p.database: tables}
+
+
+def test_shared_view_comment_has_the_description(base):
+    d = spec_dict()
+    d["clickhouse"]["shared"]["adressen"]["description"] = "Bron: Kadaster BAG (CC0), 'x'"
+    spec = ServiceSpec.model_validate(d)
+    plans = sp.plan([(spec, base)], "dev")
+    (p,) = plans
+    tables = {t.name: t for t in p.datasets[0].tables}
+    comment = tables["adressen"].view_comment(p.definer)
+    assert comment.startswith("Bron: Kadaster BAG (CC0), 'x'\nleasehold: snapshot=bag view=")
+    assert marker_of(comment) == comment.split("\n")[-1]
+    assert tables["mutaties"].view_comment(p.definer).startswith("leasehold: ")  # not shared
+
+    ch, nomad = FakeCH(), _storage(p)
+    diff_, missing = _diff(ch, nomad, plans)
+    snap_apply.apply(ch, nomad, diff_, missing, clickhouse_endpoint=ENDPOINT)
+    (create,) = [x for x in ch.executed if x.startswith("CREATE VIEW dev_bag.adressen ")]
+    assert f"COMMENT {_quote(comment)}\nAS SELECT" in create
+
+    # Planned again as apply left it: no view to recreate.
+    diff_, _ = _diff(FakeCH(tables=_as_applied(p)), nomad, plans)
+    assert not any(dc.views for c in diff_.changes for dc in c.datasets)
+    assert not diff_.warnings and not diff_.skipped
+
+    # A changed description recreates only that view.
+    d["clickhouse"]["shared"]["adressen"]["description"] = "Bron: Kadaster BAG (CC0) v2"
+    changed = sp.plan([(ServiceSpec.model_validate(d), base)], "dev")
+    diff_, _ = _diff(FakeCH(tables=_as_applied(p)), nomad, changed)
+    views = [t.view for c in diff_.changes for dc in c.datasets for t in dc.views]
+    assert views == ["dev_bag.adressen"]

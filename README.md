@@ -32,6 +32,7 @@ Stack: Python 3.12, Postgres, Kafka, ClickHouse, Grafana, Nomad, MinIO.
 | `src/leasehold/{kafka,frontier,storage,clickhouse,grafana,nomad}` | one apply step each |
 | `src/leasehold/egress` | egress addresses, providers and budgets, shared by all environments; provider tagging for planners |
 | `src/leasehold/agent` | the egress agent: one per machine and environment, the only process there that talks to the dispatcher |
+| `src/leasehold/exit` | the registry exit: a CONNECT proxy on a VPS for target leases routed through its address, with offline exit tokens |
 | `src/leasehold/archive` | archive sinks: a topic to Parquet files in a bucket |
 | `src/leasehold/snapshots` | snapshot datasets: files in a bucket that ClickHouse loads, the manifest, the loader |
 | `src/leasehold/mocks` | a mock CT log for tests and the dev stack |
@@ -67,7 +68,10 @@ encrypted with a key only the control API has (`LEASEHOLD_SECRETS_KEY`). A task 
 proxies only through its `egress:` block in `service.yml`: tiers in escalation order
 (`datacenter`, `isp`, `residential`, `mobile`), each proxy tier naming the accounts or
 pools it may use. A block moves a target to the next tier; a task type without
-`datacenter` never reaches a target from our own addresses. See `leasehold.egress.tiers`,
+`datacenter` never reaches a target from our own addresses. A task type with
+`datacenter_via: exit` reaches the datacenter tier through the exits of registry egresses
+(`exit: {endpoint: ...}` in `registry.yml`, `leasehold exit serve` on the VPS) instead of
+the worker's own address: for workers that have none, such as a sandboxed browser. See `leasehold.egress.tiers`,
 `leasehold.egress.proxies` and `leasehold.runtime.proxy`. An account is drained or enabled only
 with a limit (`--cap-gb`, or one its usage API reports); `leasehold proxy account poll`
 reads the usage API once while the account is still disabled. Account states, quota warnings and
@@ -197,7 +201,7 @@ components:
   extract: { kind: scheduled, ..., writes_buckets: [snapshots] }
 clickhouse:
   database: registry
-  shared: { addresses: { description: "..." } }   # readers get the view
+  shared: { addresses: { description: "Source: ... (CC BY 4.0)" } }   # readers get the view
 snapshots:
   registry:                        # the dataset; its loader is the component load-registry
     bucket: snapshots
@@ -231,9 +235,12 @@ w.commit(source_date="2026-11-08")  # the manifest, last
 **What `apply` creates**, in the service's database: `<table>__snapshots` (one partition
 per kept snapshot), a view `<table>` that readers use (`SQL SECURITY DEFINER` as the
 service's definer user, so readers need a grant on the view only), `snapshot_loads` (one
-row per state change of a load) and `snapshot_current`. In object storage, a read-only
-user for ClickHouse, whose keys go into a named collection with the bucket's URL, none
-of them overridable. A loader user per dataset, limited to `_staging_*` tables, its
+row per state change of a load) and `snapshot_current`. A shared table's description
+(licence, attribution) is the first part of its view's comment, above the `leasehold:`
+marker line; shared sinks and derived tables carry it the same way. In object storage,
+a read-only user for ClickHouse, whose keys go into a named collection with the
+bucket's URL, none of them overridable; datasets on the same bucket share that
+collection. A loader user per dataset, limited to `_staging_*` tables, its
 `__snapshots` partitions, `snapshot_loads` and its named collection. A periodic job
 `<service>-load-<dataset>` that runs `leasehold snapshot load`.
 
@@ -267,6 +274,53 @@ that were never current. A snapshot rolled back from comes back only with
 `leasehold snapshot load --now --snapshot <id>`. The
 ClickHouse user that runs `apply` needs named collection control
 (`named_collection_control`; the dev stack sets it in `dev/clickhouse/`).
+
+## Sandboxed components
+
+A component that runs untrusted code (a browser) declares a `sandbox`. Its job's group
+then runs in its own network namespace (Nomad bridge mode; the tasks reach each other
+on 127.0.0.1), with the component's own task, the extra `tasks` and an optional
+`netfilter` prestart task:
+
+```yaml
+components:
+  render:
+    kind: task-worker
+    ...
+    sandbox:
+      user: 10000                  # the component's own task; group defaults to the user
+      seccomp: /etc/leasehold/seccomp/chromium.json   # on the Nomad client
+      tmpfs: { /tmp: 256M }
+      cores: 8                     # whole cores (Nomad `cores`), instead of `cpu`
+      netfilter:                   # prestart: installs the rules and exits
+        command: [/app/netfilter.sh, "10001", "20000"]
+      tasks:
+        gateway:
+          user: 10001
+          command: [/app/gateway, --listen, "127.0.0.1:3128"]
+          resources: { cpu: 500, memory: 256 }
+        browser:
+          user: 20000
+          image: ghcr.io/example/chromium:131.0   # default: the component's image
+          command: [chromium, --headless]
+          resources: { cpu: 2000, memory: 2048 }
+          shm_size: 2G
+          tmpfs: { /tmp: 1G, /home/pwuser: 512M }
+          runtime: runsc           # gVisor
+```
+
+Every task runs as its numeric `user:group` (never 0) with a read-only root file
+system, all capabilities dropped and `no-new-privileges`, plus its own `seccomp`,
+`tmpfs`, `shm_size`, `runtime` and `cores`. Sizes are `512K`, `256M`, `2G`. Only the
+component's own task gets the template with its secrets, the Nomad Variables and the
+workload identity (and the egress agent's socket, when it uses one); it is the group's
+leader, so the other tasks stop with it. Extra tasks get only their own `env`, which may
+not hold secrets, and no host volumes. `netfilter` runs as root with `NET_ADMIN` as its
+only capability; its rules come from the service (a script in its image and its
+arguments). No task declares capabilities, and every task in the group shares the
+allocation directory (`$NOMAD_ALLOC_DIR`). Bridge mode needs the CNI plugins on the
+Nomad clients, and the Docker plugin must allow `NET_ADMIN` (`allow_caps`) and each
+runtime used (`allow_runtimes`).
 
 ## License
 

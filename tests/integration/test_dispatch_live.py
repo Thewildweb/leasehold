@@ -275,6 +275,73 @@ def test_revoke_renew_and_release(setup):
     assert [t["target"] for t in g2.tasks] == ["192.0.2.71"]  # .70 is revoked until it expires
 
 
+def _ended_at(eg, target):
+    """The target lease row's expires_at, and the database's now()."""
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        q = sql.SQL("SELECT expires_at, now() FROM {e}.target_leases WHERE target = %s")
+        return conn.execute(q.format(e=sql.Identifier(eg)), (target,)).fetchone()
+
+
+def _give_back(d, env, egress, holder, g):
+    """The holder gives its tasks and target leases back."""
+    run(lambda c: Frontier(env).release(c, [_ref(t) for t in g.tasks]))
+    run(lambda c: d.renew(c, egress, holder, [], release=[t.lease_id for t in g.targets]))
+
+
+def test_next_lease_waits_one_interval_after_the_last(setup):
+    """Across holders and egresses: a lease on an ended row starts one interval (10 s)
+    after the old one ended."""
+    (env, _), eg = setup
+    upsert(env, [UpsertItem(f"n{i}.example", group="192.0.2.110") for i in range(9)])
+    d = dispatcher(env, eg)
+    g = lease(d, "192.0.2.1", "w1", limit=1)
+    assert g.targets[0].not_before is None  # never leased before
+    # More tasks on the live lease: the same lease, nothing to wait for.
+    g2 = lease(d, "192.0.2.1", "w1", limit=1)
+    assert g2.targets[0].lease_id == g.targets[0].lease_id
+    assert g2.targets[0].not_before is None
+    _give_back(d, env, "192.0.2.1", "w1", g)
+    _give_back(d, env, "192.0.2.1", "w1", g2)
+    released, _ = _ended_at(eg, "192.0.2.110")
+
+    # Another holder on another egress.
+    g = lease(d, "192.0.2.2", "w2", limit=1)
+    assert g.targets[0].lease_id != g2.targets[0].lease_id
+    assert g.targets[0].not_before == released + timedelta(seconds=10)
+    _give_back(d, env, "192.0.2.2", "w2", g)
+
+    # Ended longer ago than one interval: the time is in the past, no wait.
+    egress_sql(eg, "UPDATE {e}.target_leases SET expires_at = now() - interval '10 minutes'")
+    ended, _ = _ended_at(eg, "192.0.2.110")
+    g = lease(d, "192.0.2.1", "w1", limit=1)
+    _, now = _ended_at(eg, "192.0.2.110")
+    assert g.targets[0].not_before == ended + timedelta(seconds=10) < now
+
+
+def test_next_lease_after_the_cap_and_the_pair_budget_waits(setup):
+    """The same holder at its cap, then out of pair budget (per_hour 4) and moved to
+    another egress: each new lease starts one interval after the last ended."""
+    (env, _), eg = setup
+    upsert(env, [UpsertItem(f"m{i}.example", group="192.0.2.120") for i in range(9)])
+    d = dispatcher(env, eg)
+    g = lease(d, "192.0.2.1", "w1")
+    assert len(g.tasks) == 3 and g.targets[0].not_before is None  # the cap
+    assert lease(d, "192.0.2.1", "w1").tasks == []
+    _give_back(d, env, "192.0.2.1", "w1", g)
+    released, _ = _ended_at(eg, "192.0.2.120")
+
+    g = lease(d, "192.0.2.1", "w1")
+    assert len(g.tasks) == 1  # the pair budget's fourth request
+    assert g.targets[0].not_before == released + timedelta(seconds=10)
+    _give_back(d, env, "192.0.2.1", "w1", g)
+    released, _ = _ended_at(eg, "192.0.2.120")
+
+    assert lease(d, "192.0.2.1", "w1").tasks == []
+    g = lease(d, "192.0.2.2", "w1")
+    assert len(g.tasks) == 3
+    assert g.targets[0].not_before == released + timedelta(seconds=10)
+
+
 def test_sweep(setup):
     (env, _), eg = setup
     upsert(env, [UpsertItem("s.example", group="192.0.2.80")])
@@ -340,6 +407,7 @@ def test_api_target_path(api):
     body = r.json()
     (tl,) = body["targets"]
     assert tl["target"] == "192.0.2.90" and tl["interval_s"] == 10
+    assert tl["not_before"] is None  # never leased before
     assert [t["target_lease_id"] for t in body["tasks"]] == [tl["lease_id"]] * 2
 
     r = post(api, "worker", "/v1/targets/renew",

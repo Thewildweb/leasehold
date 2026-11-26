@@ -8,9 +8,11 @@
   definition changed (``CREATE OR REPLACE`` leaves the definer user with dependencies
   ClickHouse doesn't clear). Readers see an error for that moment.
 - **``snapshot_loads``** is created once and never changed or dropped.
-- **Named collection**: created when missing, altered when the bucket's URL or the
-  ClickHouse storage keys changed. ClickHouse doesn't show a collection's secrets, so
-  the fingerprint of what was set is kept in the keys' Nomad Variable.
+- **Named collection**: one per bucket, shared by the datasets on that bucket; planned
+  once per service and collection, not per dataset. Created when missing, altered when
+  the bucket's URL or the ClickHouse storage keys changed. ClickHouse doesn't show a
+  collection's secrets, so the fingerprint of what was set is kept in the keys' Nomad
+  Variable.
 - **Definer and loader users**: created when missing; the loader's password in its job's
   variable (``LEASEHOLD_CLICKHOUSE_USER`` / ``_PASSWORD``), its grants made to match.
 
@@ -23,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from leasehold.clickhouse.apply import ClickHouse
-from leasehold.clickhouse.plan import MARK, _quote
+from leasehold.clickhouse.plan import MARK, _quote, marker_of
 from leasehold.credentials import new_password
 from leasehold.naming import SNAPSHOT_STAGING_PREFIX
 from leasehold.nomad.apply import Nomad
@@ -54,7 +56,6 @@ class DatasetChange:
     create_tables: list[TablePlan] = field(default_factory=list)
     accept_tables: list[TablePlan] = field(default_factory=list)
     views: list[TablePlan] = field(default_factory=list)  # create or recreate
-    collection: str | None = None  # "create" | "update"
     user_create: bool = False
     user_password: bool = False
     grant: list[Grant] = field(default_factory=list)
@@ -67,8 +68,6 @@ class DatasetChange:
         out = [f"table    {t.storage_table}: create" for t in self.create_tables]
         out += [f"table    {t.storage_table}: accept changed table" for t in self.accept_tables]
         out += [f"view     {t.view}: create" for t in self.views]
-        if self.collection:
-            out.append(f"named collection {d.collection}: {self.collection}")
         what = (["create"] if self.user_create else []) + (
             ["new password"] if self.user_password else []
         )
@@ -90,6 +89,8 @@ class ServiceChange:
     current_view: bool = False
     definer_create: bool = False
     definer_grant: bool = False
+    # collection name → (bucket, "create" | "update"); several datasets may share one
+    collections: dict[str, tuple[str, str]] = field(default_factory=dict)
     datasets: list[DatasetChange] = field(default_factory=list)
     _storage_items: dict[str, str] = field(default_factory=dict, repr=False)
     _storage_index: int = 0
@@ -105,6 +106,8 @@ class ServiceChange:
             out.append(f"user     {s.definer}: create (definer of the snapshot views)")
         if self.definer_grant:
             out.append(f"user     {s.definer}: grant SELECT ON {s.database}.*")
+        for name, (_, action) in self.collections.items():
+            out.append(f"named collection {name}: {action}")
         for d in self.datasets:
             out += d.lines()
         return out
@@ -186,6 +189,7 @@ def diff(
         sc._storage_items = dict(storage_var.get("Items") or {})
         sc._storage_index = int(storage_var.get("ModifyIndex") or 0)
 
+        seen_collections: set[str] = set()
         for dp in sp.datasets:
             dc = DatasetChange(dp)
             skip = False
@@ -212,7 +216,7 @@ def diff(
                         skip = True
                 view = tables.get(t.name)
                 if view is None or view[1] != t.view_comment(sp.definer):
-                    if view is not None and not view[1].startswith(MARK):
+                    if view is not None and marker_of(view[1]) is None:
                         d.warnings.append(
                             f"{t.view} exists and wasn't created by leasehold; "
                             f"dataset {dp.dataset} skipped"
@@ -224,24 +228,18 @@ def diff(
                 d.skipped.append(f"{sp.service}.{dp.dataset}")
                 continue
 
-            if not clickhouse_endpoint:
+            if dp.collection in seen_collections:
+                pass  # planned with an earlier dataset on the same bucket
+            elif not clickhouse_endpoint:
                 d.warnings.append(
                     f"{sp.service}.{dp.dataset}: no storage endpoint for ClickHouse "
-                    "(storage.clickhouse_endpoint); named collection left out"
+                    f"(storage.clickhouse_endpoint); named collection {dp.collection} left out"
                 )
             else:
-                items = sc._storage_items
-                key, secret = items.get(ACCESS_KEY), items.get(SECRET_KEY)
-                url = collection_url(clickhouse_endpoint, dp.bucket)
-                if not key or not secret:
-                    dc.collection = "create" if dp.collection not in collections else "update"
-                    dc.collection += " (once the storage step has made the keys)"
-                else:
-                    fp = collection_fingerprint(dp.collection, url, key, secret)
-                    if dp.collection not in collections:
-                        dc.collection = "create"
-                    elif items.get(_fp_key(dp.collection)) != fp:
-                        dc.collection = "update"
+                action = _collection_action(sc._storage_items, dp, collections, clickhouse_endpoint)
+                if action:
+                    sc.collections[dp.collection] = (dp.bucket, action)
+            seen_collections.add(dp.collection)
 
             var = nomad.var_get(dp.loader_variable, dp.namespace)
             items = dict((var or {}).get("Items") or {})
@@ -264,6 +262,22 @@ def diff(
         u for u in _profile_users(ch) if u.startswith(managed) and u not in planned
     )
     return d, profile_missing
+
+
+def _collection_action(
+    items: dict[str, str], dp: DatasetPlan, existing: set[str], clickhouse_endpoint: str
+) -> str | None:
+    """``create``, ``update`` or None for the named collection of ``dp``'s bucket."""
+    key, secret = items.get(ACCESS_KEY), items.get(SECRET_KEY)
+    if not key or not secret:
+        action = "create" if dp.collection not in existing else "update"
+        return action + " (once the storage step has made the keys)"
+    if dp.collection not in existing:
+        return "create"
+    url = collection_url(clickhouse_endpoint, dp.bucket)
+    if items.get(_fp_key(dp.collection)) != collection_fingerprint(dp.collection, url, key, secret):
+        return "update"
+    return None
 
 
 def _grant_of(row: tuple) -> Grant:
@@ -301,8 +315,22 @@ def apply(
             ch.execute(f"GRANT SELECT ON {ident(sp.database)}.* TO {ident(sp.definer)}")
         storage_items = dict(sc._storage_items)
         storage_changed = False
+        key, secret = storage_items.get(ACCESS_KEY), storage_items.get(SECRET_KEY)
+        if sc.collections and clickhouse_endpoint and key and secret:
+            for name, (bucket, action) in sc.collections.items():
+                url = collection_url(clickhouse_endpoint, bucket)
+                kv = (
+                    f"url = {_quote(url)} NOT OVERRIDABLE, "
+                    f"access_key_id = {_quote(key)} NOT OVERRIDABLE, "
+                    f"secret_access_key = {_quote(secret)} NOT OVERRIDABLE"
+                )
+                if action.startswith("create"):
+                    ch.execute(f"CREATE NAMED COLLECTION {ident(name)} AS {kv}", secret=secret)
+                else:
+                    ch.execute(f"ALTER NAMED COLLECTION {ident(name)} SET {kv}", secret=secret)
+                storage_items[_fp_key(name)] = collection_fingerprint(name, url, key, secret)
+                storage_changed = True
         for dc in sc.datasets:
-            dp = dc.dataset
             for t in dc.create_tables:
                 ch.execute(t.create_storage_sql())
             for t in dc.accept_tables:
@@ -312,28 +340,6 @@ def apply(
             for t in dc.views:
                 ch.execute(f"DROP VIEW IF EXISTS {t.view} SYNC")
                 ch.execute(t.create_view_sql(sp.definer))
-            if dc.collection and clickhouse_endpoint:
-                key, secret = storage_items.get(ACCESS_KEY), storage_items.get(SECRET_KEY)
-                if key and secret:
-                    url = collection_url(clickhouse_endpoint, dp.bucket)
-                    kv = (
-                        f"url = {_quote(url)} NOT OVERRIDABLE, "
-                        f"access_key_id = {_quote(key)} NOT OVERRIDABLE, "
-                        f"secret_access_key = {_quote(secret)} NOT OVERRIDABLE"
-                    )
-                    verb = "CREATE" if dc.collection.startswith("create") else "ALTER"
-                    if verb == "CREATE":
-                        ch.execute(
-                            f"CREATE NAMED COLLECTION {ident(dp.collection)} AS {kv}", secret=secret
-                        )
-                    else:
-                        ch.execute(
-                            f"ALTER NAMED COLLECTION {ident(dp.collection)} SET {kv}", secret=secret
-                        )
-                    storage_items[_fp_key(dp.collection)] = collection_fingerprint(
-                        dp.collection, url, key, secret
-                    )
-                    storage_changed = True
             _apply_user(ch, nomad, dc)
         if storage_changed:
             nomad.var_put(

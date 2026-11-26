@@ -14,10 +14,13 @@ Per service with a ``clickhouse`` section, in database ``<env prefix><database>`
 - per derived table ``<name>``:
   - ``<name>``: the target table, from the schema file (as for sinks, never dropped);
   - ``<name>_refresh``: a refreshable materialized view that recomputes it every
-    ``refresh`` from the schema file's SELECT and replaces its contents.
+    ``refresh`` (shifted by ``offset`` when set) from the schema file's SELECT and
+    replaces its contents.
 
-Every object carries a comment starting with ``leasehold:``; ``apply`` uses it to
-find what it manages and to see what changed.
+Every object carries a marker comment starting with ``leasehold:``; ``apply`` uses it
+to find what it manages and to see what changed. A shared table
+(``clickhouse.shared``) has its description (licence, attribution) in the comment as
+well: the description first, then the marker on its own last line (``marker_of``).
 """
 
 from __future__ import annotations
@@ -35,6 +38,17 @@ ERRORS_TABLE = "sink_errors"
 ERRORS_TTL_DAYS = 30
 
 
+def with_description(marker: str, description: str | None) -> str:
+    """A comment: ``description`` first, then ``marker`` on its own line."""
+    return f"{description}\n{marker}" if description else marker
+
+
+def marker_of(comment: str) -> str | None:
+    """The leasehold marker of a comment (its last line), or None when it has none."""
+    last = comment.rsplit("\n", 1)[-1]
+    return last if last.startswith(MARK) else None
+
+
 @dataclass(frozen=True)
 class SinkPlan:
     service: str
@@ -47,6 +61,7 @@ class SinkPlan:
     namespace: str
     schema: SinkSchema
     consumers: int = 1
+    description: str | None = None  # clickhouse.shared, in the table's comment
 
     @property
     def table(self) -> str:
@@ -65,7 +80,11 @@ class SinkPlan:
         return f"{self.database}.{self.sink}_errors_mv"
 
     def table_comment(self) -> str:
+        """The marker: changes with the schema file's CREATE TABLE."""
         return f"{MARK} sink={self.sink} table={self.schema.table_hash()}"
+
+    def full_table_comment(self) -> str:
+        return with_description(self.table_comment(), self.description)
 
     def pipeline_comment(self, kafka_bootstrap: str, credential_version: str) -> str:
         """Changes whenever the Kafka table or a view must be recreated."""
@@ -85,7 +104,7 @@ class SinkPlan:
 
     def create_table_sql(self) -> str:
         sql = self.schema.create_table.replace(TABLE, self.table, 1)
-        return f"{sql}\nCOMMENT {_quote(self.table_comment())}"
+        return f"{sql}\nCOMMENT {_quote(self.full_table_comment())}"
 
     def create_kafka_sql(self, kafka_bootstrap: str, password: str, comment: str) -> str:
         settings = {
@@ -137,6 +156,8 @@ class DerivedPlan:
     database: str
     schema: SinkSchema
     refresh_seconds: int
+    offset_seconds: int | None = None
+    description: str | None = None  # clickhouse.shared, in the table's comment
 
     @property
     def table(self) -> str:
@@ -147,22 +168,31 @@ class DerivedPlan:
         return f"{self.database}.{self.name}_refresh"
 
     def table_comment(self) -> str:
+        """The marker: changes with the schema file's CREATE TABLE."""
         return f"{MARK} derived={self.name} table={self.schema.table_hash()}"
+
+    def full_table_comment(self) -> str:
+        return with_description(self.table_comment(), self.description)
 
     def view_comment(self) -> str:
         parts = [self.schema.select_hash(), str(self.refresh_seconds), "1"]
+        if self.offset_seconds is not None:  # only when set: views without one keep their hash
+            parts.append(f"offset={self.offset_seconds}")
         fp = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         return f"{MARK} derived={self.name} view={fp}"
 
     def create_table_sql(self) -> str:
         sql = self.schema.create_table.replace(TABLE, self.table, 1)
-        return f"{sql}\nCOMMENT {_quote(self.table_comment())}"
+        return f"{sql}\nCOMMENT {_quote(self.full_table_comment())}"
 
     def create_view_sql(self) -> str:
         select = self.schema.select.replace(DATABASE, self.database)
+        refresh = f"REFRESH EVERY {self.refresh_seconds} SECOND"
+        if self.offset_seconds is not None:
+            refresh += f" OFFSET {self.offset_seconds} SECOND"
         return (
             f"CREATE MATERIALIZED VIEW {self.view}\n"
-            f"REFRESH EVERY {self.refresh_seconds} SECOND TO {self.table}\n"
+            f"{refresh} TO {self.table}\n"
             f"COMMENT {_quote(self.view_comment())}\nAS {select}"
         )
 
@@ -220,6 +250,7 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
         ):
             continue
         db = naming.clickhouse_database(env, spec.clickhouse.database)
+        shared = spec.clickhouse.shared
         sinks = []
         for sname, sink in sorted(spec.sinks().items()):
             schema = parse((base / sink.schema_file).read_text())
@@ -235,6 +266,7 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
                     namespace=naming.nomad_namespace(env),
                     schema=schema,
                     consumers=sink.consumers,
+                    description=shared[sname].description if sname in shared else None,
                 )
             )
         derived = tuple(
@@ -244,6 +276,8 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
                 database=db,
                 schema=parse_derived((base / d.schema_file).read_text()),
                 refresh_seconds=int(d.refresh.total_seconds()),
+                offset_seconds=None if d.offset is None else int(d.offset.total_seconds()),
+                description=shared[dname].description if dname in shared else None,
             )
             for dname, d in sorted(spec.clickhouse.derived.items())
         )

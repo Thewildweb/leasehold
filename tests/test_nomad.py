@@ -422,3 +422,166 @@ def test_agent_socket_for_target_leasing_workers(spec):
         assert "Volumes" not in job["TaskGroups"][0]
         assert "VolumeMounts" not in _task(job)
         assert "LEASEHOLD_AGENT_SOCKET" not in _task(job)["Env"]
+
+
+# --- sandbox ---------------------------------------------------------------------------------
+
+
+def _sandboxed(spec, cname="worker"):
+    from test_spec import sandbox_block
+
+    from leasehold.spec import ServiceSpec
+
+    data = spec.model_dump(mode="json", exclude_none=True, by_alias=True)
+    data["components"][cname]["sandbox"] = sandbox_block()
+    return ServiceSpec.model_validate(data)
+
+
+HARDENED = {"readonly_rootfs": True, "cap_drop": ["ALL"]}
+
+
+def test_sandbox_group_and_main_task(spec):
+    job = render_job(_sandboxed(spec), "worker", "prod", SHA, PLATFORM).job
+    group = job["TaskGroups"][0]
+    assert group["Networks"] == [{"Mode": "bridge", "DynamicPorts": [{"Label": "http"}]}]
+    assert group["Services"][0]["PortLabel"] == "http"
+    assert [t["Name"] for t in group["Tasks"]] == ["worker", "netfilter", "gateway", "browser"]
+
+    main = group["Tasks"][0]
+    assert main["User"] == "10000:10000"
+    assert main["Leader"] is True
+    assert main["Config"] == {
+        "image": "ghcr.io/example/certwatch-worker:0123abc",  # no ports: the bridge maps them
+        **HARDENED,
+        "security_opt": ["no-new-privileges", "seccomp=/etc/leasehold/seccomp/chromium.json"],
+        "mount": [
+            {
+                "type": "tmpfs",
+                "target": "/tmp",
+                "readonly": False,
+                "tmpfs_options": {"size": 256 * 1024**2},
+            }
+        ],
+    }
+    assert main["Resources"] == {"Cores": 2, "MemoryMB": 256, "MemoryMaxMB": 512}
+    # The component's own task keeps what it gets today.
+    assert main["Identities"][0]["Name"] == "leasehold"
+    assert 'nomadVar "nomad/jobs/certwatch-worker"' in main["Templates"][0]["EmbeddedTmpl"]
+    assert main["Env"]["LEASEHOLD_KAFKA_BOOTSTRAP"] == "kafka:9092"
+    assert "Lifecycle" not in main
+
+
+def test_sandbox_netfilter_prestart_is_the_only_task_with_a_capability(spec):
+    tasks = render_job(_sandboxed(spec), "worker", "prod", SHA, PLATFORM).job["TaskGroups"][0][
+        "Tasks"
+    ]
+    nf = next(t for t in tasks if t["Name"] == "netfilter")
+    assert nf["Lifecycle"] == {"Hook": "prestart", "Sidecar": False}
+    assert nf["User"] == "0:0"
+    assert nf["Config"] == {
+        "image": "ghcr.io/example/certwatch-worker:0123abc",  # the component's image
+        "command": "/app/netfilter.sh",
+        "args": ["10001", "20000"],
+        **HARDENED,
+        "cap_add": ["NET_ADMIN"],
+        "security_opt": ["no-new-privileges"],
+    }
+    assert nf["Resources"] == {"CPU": 50, "MemoryMB": 64}
+    for t in tasks:
+        assert t["Config"]["readonly_rootfs"] is True
+        assert t["Config"]["cap_drop"] == ["ALL"]
+        assert "no-new-privileges" in t["Config"]["security_opt"]
+        assert ("cap_add" in t["Config"]) == (t["Name"] == "netfilter")
+        assert "Lifecycle" not in t or t["Name"] == "netfilter"
+
+
+def test_sandbox_extra_tasks_get_no_secrets(spec):
+    tasks = render_job(_sandboxed(spec), "worker", "prod", SHA, PLATFORM).job["TaskGroups"][0][
+        "Tasks"
+    ]
+    by_name = {t["Name"]: t for t in tasks}
+    for name in ("netfilter", "gateway", "browser"):
+        t = by_name[name]
+        for absent in ("Templates", "Identities", "VolumeMounts", "Leader"):
+            assert absent not in t, (name, absent)
+        assert not any(k.startswith("LEASEHOLD_") for k in t["Env"])
+        assert "ports" not in t["Config"]
+
+    gw = by_name["gateway"]
+    assert gw["User"] == "10001:10001"
+    assert gw["Env"] == {"GATEWAY_LOG_LEVEL": "info"}
+    assert gw["Config"]["command"] == "/app/gateway"
+    assert gw["Config"]["args"] == ["--listen", "127.0.0.1:3128"]
+    assert gw["Config"]["security_opt"] == ["no-new-privileges"]  # seccomp is per task
+    assert gw["Resources"] == {"CPU": 500, "MemoryMB": 256}
+
+    br = by_name["browser"]
+    assert br["User"] == "20000:20000"
+    assert br["Config"]["image"] == "ghcr.io/example/chromium:131.0"
+    assert br["Config"]["shm_size"] == 2 * 1024**3
+    assert br["Config"]["runtime"] == "runsc"
+    assert br["Config"]["mount"] == [
+        {"type": "tmpfs", "target": "/tmp", "readonly": False, "tmpfs_options": {"size": 1024**3}},
+        {
+            "type": "tmpfs",
+            "target": "/home/pwuser",
+            "readonly": False,
+            "tmpfs_options": {"size": 512 * 1024**2},
+        },
+    ]
+    assert br["Resources"] == {"CPU": 2000, "MemoryMB": 2048}
+
+
+def test_sandbox_keeps_the_host_network_and_agent_socket(spec):
+    from dataclasses import replace
+
+    from leasehold.spec import ServiceSpec
+
+    data = _sandboxed(spec).model_dump(mode="json", exclude_none=True, by_alias=True)
+    data["frontier"]["task_types"]["certwatch.chunk"]["target_leases"] = True
+    targeted = ServiceSpec.model_validate(data)
+    platform = replace(PLATFORM, agent_volume="leasehold-agent", host_network="tailscale")
+    group = render_job(targeted, "worker", "dev", SHA, platform).job["TaskGroups"][0]
+    assert group["Networks"] == [
+        {"Mode": "bridge", "DynamicPorts": [{"Label": "http", "HostNetwork": "tailscale"}]}
+    ]
+    assert "VolumeMounts" in group["Tasks"][0]
+    assert all("VolumeMounts" not in t for t in group["Tasks"][1:])
+
+
+def test_sandbox_on_a_scheduled_component(spec):
+    group = render_job(_sandboxed(spec, "planner"), "planner", "prod", SHA, PLATFORM).job[
+        "TaskGroups"
+    ][0]
+    assert group["Networks"] == [{"Mode": "bridge"}]
+    assert group["Tasks"][0]["Leader"] is True
+    assert "ports" not in group["Tasks"][0]["Config"]
+
+
+def test_sandbox_minimal(spec):
+    from leasehold.spec import ServiceSpec
+
+    data = spec.model_dump(mode="json", exclude_none=True, by_alias=True)
+    data["components"]["worker"]["sandbox"] = {"user": 10000, "group": 10500}
+    job = render_job(ServiceSpec.model_validate(data), "worker", "prod", SHA, PLATFORM).job
+    (task,) = job["TaskGroups"][0]["Tasks"]
+    assert task["User"] == "10000:10500"
+    assert "Leader" not in task
+    assert task["Config"] == {
+        "image": "ghcr.io/example/certwatch-worker:0123abc",
+        **HARDENED,
+        "security_opt": ["no-new-privileges"],
+    }
+    assert task["Resources"] == {"CPU": 500, "MemoryMB": 256, "MemoryMaxMB": 512}
+
+
+def test_no_sandbox_renders_as_before(spec):
+    job = render_job(spec, "worker", "prod", SHA, PLATFORM).job
+    group = job["TaskGroups"][0]
+    assert group["Networks"] == [{"DynamicPorts": [{"Label": "http"}]}]
+    (task,) = group["Tasks"]
+    assert not {"User", "Leader", "Lifecycle"} & set(task)
+    assert task["Config"] == {
+        "image": "ghcr.io/example/certwatch-worker:0123abc",
+        "ports": ["http"],
+    }

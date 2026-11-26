@@ -244,6 +244,34 @@ def _cmd_agent_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_exit_serve(args: argparse.Namespace) -> int:
+    from leasehold.exit.server import ExitSettings, serve
+
+    try:
+        settings = ExitSettings.from_env()
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+    serve(settings)
+    return 0
+
+
+def _cmd_exit_key(args: argparse.Namespace) -> int:
+    import ipaddress
+
+    from leasehold.exit.token import exit_key, parse_keys
+
+    master = os.environ.get("LEASEHOLD_EXIT_KEYS", "")
+    try:
+        keys = parse_keys(master)
+        egress = str(ipaddress.ip_address(args.egress))
+    except ValueError as e:
+        print(f"LEASEHOLD_EXIT_KEYS or --egress: {e}", file=sys.stderr)
+        return 1
+    print(",".join(exit_key(k, egress).hex() for k in keys))
+    return 0
+
+
 def _cmd_api_serve(args: argparse.Namespace) -> int:
     import logging
 
@@ -956,6 +984,22 @@ def build_parser() -> argparse.ArgumentParser:
         "leasehold.agent.server)",
     )
     ags.set_defaults(func=_cmd_agent_serve)
+
+    ex = sub.add_parser("exit", help="the CONNECT exit of a VPS for routed target leases")
+    exsub = ex.add_subparsers(dest="exit_command", required=True)
+    exs = exsub.add_parser(
+        "serve",
+        help="serve on LEASEHOLD_EXIT_LISTEN (settings from the environment, see "
+        "leasehold.exit.server)",
+    )
+    exs.set_defaults(func=_cmd_exit_serve)
+    exk = exsub.add_parser(
+        "key",
+        help="print the keys of one exit, derived from the master keys in LEASEHOLD_EXIT_KEYS "
+        "(same order: current first)",
+    )
+    exk.add_argument("--egress", required=True, help="the exit's registry address")
+    exk.set_defaults(func=_cmd_exit_key)
 
     gr = sub.add_parser("grafana", help="dashboards derived from service.yml")
     grsub = gr.add_subparsers(dest="grafana_command", required=True)

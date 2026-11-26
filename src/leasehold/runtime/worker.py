@@ -40,13 +40,14 @@ generated event ID.
 Task types with ``target_leases`` (tasks that talk to sites) lease with the machine's
 egress (``LEASEHOLD_EGRESS_IP``; without it the worker doesn't start) and get an
 exclusive lease on each task's target (``leasehold.egress.dispatch``). Per target the
-worker runs one task at a time, at most one per the lease's interval, and starts none
-after a safety margin before the lease expires (on its own monotonic clock). Target
-leases are renewed with the task leases and given back when their tasks are done; a
-lost one (expired, revoked, cooling down) stops its target at once: queued tasks go
-back untried, running ones get ``task.lost``. ``Retry(..., cooldown=True)`` and
-``Defer(..., cooldown=True)`` report pushback: the target cools down for every egress
-for ``after``.
+worker runs one task at a time, at most one per the lease's interval, the first not
+before the lease's ``not_before`` (one interval after the target's previous lease
+ended), and starts none after a safety margin before the lease expires (on its own
+monotonic clock). Target leases are renewed with the task leases and given back when
+their tasks are done; a lost one (expired, revoked, cooling down) stops its target at
+once: queued tasks go back untried, running ones get ``task.lost``.
+``Retry(..., cooldown=True)`` and ``Defer(..., cooldown=True)`` report pushback: the
+target cools down for every egress for ``after``.
 
 With the machine's egress agent (``LEASEHOLD_AGENT_SOCKET``; ``leasehold.agent``), the
 worker talks only to the agent: it holds the target leases for every worker on the
@@ -315,6 +316,14 @@ def _stop_at(expires: datetime, now: datetime) -> float:
     return time.monotonic() + (expires - now).total_seconds() - TARGET_MARGIN_S
 
 
+def _start_at(not_before: datetime | None, now: datetime) -> float:
+    """The monotonic time a new target lease's first task may start: ``not_before``
+    (one interval after the target's previous lease ended), or at once."""
+    if not_before is None:
+        return 0.0
+    return time.monotonic() + max(0.0, (not_before - now).total_seconds())
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -497,6 +506,7 @@ class Worker:
                     expires=tl.expires_at,
                     duration=max(tl.expires_at - now, timedelta(seconds=10)),
                     stop_at=_stop_at(tl.expires_at, now),
+                    next_start=_start_at(tl.not_before, now),
                     route=tl.route,
                 )
             elif not have.lost:

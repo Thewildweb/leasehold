@@ -16,10 +16,11 @@ What it does:
   It renews them while they have tasks and gives them back when they have none.
 - **Hands out tokens** (``POST /v1/agent/token``): leave to send one request to a
   target. Per target, one token per interval of its lease (across all workers on the
-  machine), none after a safety margin before the lease expires or once it is lost
-  (revoked, cooling down, not renewed). A task's first request was paid for when the
-  task was granted; later requests in the same task (a retry, a fallback, a browser
-  page load costing N) spend tokens from the egress's allocation
+  machine), the first not before the lease's ``not_before`` (one interval after the
+  target's previous lease ended), none after a safety margin before the lease expires
+  or once it is lost (revoked, cooling down, not renewed). A task's first request was
+  paid for when the task was granted; later requests in the same task (a retry, a
+  fallback, a browser page load costing N) spend tokens from the egress's allocation
   (``POST /v1/targets/spend``), including what a higher class lends in the window.
 - **Fails closed**: without the control API it stops handing out tokens once leases
   reach their stop time.
@@ -114,6 +115,14 @@ def _stop_at(expires: datetime, now: datetime) -> float:
     return time.monotonic() + (expires - now).total_seconds() - MARGIN_S
 
 
+def _next_at(not_before: str | None, now: datetime) -> float:
+    """The monotonic time of a new target lease's first token: ``not_before`` (one
+    interval after the target's previous lease ended), or at once."""
+    if not not_before:
+        return 0.0
+    return time.monotonic() + max(0.0, (_time(not_before) - now).total_seconds())
+
+
 def _time(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
@@ -167,6 +176,7 @@ class Agent:
                     expires=exp,
                     duration=max(exp - now, timedelta(seconds=10)),
                     stop_at=_stop_at(exp, now),
+                    next_at=_next_at(t.get("not_before"), now),
                     route=t.get("route"),
                 )
             elif not have.lost:

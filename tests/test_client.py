@@ -68,6 +68,25 @@ def test_lease_parses_tasks_and_sends_auth():
     assert tasks[0].payload == {"x": 0} and tasks[0].lease_expires_at.tzinfo is not None
 
 
+def test_target_leases_parse_not_before():
+    """``not_before`` is optional: an older API sends none."""
+    target = {
+        "target": "192.0.2.9",
+        "lease_id": str(uuid.uuid4()),
+        "expires_at": "2026-11-11T12:00:30Z",
+        "interval_s": 10.0,
+    }
+    bodies = [
+        {"tasks": [], "targets": [target | {"not_before": "2026-11-11T12:00:05.5Z"}]},
+        {"tasks": [], "targets": [target | {"not_before": None}]},
+        {"tasks": [], "targets": [target]},
+    ]
+    c = make(lambda req: httpx.Response(200, json=bodies.pop(0)))
+    got = [c.lease_with_targets(1, egress="192.0.2.1")[1][0].not_before for _ in range(3)]
+    assert got[0] is not None and got[0].isoformat() == "2026-11-11T12:00:05.500000+00:00"
+    assert got[1:] == [None, None]
+
+
 def test_identity_file_is_read_per_request(tmp_path):
     f = tmp_path / "nomad_leasehold.jwt"
     f.write_text("jwt-1\n")
