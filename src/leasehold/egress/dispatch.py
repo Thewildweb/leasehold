@@ -1153,6 +1153,22 @@ class Dispatcher:
         )
         return {r["target"]: r for r in rows}
 
+    async def held_by_others(
+        self, conn: AsyncConnection, holder: str, limit: int = 200_000
+    ) -> list[str]:
+        """Targets with a live lease (revoked ones included: their holder may still be
+        sending until it renews) held by anyone but ``holder`` in this environment, in
+        any environment. A routed browser's gateway refuses these as third-party hosts:
+        its page must not reach another holder's target."""
+        rows = await self._rows(
+            conn,
+            "SELECT target FROM {e}.target_leases "
+            "WHERE expires_at > now() AND NOT (holder = %s AND env = %s) "
+            "ORDER BY target LIMIT %s",
+            (holder, self.env, limit),
+        )
+        return [r["target"] for r in rows]
+
     async def revoke(self, conn: AsyncConnection, target: str, reason: str) -> bool:
         """Stop a target lease: no new tasks, and its holder learns at the next renewal."""
         cur = await conn.execute(

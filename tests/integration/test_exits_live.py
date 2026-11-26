@@ -258,3 +258,30 @@ def test_release_ends_an_exit_lease(world):
     run(lambda c: d.renew(c, None, "b1", [], release=[t.lease_id]))
     rows = egress_sql(eg, "SELECT expires_at <= now() FROM {e}.target_leases")
     assert rows == [(True,)]
+
+
+def test_held_by_others_lists_every_other_holders_live_targets(world):
+    env, eg, _ = world
+    upsert(env, "render.fetch", ["a.example"], "198.51.100.10")
+    upsert(env, "render.page", ["b.example"], "198.51.100.11")
+    d = Dispatcher(env, schema.schema_name(env), eg, exit_key=KEY)
+    lease(d, ["render.fetch"], egress="192.0.2.1", holder="vps-1")
+    lease(d, ["render.page"], holder="browser-1")
+    # Another environment's holder with the browser's name still counts.
+    other = Dispatcher(f"{env}x", schema.schema_name(env), eg, exit_key=KEY)
+    egress_sql(
+        eg,
+        "INSERT INTO {e}.target_leases (target, egress, holder, env, lease_id, interval_ms, "
+        "duration_ms, cap, granted, expires_at) VALUES ('198.51.100.12', '192.0.2.3', "
+        "'browser-1', %s, gen_random_uuid(), 1000, 30000, 1, 1, now() + interval '1 minute'), "
+        "('198.51.100.13', '192.0.2.3', 'old', %s, gen_random_uuid(), 1000, 30000, 1, 1, "
+        "now() - interval '1 second')",
+        (f"{env}x", env),
+    )
+    held = run(lambda c: d.held_by_others(c, "browser-1"))
+    assert held == ["198.51.100.10", "198.51.100.12"]  # not its own, not the expired one
+    assert run(lambda c: other.held_by_others(c, "browser-1")) == [
+        "198.51.100.10",
+        "198.51.100.11",
+    ]
+    assert run(lambda c: d.held_by_others(c, "browser-1", limit=1)) == ["198.51.100.10"]

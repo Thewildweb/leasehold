@@ -106,6 +106,14 @@ class Registry:
             for name, tt in s.frontier.task_types.items()
             if tt.target_leases and tt.needs_own_egress()
         }
+        # Task types through registry exits (datacenter_via: exit): their workers (the
+        # sandboxed browser) may list the targets other holders have leased.
+        self.routed = {
+            name
+            for s in specs
+            for name, tt in s.frontier.task_types.items()
+            if tt.target_leases and tt.egress is not None and tt.egress.datacenter_via == "exit"
+        }
         self.egress_specs = {
             name: tt.egress
             for s in specs

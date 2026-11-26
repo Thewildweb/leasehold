@@ -157,7 +157,7 @@ def test_permissions(registry):
         registry.require_create(worker, "resolver.a_record")
 
 
-def test_only_the_own_datacenter_tier_needs_the_workers_egress():
+def test_egress_needs_of_task_types():
     from leasehold.spec.models import ServiceSpec
 
     def svc(name, egress):
@@ -177,3 +177,4 @@ def test_only_the_own_datacenter_tier_needs_the_workers_egress():
         svc("isp", {"tiers": [{"isp": ["isp-a"]}]}),
     ])  # fmt: skip
     assert r.needs_egress == {"plain.t", "bound.t"}
+    assert r.routed == {"exits.t"}  # may list the targets other holders have leased

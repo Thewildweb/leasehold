@@ -524,6 +524,14 @@ class ControlClient:
                 routes[UUID(x["lease_id"])] = Route.parse(x["route"])
         return renewed, lost
 
+    def held_targets(self, worker_id: str | None = None) -> tuple[list[str], bool, datetime]:
+        """Targets with a live lease held by someone else: (targets, complete, as of).
+        For workers of task types through exits, whose gateway refuses these as
+        third-party hosts. ``complete`` is False when the API cut the list."""
+        path = "/v1/targets/held" + (f"?worker_id={quote(worker_id)}" if worker_id else "")
+        r = self._request("GET", path, repeatable=True)
+        return list(r["targets"]), bool(r["complete"]), _parse_time(r["as_of"])
+
     def renew(self, refs: Sequence[LeaseRef]) -> tuple[dict[LeaseRef, datetime], list[LeaseRef]]:
         """Returns (new expiry per renewed lease, lost leases)."""
         renewed: dict[LeaseRef, datetime] = {}

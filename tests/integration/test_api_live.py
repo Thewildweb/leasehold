@@ -194,3 +194,10 @@ def test_sweeper_and_stats_loops(api):
     metrics = api.get("/metrics").text
     assert "leasehold_leases_expired_total{env=" in metrics
     assert f'leasehold_frontier_eligible_tasks{{env="{env}",task_type="jobs.once"}}' in metrics
+
+
+def test_held_targets_only_for_workers_through_exits(api):
+    # The fixture's task types have no exits: no caller may list other holders' targets.
+    for role in ("worker", "planner", "admin"):
+        r = call(api, role, "GET", "/v1/targets/held")
+        assert r.status_code == 403, (role, r.text)
