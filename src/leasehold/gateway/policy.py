@@ -73,6 +73,11 @@ def normalize_host(text: str) -> str:
     labels = host.split(".")
     if not all(_LABEL.match(lbl) for lbl in labels):
         raise ValueError(f"invalid host {text!r}")
+    last = labels[-1]
+    if last.isdigit() or (last.startswith("0x") and all(c in "0123456789abcdef" for c in last[2:])):
+        # 2130706433, 127.1, 0x7f.1, 017700000001: numeric IPv4 forms a resolver may turn
+        # into an address; no top-level domain is numeric.
+        raise ValueError(f"numeric host {text!r}")
     return host
 
 
@@ -150,18 +155,21 @@ class Foreign:
     targets: frozenset[str] = frozenset()
     updated: float | None = None  # monotonic
 
-    def set(self, targets: list[str], now: float | None = None) -> int:
+    def set(self, targets: list, now: float | None = None) -> tuple[int, int]:
+        """Replace the list; (targets kept, entries skipped). An entry that isn't a host
+        is skipped and counted, not a reason to keep the old list."""
         out = set()
+        skipped = 0
         for t in targets:
-            if not isinstance(t, str):
-                raise ControlError("targets must be strings")
             try:
+                if not isinstance(t, str):
+                    raise ValueError
                 out.add(normalize_host(t))
             except ValueError:
-                raise ControlError(f"invalid target {t!r}") from None
+                skipped += 1
         self.targets = frozenset(out)
         self.updated = time.monotonic() if now is None else now
-        return len(self.targets)
+        return len(self.targets), skipped
 
     def fresh(self, now: float, max_age: float) -> bool:
         if max_age <= 0:
@@ -292,6 +300,7 @@ class Context:
         foreign_max_age: float,
         now: float | None = None,
         wall: float | None = None,
+        own: Foreign | None = None,
     ) -> bool:
         """Whether a tunnel to ``host:port`` may open; True when it is third party (and
         then counted against the context's third-party tunnels). ``Refusal`` if not."""
@@ -316,6 +325,11 @@ class Context:
         party = self.hosts.party(host)
         if party == "target":
             return False
+        # ``own``: the targets of the gateway's other open contexts. The same browser
+        # holds their leases, so they aren't in the foreign list, but a page must not load
+        # them outside their own pacing either.
+        if own is not None and own.holds(host):
+            raise Refusal(403, "own_target")
         if party == "redirect":
             if not foreign.fresh(now, foreign_max_age):
                 raise Refusal(403, "foreign_stale")
@@ -352,3 +366,89 @@ class Context:
             "exit_errors": dict(self.exit_errors),
             "limits": self.limits.json(),
         }
+
+
+# --- what a tunnel carries -------------------------------------------------------------------
+
+TLS_RECORD_MAX = 16384 + 2048  # a record's payload, with room for compression/expansion
+TLS_PORTS = (443,)  # tunnels whose first bytes must be a ClientHello for the host
+HTTP_PORTS = (80,)  # tunnels whose first request must name the host
+
+
+def client_hello_sni(record: bytes) -> str | None:
+    """The server name in a TLS ClientHello record (the first record of a tunnel), or
+    None without the extension. ``ValueError`` when it isn't a ClientHello."""
+
+    def take(n: int) -> bytes:
+        nonlocal pos
+        if pos + n > len(record):
+            raise ValueError("truncated ClientHello")
+        out = record[pos : pos + n]
+        pos += n
+        return out
+
+    def num(n: int) -> int:
+        return int.from_bytes(take(n), "big")
+
+    pos = 0
+    if num(1) != 0x16:
+        raise ValueError("not a TLS handshake record")
+    take(2)  # record version
+    length = num(2)
+    if length != len(record) - 5:
+        raise ValueError("record length mismatch")
+    if num(1) != 1:
+        raise ValueError("not a ClientHello")
+    take(3)  # handshake length (the hello may continue in later records: we read the first)
+    take(2 + 32)  # client version, random
+    take(num(1))  # session id
+    take(num(2))  # cipher suites
+    take(num(1))  # compression methods
+    if pos >= len(record):
+        return None  # no extensions
+    end = min(len(record), pos + 2 + num(2))
+    while pos + 4 <= end:
+        ext, size = num(2), num(2)
+        data = take(size)
+        if ext == 0:  # server_name
+            if len(data) < 5 or data[2] != 0:
+                raise ValueError("bad server_name extension")
+            n = int.from_bytes(data[3:5], "big")
+            name = data[5 : 5 + n]
+            if len(name) != n:
+                raise ValueError("bad server_name extension")
+            return normalize_host(name.decode("ascii"))
+    return None
+
+
+def check_tunnel_start(host: str, port: int, first: bytes) -> None:
+    """The first bytes the browser sends into a CONNECT tunnel must be for the host it
+    named (no fronting: an admitted host carrying a request for another). Port 443: the
+    ClientHello's SNI is that host (none for an IP host); port 80: the request's Host is.
+    ``Refusal`` otherwise."""
+    if port in TLS_PORTS:
+        try:
+            sni = client_hello_sni(first)
+        except (ValueError, UnicodeDecodeError):
+            raise Refusal(403, "not_tls") from None
+        if is_ip(host):
+            if sni is not None:
+                raise Refusal(403, "sni_mismatch")
+        elif sni != host:
+            raise Refusal(403, "sni_mismatch")
+    elif port in HTTP_PORTS:
+        value = None
+        for line in first.split(b"\r\n")[1:]:
+            name, sep, rest = line.partition(b":")
+            if sep and name.strip().lower() == b"host":
+                if value is not None:
+                    raise Refusal(403, "host_mismatch")  # two Host headers
+                value = rest.strip().decode("latin1")
+        if value is None:
+            raise Refusal(403, "host_mismatch")
+        name, _, p = value.rpartition(":") if value.count(":") == 1 else (value, "", "")
+        try:
+            if normalize_host(name) != host or p not in ("", "80"):
+                raise Refusal(403, "host_mismatch")
+        except ValueError:
+            raise Refusal(403, "host_mismatch") from None

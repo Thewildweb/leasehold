@@ -776,7 +776,7 @@ def test_control_socket_json_lines(tmp_path):
     assert out[2] == {"ok": True, "page_timeout_s": 60.0}
     assert not out[3]["ok"] and "unknown op" in out[3]["error"]
     assert not out[4]["ok"] and "16" in out[4]["error"]
-    assert out[5] == {"ok": True, "count": 2}
+    assert out[5] == {"ok": True, "applied": True, "count": 2, "skipped": 0}
     st = out[6]["contexts"]["ctx-3"]
     assert st["page_in_progress"] and st["bytes"] == 0 and out[6]["foreign_targets"] == 2
     assert out[7] == {"ok": False, "error": "not JSON"}
@@ -807,3 +807,148 @@ def test_control_socket_replaces_a_stale_socket_file(tmp_path):
         return out
 
     assert asyncio.run(main())[0]["ok"]
+
+
+# --- review findings (2026-11-26) ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["2130706433", "127.1", "0x7f.1", "017700000001", "0x7f000001",
+                                  "1572395042", "a.b.0x1f"])  # fmt: skip
+def test_numeric_ipv4_forms_are_not_hosts(host):
+    with pytest.raises(ValueError, match="numeric"):
+        normalize_host(host)
+
+
+def test_hosts_with_digits_are_still_hosts():
+    assert normalize_host("123.example.nl") == "123.example.nl"
+    assert normalize_host("x1.nl") == "x1.nl" and normalize_host("127.0.0.1") == "127.0.0.1"
+
+
+def test_foreign_list_skips_and_counts_entries_that_arent_hosts():
+    f = Foreign()
+    assert f.set(["shop.nl", "", 7, "2130706433", "bad host", "x.nl"], now=1.0) == (2, 4)
+    assert f.holds("www.shop.nl") and f.fresh(2.0, 120)
+
+
+def test_the_browsers_other_contexts_targets_are_refused_as_third_parties():
+    ctx = _ctx()
+    ctx.page_deadline = 10.0
+    fresh = Foreign()
+    fresh.set([], now=0.0)
+    own = Foreign()
+    own.targets = frozenset({"other.nl"})
+    admit = lambda h: lambda: ctx.admit(h, 443, (80, 443), fresh, 120, now=1.0, own=own)  # noqa: E731
+    assert _reason(admit("cdn.other.nl")) == "own_target"
+    assert ctx.admit("cdn.third.nl", 443, (80, 443), fresh, 120, now=1.0, own=own) is True
+
+
+def _client_hello(server_name):
+    import ssl
+
+    c = ssl.create_default_context()
+    inc, out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    obj = c.wrap_bio(inc, out, server_hostname=server_name)
+    with pytest.raises(ssl.SSLWantReadError):
+        obj.do_handshake()
+    data = out.read()
+    size = int.from_bytes(data[3:5], "big")
+    return data[: 5 + size]  # the first record
+
+
+def test_client_hello_sni():
+    from leasehold.gateway.policy import client_hello_sni
+
+    assert client_hello_sni(_client_hello("www.Example.nl")) == "www.example.nl"
+    assert client_hello_sni(_client_hello(None)) is None
+    with pytest.raises(ValueError):
+        client_hello_sni(b"GET / HTTP/1.1\r\n\r\n")
+    with pytest.raises(ValueError):
+        client_hello_sni(_client_hello("a.nl")[:40])
+
+
+def test_tunnel_start_must_be_for_the_named_host():
+    from leasehold.gateway.policy import check_tunnel_start
+
+    check_tunnel_start("www.example.nl", 443, _client_hello("www.example.nl"))
+    check_tunnel_start("93.184.215.14", 443, _client_hello(None))
+    for host, first, why in [
+        ("www.example.nl", _client_hello("leased.nl"), "sni_mismatch"),  # fronting
+        ("www.example.nl", _client_hello(None), "sni_mismatch"),
+        ("93.184.215.14", _client_hello("leased.nl"), "sni_mismatch"),
+        ("www.example.nl", b"GET / HTTP/1.1\r\nHost: www.example.nl\r\n\r\n", "not_tls"),
+    ]:
+        assert _reason(lambda h=host, f=first: check_tunnel_start(h, 443, f)) == why, (host, why)
+    check_tunnel_start("a.nl", 80, b"GET / HTTP/1.1\r\nHost: A.nl:80\r\n\r\n")
+    for first in (b"GET / HTTP/1.1\r\nHost: b.nl\r\n\r\n", b"GET / HTTP/1.1\r\n\r\n",
+                  b"GET / HTTP/1.1\r\nHost: a.nl\r\nHost: b.nl\r\n\r\n",
+                  b"GET / HTTP/1.1\r\nHost: a.nl:8080\r\n\r\n"):  # fmt: skip
+        assert _reason(lambda f=first: check_tunnel_start("a.nl", 80, f)) == "host_mismatch"
+    check_tunnel_start("a.nl", 8443, b"")  # other ports: not checked
+
+
+def test_a_fronted_tunnel_is_closed_before_anything_reaches_the_exit(tmp_path, monkeypatch):
+    from leasehold.gateway import policy
+
+    async def body(s: Stack):
+        monkeypatch.setattr(policy, "HTTP_PORTS", (s.echo_port,))
+        await s.open()
+        out = []
+        for host in ("www.example.nl", "leased.nl"):
+            status, r, w = await s.connect(
+                "www.example.nl", extra=f"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n".encode()
+            )
+            data = await asyncio.wait_for(r.read(200), 5)
+            out.append((status[:12], data[:15]))
+            w.close()
+        stats = await s.ctl({"op": "stats", "ctx": "ctx-1"})
+        return out, stats["contexts"]["ctx-1"]
+
+    out, stats = run(tmp_path, body)
+    assert out[0][0] == b"HTTP/1.1 200" and out[0][1].startswith(b"GET / HTTP/1.1")  # echoed
+    assert out[1] == (b"HTTP/1.1 200", b"")  # closed: nothing echoed back
+    assert stats["refused"] == {"host_mismatch": 1}
+
+
+def test_incomplete_foreign_list_is_not_applied_and_an_oversized_message_is_answered(tmp_path):
+    async def body(s: Stack):
+        a = await s.ctl({"op": "set_foreign_targets", "targets": ["a.nl"]})
+        b = await s.ctl({"op": "set_foreign_targets", "targets": [], "complete": False})
+        stats = await s.ctl({"op": "stats"})
+        r, w = await asyncio.open_unix_connection(s.sock, limit=2**20)
+
+        async def send():
+            try:
+                w.write(b'{"op":"stats","pad":"' + b"x" * (17 * 2**20) + b'"}\n')
+                await w.drain()
+            except ConnectionError:
+                pass  # the gateway closes after answering
+
+        sender = asyncio.ensure_future(send())
+        answer = json.loads(await asyncio.wait_for(r.readline(), 10))
+        await sender
+        w.close()
+        return a, b, stats, answer
+
+    a, b, stats, answer = run(tmp_path, body)
+    assert a["applied"] and not b["applied"] and stats["foreign_targets"] == 1
+    assert answer == {"ok": False, "error": "message over the control limit"}
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"GET http://a.nl/ HTTP/1.1\r\nHost: a.nl\nX: y\r\n\r\n",  # bare LF
+        b"GET http://a.nl/ HTTP/1.1\r\nHost: a.nl\rX: y\r\n\r\n",  # bare CR
+        b"GET http://a.nl/ HTTP/1.1\r\nX: a\r\n b\r\n\r\n",  # obs-fold
+        b"POST http://a.nl/ HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+        b"POST http://a.nl/ HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        b"GET http://a.nl/ HTTP/1.1\r\nX: a\0b\r\n\r\n",
+    ],
+)
+def test_ambiguous_heads_are_refused(head):
+    assert _reason(lambda: parse_head(head)) == "bad_request"
+
+
+def test_a_plain_head_still_parses():
+    req = parse_head(b"GET http://a.nl/x?q=1 HTTP/1.1\r\nHost: a.nl\r\nContent-Length: 0\r\n\r\n")
+    assert (req.host, req.port, req.path) == ("a.nl", 80, "/x?q=1")

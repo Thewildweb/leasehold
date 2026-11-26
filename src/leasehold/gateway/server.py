@@ -84,14 +84,17 @@ from urllib.parse import urlsplit
 from prometheus_client import Counter, Gauge
 
 from leasehold.exit.server import parse_authority
+from leasehold.gateway import policy
 from leasehold.gateway.policy import (
     KINDS,
+    TLS_RECORD_MAX,
     Context,
     ControlError,
     Foreign,
     Hosts,
     Limits,
     Refusal,
+    check_tunnel_start,
     normalize_host,
     parse_route,
 )
@@ -99,7 +102,7 @@ from leasehold.gateway.policy import (
 log = logging.getLogger("leasehold.gateway")
 
 HEAD_LIMIT = 65536  # browser request heads carry cookies
-CONTROL_LIMIT = 2**20
+CONTROL_LIMIT = 16 * 2**20  # set_foreign_targets: ~4 MB at the API's 200k held targets
 DEFAULT_PORTS = (80, 443)
 CHUNK = 65536
 REASON_HEADER = "X-Leasehold-Refused"
@@ -279,7 +282,13 @@ class Request:
 
 
 def parse_head(head: bytes) -> Request:
-    lines = head.decode("latin-1").split("\r\n")
+    text = head.decode("latin-1")
+    if text.endswith("\r\n\r\n"):
+        text = text[:-4]
+    # Bare CR or LF, or NUL: a head another parser could split differently (smuggling).
+    if "\n" in text.replace("\r\n", "") or "\r" in text.replace("\r\n", "") or "\0" in text:
+        raise Refusal(400, "bad_request")
+    lines = text.split("\r\n")
     parts = lines[0].split(" ")
     if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
         raise Refusal(400, "bad_request")
@@ -288,10 +297,15 @@ def parse_head(head: bytes) -> Request:
     for line in lines[1:]:
         if not line:
             continue
+        if line[0] in " \t":
+            raise Refusal(400, "bad_request")  # obs-fold (RFC 9112 5.2)
         k, sep, v = line.partition(":")
         if not sep or not k or k != k.strip():
             raise Refusal(400, "bad_request")
         headers.append((k, v.strip()))
+    lengths = [v for k, v in headers if k.lower() == "content-length"]
+    if len(lengths) > 1 or (lengths and any(k.lower() == "transfer-encoding" for k, _ in headers)):
+        raise Refusal(400, "bad_request")  # two lengths, or a length and chunked
     if method == "CONNECT":
         try:
             host, port = parse_authority(target)
@@ -406,6 +420,9 @@ class Gateway:
                 try:
                     line = await reader.readline()
                 except (ValueError, asyncio.LimitOverrunError):
+                    # Say so before closing: a silent close looks like a gateway crash.
+                    writer.write(b'{"ok": false, "error": "message over the control limit"}\n')
+                    await writer.drain()
                     break
                 if not line:
                     break
@@ -535,7 +552,14 @@ class Gateway:
         targets = msg.get("targets")
         if not isinstance(targets, list):
             raise ControlError("targets must be a list")
-        return {"count": self.foreign.set(targets)}
+        if msg.get("complete", True) is not True:
+            # A cut list would let the missing targets through: keep the old one, which
+            # goes stale (third parties refused) unless a complete one follows.
+            return {"applied": False, "count": len(self.foreign.targets), "skipped": 0}
+        count, skipped = self.foreign.set(targets)
+        if skipped:
+            log.warning("foreign targets: %d entries skipped (not hosts)", skipped)
+        return {"applied": True, "count": count, "skipped": skipped}
 
     async def _close_context(self, msg: dict) -> dict:
         self._get(msg)
@@ -577,7 +601,12 @@ class Gateway:
                 req, o = await self._authorize(reader)
                 ctx = o.ctx
                 third = ctx.admit(
-                    req.host, req.port, self.s.ports, self.foreign, self.s.foreign_max_age
+                    req.host,
+                    req.port,
+                    self.s.ports,
+                    self.foreign,
+                    self.s.foreign_max_age,
+                    own=self._own_targets(ctx),
                 )
                 if req.absolute and req.header("transfer-encoding") is not None:
                     raise Refusal(411, "chunked_body")
@@ -623,7 +652,21 @@ class Gateway:
                     else:
                         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                         await writer.drain()
-                        reason = await self._relay(t, reader, writer, ur, uw)
+                        try:
+                            first = await asyncio.wait_for(
+                                self._first_bytes(reader, req.port), self.s.head_timeout
+                            )
+                            check_tunnel_start(req.host, req.port, first)
+                        except Refusal as r:
+                            REFUSED.labels(r.reason).inc()
+                            ctx.refused[r.reason] += 1
+                            reason = r.reason
+                        except (TimeoutError, asyncio.IncompleteReadError,
+                                asyncio.LimitOverrunError):  # fmt: skip
+                            reason = "no_start"
+                        else:
+                            await self._send(t, uw, first, up=True)
+                            reason = await self._relay(t, reader, writer, ur, uw)
                     CLOSED.labels(reason).inc()
                 except (ConnectionError, OSError, ValueError):
                     CLOSED.labels("error").inc()
@@ -634,6 +677,29 @@ class Gateway:
         finally:
             o.tunnels.discard(t)
             t.done.set()
+
+    async def _first_bytes(self, reader: asyncio.StreamReader, port: int) -> bytes:
+        """What the browser sends first into a CONNECT tunnel, for check_tunnel_start:
+        the first TLS record on 443, the request head on 80, nothing on other ports."""
+        if port in policy.TLS_PORTS:
+            head = await reader.readexactly(5)
+            size = int.from_bytes(head[3:5], "big")
+            if head[0] != 0x16 or size > TLS_RECORD_MAX:
+                return head  # check_tunnel_start refuses it as not_tls
+            return head + await reader.readexactly(size)
+        if port in policy.HTTP_PORTS:
+            return await reader.readuntil(b"\r\n\r\n")
+        return b""
+
+    def _own_targets(self, ctx: Context) -> Foreign:
+        """The targets of the other open contexts (not this one's own target)."""
+        own = Foreign()
+        own.targets = frozenset(
+            o.ctx.hosts.target
+            for o in self.contexts.values()
+            if o.ctx is not ctx and o.ctx.hosts.target != ctx.hosts.target
+        )
+        return own
 
     async def _authorize(self, reader: asyncio.StreamReader) -> tuple[Request, _Open]:
         try:
