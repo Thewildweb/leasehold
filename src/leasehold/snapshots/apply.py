@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from leasehold.clickhouse.apply import ClickHouse
-from leasehold.clickhouse.plan import MARK, _quote
+from leasehold.clickhouse.plan import MARK, _quote, marker_of
 from leasehold.credentials import new_password
 from leasehold.naming import SNAPSHOT_STAGING_PREFIX
 from leasehold.nomad.apply import Nomad
@@ -216,7 +216,7 @@ def diff(
                         skip = True
                 view = tables.get(t.name)
                 if view is None or view[1] != t.view_comment(sp.definer):
-                    if view is not None and not view[1].startswith(MARK):
+                    if view is not None and marker_of(view[1]) is None:
                         d.warnings.append(
                             f"{t.view} exists and wasn't created by leasehold; "
                             f"dataset {dp.dataset} skipped"

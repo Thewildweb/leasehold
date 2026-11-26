@@ -13,6 +13,7 @@ import pytest
 
 from leasehold import naming
 from leasehold.clickhouse.apply import ClickHouseError
+from leasehold.clickhouse.plan import _quote, marker_of
 from leasehold.clickhouse.schema import SchemaFileError
 from leasehold.nomad.render import Platform
 from leasehold.nomad.render import plan as nomad_plan
@@ -497,3 +498,50 @@ def test_changed_collection_is_altered_once(two_datasets, base):
         x.split(" SET ")[0] for x in ch.executed if x.startswith(("CREATE NAMED", "ALTER NAMED"))
     ] == ["ALTER NAMED COLLECTION `leasehold_dev_bag_snapshots`"]
     assert len([1 for path, _ in nomad.puts if path == p.storage_variable]) == 1
+
+
+# --- apply: the shared view's comment ----------------------------------------------------------
+
+
+def _as_applied(p) -> dict:
+    """The service's database as apply leaves it."""
+    tables = {
+        "snapshot_loads": ("MergeTree", "leasehold: snapshot loads"),
+        "snapshot_current": ("View", p.current_comment()),
+    }
+    for dp in p.datasets:
+        for t in dp.tables:
+            tables[t.storage_table.split(".", 1)[1]] = ("MergeTree", t.storage_comment())
+            tables[t.name] = ("View", t.view_comment(p.definer))
+    return {p.database: tables}
+
+
+def test_shared_view_comment_has_the_description(base):
+    d = spec_dict()
+    d["clickhouse"]["shared"]["adressen"]["description"] = "Bron: Kadaster BAG (CC0), 'x'"
+    spec = ServiceSpec.model_validate(d)
+    plans = sp.plan([(spec, base)], "dev")
+    (p,) = plans
+    tables = {t.name: t for t in p.datasets[0].tables}
+    comment = tables["adressen"].view_comment(p.definer)
+    assert comment.startswith("Bron: Kadaster BAG (CC0), 'x'\nleasehold: snapshot=bag view=")
+    assert marker_of(comment) == comment.split("\n")[-1]
+    assert tables["mutaties"].view_comment(p.definer).startswith("leasehold: ")  # not shared
+
+    ch, nomad = FakeCH(), _storage(p)
+    diff_, missing = _diff(ch, nomad, plans)
+    snap_apply.apply(ch, nomad, diff_, missing, clickhouse_endpoint=ENDPOINT)
+    (create,) = [x for x in ch.executed if x.startswith("CREATE VIEW dev_bag.adressen ")]
+    assert f"COMMENT {_quote(comment)}\nAS SELECT" in create
+
+    # Planned again as apply left it: no view to recreate.
+    diff_, _ = _diff(FakeCH(tables=_as_applied(p)), nomad, plans)
+    assert not any(dc.views for c in diff_.changes for dc in c.datasets)
+    assert not diff_.warnings and not diff_.skipped
+
+    # A changed description recreates only that view.
+    d["clickhouse"]["shared"]["adressen"]["description"] = "Bron: Kadaster BAG (CC0) v2"
+    changed = sp.plan([(ServiceSpec.model_validate(d), base)], "dev")
+    diff_, _ = _diff(FakeCH(tables=_as_applied(p)), nomad, changed)
+    views = [t.view for c in diff_.changes for dc in c.datasets for t in dc.views]
+    assert views == ["dev_bag.adressen"]

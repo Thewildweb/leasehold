@@ -5,14 +5,16 @@ Per sink:
 - **Target table** (holds data): created when missing. When the schema file's
   CREATE TABLE has changed, the sink is skipped with a warning: change the table by
   hand (``ALTER TABLE``), then ``--accept-table <database.table>`` records the new
-  version. A table of that name that leasehold didn't create is never touched.
+  version. A table of that name that leasehold didn't create is never touched. A
+  changed description (``clickhouse.shared``) only changes its comment
+  (``MODIFY COMMENT``).
 - **Kafka table and views** (hold no data): recreated when the SELECT, topic, group,
   Kafka address or sink password changed, or when one of them is missing. The
   consumer group's offsets stay in Kafka, so the new Kafka table continues where the
   old one stopped; messages produced in between are read afterwards.
 
-Per derived table, the same for its target table; its refresh view (no data) is
-recreated when its SELECT or interval changed, or when it is missing.
+Per derived table, the same for its target table (description included); its refresh
+view (no data) is recreated when its SELECT or interval changed, or when it is missing.
 
 Stale objects (marked ``leasehold:`` in a planned database, for a sink or derived table
 the plan no longer has) are reported. ``prune`` drops their Kafka tables and views; target tables
@@ -21,15 +23,31 @@ are never dropped by ``apply``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import httpx
 
-from leasehold.clickhouse.plan import MARK, ClickHousePlan, DatabasePlan, DerivedPlan, SinkPlan
+from leasehold.clickhouse.plan import (
+    ClickHousePlan,
+    DatabasePlan,
+    DerivedPlan,
+    SinkPlan,
+    _quote,
+    marker_of,
+)
 
 
 class ClickHouseError(RuntimeError):
     pass
+
+
+_TSV_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "0": "\0"}
+
+
+def tsv_unescape(value: str) -> str:
+    """A TSV field as ClickHouse escapes it (``\\n``, ``\\t``, ``\\'``, ``\\\\``)."""
+    return re.sub(r"\\(.)", lambda m: _TSV_ESCAPES.get(m[1], m[1]), value)
 
 
 class ClickHouse:
@@ -60,7 +78,7 @@ class ClickHouse:
         """name → (engine, comment) for every table and view in ``database``."""
         db = database.replace("'", "")
         rows = self.rows(f"SELECT name, engine, comment FROM system.tables WHERE database = '{db}'")
-        return {r[0]: (r[1], r[2] if len(r) > 2 else "") for r in rows}
+        return {r[0]: (r[1], tsv_unescape(r[2]) if len(r) > 2 else "") for r in rows}
 
     def database_exists(self, database: str) -> bool:
         db = database.replace("'", "")
@@ -72,6 +90,7 @@ class SinkChange:
     sink: SinkPlan
     create_table: bool = False
     accept_table: bool = False
+    update_comment: bool = False  # the description changed
     recreate_pipeline: bool = False
     reasons: list[str] = field(default_factory=list)
     _pipeline_comment: str = ""
@@ -82,6 +101,8 @@ class SinkChange:
             what.append(f"create table {self.sink.table}")
         if self.accept_table:
             what.append(f"record table version {self.sink.table}")
+        if self.update_comment:
+            what.append(f"update comment of {self.sink.table}")
         if self.recreate_pipeline:
             what.append(
                 f"(re)create {self.sink.kafka_table}, {self.sink.mv}, {self.sink.errors_mv}"
@@ -94,6 +115,7 @@ class DerivedChange:
     derived: DerivedPlan
     create_table: bool = False
     accept_table: bool = False
+    update_comment: bool = False  # the description changed
     recreate_view: bool = False
 
     def __str__(self) -> str:
@@ -102,6 +124,8 @@ class DerivedChange:
             what.append(f"create table {self.derived.table}")
         if self.accept_table:
             what.append(f"record table version {self.derived.table}")
+        if self.update_comment:
+            what.append(f"update comment of {self.derived.table}")
         if self.recreate_view:
             what.append(f"(re)create {self.derived.view}")
         return "; ".join(what)
@@ -124,9 +148,10 @@ class ClickHouseDiff:
 
 def _owner_of(comment: str) -> str | None:
     """``sink:<name>`` or ``derived:<name>`` for an object leasehold made for one."""
-    if not comment.startswith(MARK):
+    marker = marker_of(comment)
+    if marker is None:
         return None
-    for part in comment.split():
+    for part in marker.split():
         for kind in ("sink", "derived"):
             if part.startswith(f"{kind}="):
                 return f"{kind}:{part[len(kind) + 1 :]}"
@@ -159,13 +184,13 @@ def diff(
                 ch_change.create_table = True
             else:
                 engine, comment = current
-                if not comment.startswith(MARK):
+                if marker_of(comment) is None:
                     d.warnings.append(
                         f"{s.table} exists and wasn't created by leasehold; sink {s.sink} skipped"
                     )
                     d.skipped.append(s.table)
                     continue
-                if comment != s.table_comment():
+                if marker_of(comment) != s.table_comment():
                     if s.table in accept_tables:
                         ch_change.accept_table = True
                         ch_change.reasons.append("table changed by hand")
@@ -177,6 +202,9 @@ def diff(
                         )
                         d.skipped.append(s.table)
                         continue
+                elif comment != s.full_table_comment():
+                    ch_change.update_comment = True
+                    ch_change.reasons.append("description changed")
             version = credential_versions.get(s.principal)
             if version is None:
                 d.warnings.append(
@@ -200,7 +228,12 @@ def diff(
                     ch_change.reasons.append("missing: " + ", ".join(missing))
                 if changed:
                     ch_change.reasons.append("SELECT, topic, address or password changed")
-            if ch_change.create_table or ch_change.accept_table or ch_change.recreate_pipeline:
+            if (
+                ch_change.create_table
+                or ch_change.accept_table
+                or ch_change.update_comment
+                or ch_change.recreate_pipeline
+            ):
                 d.changes.append(ch_change)
 
         planned = {f"sink:{s}" for s in planned_sinks}
@@ -225,11 +258,11 @@ def _derived_change(
         c.create_table = True
     else:
         _, comment = current
-        if not comment.startswith(MARK):
+        if marker_of(comment) is None:
             d.warnings.append(f"{dp.table} exists and wasn't created by leasehold; skipped")
             d.skipped.append(dp.table)
             return None
-        if comment != dp.table_comment():
+        if marker_of(comment) != dp.table_comment():
             if dp.table in accept_tables:
                 c.accept_table = True
             else:
@@ -239,10 +272,12 @@ def _derived_change(
                 )
                 d.skipped.append(dp.table)
                 return None
+        elif comment != dp.full_table_comment():
+            c.update_comment = True
     view = tables.get(dp.view.split(".", 1)[1])
     if view is None or view[1] != dp.view_comment():
         c.recreate_view = True
-    if c.create_table or c.accept_table or c.recreate_view:
+    if c.create_table or c.accept_table or c.update_comment or c.recreate_view:
         return c
     return None
 
@@ -266,8 +301,8 @@ def apply(
         s = c.sink
         if c.create_table:
             ch.execute(s.create_table_sql())
-        if c.accept_table:
-            ch.execute(f"ALTER TABLE {s.table} MODIFY COMMENT '{s.table_comment()}'")
+        if c.accept_table or c.update_comment:
+            ch.execute(f"ALTER TABLE {s.table} MODIFY COMMENT {_quote(s.full_table_comment())}")
         if c.recreate_pipeline:
             # Views first: dropping the Kafka table while a view reads it is refused.
             for name in (s.mv, s.errors_mv, s.kafka_table):
@@ -293,8 +328,8 @@ def apply_derived(ch: ClickHouse, d: ClickHouseDiff) -> None:
         dp = c.derived
         if c.create_table:
             ch.execute(dp.create_table_sql())
-        if c.accept_table:
-            ch.execute(f"ALTER TABLE {dp.table} MODIFY COMMENT '{dp.table_comment()}'")
+        if c.accept_table or c.update_comment:
+            ch.execute(f"ALTER TABLE {dp.table} MODIFY COMMENT {_quote(dp.full_table_comment())}")
         if c.recreate_view:
             ch.execute(f"DROP TABLE IF EXISTS {dp.view} SYNC")
             ch.execute(dp.create_view_sql())

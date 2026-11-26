@@ -197,7 +197,7 @@ components:
   extract: { kind: scheduled, ..., writes_buckets: [snapshots] }
 clickhouse:
   database: registry
-  shared: { addresses: { description: "..." } }   # readers get the view
+  shared: { addresses: { description: "Source: ... (CC BY 4.0)" } }   # readers get the view
 snapshots:
   registry:                        # the dataset; its loader is the component load-registry
     bucket: snapshots
@@ -231,12 +231,14 @@ w.commit(source_date="2026-11-08")  # the manifest, last
 **What `apply` creates**, in the service's database: `<table>__snapshots` (one partition
 per kept snapshot), a view `<table>` that readers use (`SQL SECURITY DEFINER` as the
 service's definer user, so readers need a grant on the view only), `snapshot_loads` (one
-row per state change of a load) and `snapshot_current`. In object storage, a read-only
-user for ClickHouse, whose keys go into a named collection with the bucket's URL, none
-of them overridable; datasets on the same bucket share that collection. A loader user
-per dataset, limited to `_staging_*` tables, its `__snapshots` partitions,
-`snapshot_loads` and its named collection. A periodic job `<service>-load-<dataset>`
-that runs `leasehold snapshot load`.
+row per state change of a load) and `snapshot_current`. A shared table's description
+(licence, attribution) is the first part of its view's comment, above the `leasehold:`
+marker line; shared sinks and derived tables carry it the same way. In object storage,
+a read-only user for ClickHouse, whose keys go into a named collection with the
+bucket's URL, none of them overridable; datasets on the same bucket share that
+collection. A loader user per dataset, limited to `_staging_*` tables, its
+`__snapshots` partitions, `snapshot_loads` and its named collection. A periodic job
+`<service>-load-<dataset>` that runs `leasehold snapshot load`.
 
 **One load.** The loader checks the files against the manifest, loads each table into a
 new `_staging_*` table, compares row counts and runs the checks, attaches each as a new

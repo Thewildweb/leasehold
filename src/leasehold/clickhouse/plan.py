@@ -16,8 +16,10 @@ Per service with a ``clickhouse`` section, in database ``<env prefix><database>`
   - ``<name>_refresh``: a refreshable materialized view that recomputes it every
     ``refresh`` from the schema file's SELECT and replaces its contents.
 
-Every object carries a comment starting with ``leasehold:``; ``apply`` uses it to
-find what it manages and to see what changed.
+Every object carries a marker comment starting with ``leasehold:``; ``apply`` uses it
+to find what it manages and to see what changed. A shared table
+(``clickhouse.shared``) has its description (licence, attribution) in the comment as
+well: the description first, then the marker on its own last line (``marker_of``).
 """
 
 from __future__ import annotations
@@ -35,6 +37,17 @@ ERRORS_TABLE = "sink_errors"
 ERRORS_TTL_DAYS = 30
 
 
+def with_description(marker: str, description: str | None) -> str:
+    """A comment: ``description`` first, then ``marker`` on its own line."""
+    return f"{description}\n{marker}" if description else marker
+
+
+def marker_of(comment: str) -> str | None:
+    """The leasehold marker of a comment (its last line), or None when it has none."""
+    last = comment.rsplit("\n", 1)[-1]
+    return last if last.startswith(MARK) else None
+
+
 @dataclass(frozen=True)
 class SinkPlan:
     service: str
@@ -47,6 +60,7 @@ class SinkPlan:
     namespace: str
     schema: SinkSchema
     consumers: int = 1
+    description: str | None = None  # clickhouse.shared, in the table's comment
 
     @property
     def table(self) -> str:
@@ -65,7 +79,11 @@ class SinkPlan:
         return f"{self.database}.{self.sink}_errors_mv"
 
     def table_comment(self) -> str:
+        """The marker: changes with the schema file's CREATE TABLE."""
         return f"{MARK} sink={self.sink} table={self.schema.table_hash()}"
+
+    def full_table_comment(self) -> str:
+        return with_description(self.table_comment(), self.description)
 
     def pipeline_comment(self, kafka_bootstrap: str, credential_version: str) -> str:
         """Changes whenever the Kafka table or a view must be recreated."""
@@ -85,7 +103,7 @@ class SinkPlan:
 
     def create_table_sql(self) -> str:
         sql = self.schema.create_table.replace(TABLE, self.table, 1)
-        return f"{sql}\nCOMMENT {_quote(self.table_comment())}"
+        return f"{sql}\nCOMMENT {_quote(self.full_table_comment())}"
 
     def create_kafka_sql(self, kafka_bootstrap: str, password: str, comment: str) -> str:
         settings = {
@@ -137,6 +155,7 @@ class DerivedPlan:
     database: str
     schema: SinkSchema
     refresh_seconds: int
+    description: str | None = None  # clickhouse.shared, in the table's comment
 
     @property
     def table(self) -> str:
@@ -147,7 +166,11 @@ class DerivedPlan:
         return f"{self.database}.{self.name}_refresh"
 
     def table_comment(self) -> str:
+        """The marker: changes with the schema file's CREATE TABLE."""
         return f"{MARK} derived={self.name} table={self.schema.table_hash()}"
+
+    def full_table_comment(self) -> str:
+        return with_description(self.table_comment(), self.description)
 
     def view_comment(self) -> str:
         parts = [self.schema.select_hash(), str(self.refresh_seconds), "1"]
@@ -156,7 +179,7 @@ class DerivedPlan:
 
     def create_table_sql(self) -> str:
         sql = self.schema.create_table.replace(TABLE, self.table, 1)
-        return f"{sql}\nCOMMENT {_quote(self.table_comment())}"
+        return f"{sql}\nCOMMENT {_quote(self.full_table_comment())}"
 
     def create_view_sql(self) -> str:
         select = self.schema.select.replace(DATABASE, self.database)
@@ -220,6 +243,7 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
         ):
             continue
         db = naming.clickhouse_database(env, spec.clickhouse.database)
+        shared = spec.clickhouse.shared
         sinks = []
         for sname, sink in sorted(spec.sinks().items()):
             schema = parse((base / sink.schema_file).read_text())
@@ -235,6 +259,7 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
                     namespace=naming.nomad_namespace(env),
                     schema=schema,
                     consumers=sink.consumers,
+                    description=shared[sname].description if sname in shared else None,
                 )
             )
         derived = tuple(
@@ -244,6 +269,7 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> ClickHousePlan:
                 database=db,
                 schema=parse_derived((base / d.schema_file).read_text()),
                 refresh_seconds=int(d.refresh.total_seconds()),
+                description=shared[dname].description if dname in shared else None,
             )
             for dname, d in sorted(spec.clickhouse.derived.items())
         )

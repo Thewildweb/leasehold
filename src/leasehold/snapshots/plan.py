@@ -25,7 +25,9 @@ Per service with ``snapshots``, in its database (``<env prefix><database>``):
     collection, ``SELECT`` on ``system.parts`` and ``system.tables`` (which show it only
     what it may see) and on the environment's busy-check tables.
 
-Objects carry a ``leasehold:`` comment, as sink objects do.
+Objects carry a ``leasehold:`` comment, as sink objects do. The view of a shared
+table (``clickhouse.shared``) has the table's description first, the marker on its own
+last line; a changed description recreates the view, like any other change to it.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from leasehold import naming
-from leasehold.clickhouse.plan import MARK, _quote
+from leasehold.clickhouse.plan import MARK, _quote, with_description
 from leasehold.clickhouse.schema import SOURCE, TABLE, SinkSchema
 from leasehold.nomad.render import job_variable_path
 from leasehold.snapshots.schema import SNAPSHOT, parse_snapshot
@@ -94,6 +96,7 @@ class TablePlan:
     mode: str
     database: str
     schema: SinkSchema
+    description: str | None = None  # clickhouse.shared, in the view's comment
 
     @property
     def storage_table(self) -> str:
@@ -128,7 +131,7 @@ class TablePlan:
     def view_comment(self, definer: str) -> str:
         parts = [self.view_select(), definer, "1"]
         fp = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-        return f"{MARK} snapshot={self.dataset} view={fp}"
+        return with_description(f"{MARK} snapshot={self.dataset} view={fp}", self.description)
 
     def create_view_sql(self, definer: str) -> str:
         return (
@@ -258,6 +261,7 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> list[ServicePlan
         if not spec.snapshots or spec.clickhouse is None:
             continue
         db = naming.clickhouse_database(env, spec.clickhouse.database)
+        shared = spec.clickhouse.shared
         datasets = []
         for dname, d in sorted(spec.snapshots.items()):
             tables = tuple(
@@ -267,6 +271,7 @@ def plan(services: list[tuple[ServiceSpec, Path]], env: str) -> list[ServicePlan
                     mode=t.mode,
                     database=db,
                     schema=parse_snapshot((base / t.schema_file).read_text()),
+                    description=shared[tname].description if tname in shared else None,
                 )
                 for tname, t in sorted(d.tables.items())
             )

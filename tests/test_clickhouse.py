@@ -5,12 +5,15 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 
+import httpx
 import pytest
 
 from leasehold import clickhouse
-from leasehold.clickhouse.apply import apply, apply_derived, diff
+from leasehold.clickhouse.apply import ClickHouse, apply, apply_derived, diff
+from leasehold.clickhouse.plan import _quote, marker_of
 from leasehold.clickhouse.schema import SchemaFileError, parse, parse_derived, split_statements
 from leasehold.spec import SpecError, load_spec
+from leasehold.spec.models import SharedTable
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GOOD = """
@@ -321,3 +324,80 @@ def test_derived_schema_file_is_checked(derived_spec):
     with pytest.raises(SpecError) as e:
         load_spec(derived_spec / "service.yml")
     assert any("clickhouse.derived.counts.schema_file" in m for m in e.value.messages)
+
+
+# --- shared tables: the description in the comment --------------------------------------------
+
+ATTRIBUTION = "Bron: CT logs (CC BY 4.0), it's \\ public"
+
+
+def _shared_plan(description=ATTRIBUTION):
+    spec = load_spec(FIXTURES / "certwatch" / "service.yml")
+    spec.clickhouse.shared["domains"] = SharedTable(description=description)
+    return clickhouse.plan([(spec, FIXTURES / "certwatch")], "dev")
+
+
+def test_shared_sink_description_in_comment():
+    p = _shared_plan()
+    s = next(s for s in p.sinks() if s.sink == "domains")
+    full = s.full_table_comment()
+    assert full == f"{ATTRIBUTION}\n{s.table_comment()}"
+    assert marker_of(full) == s.table_comment()
+    assert s.create_table_sql().endswith(f"COMMENT {_quote(full)}")
+    other = next(s for s in p.sinks() if s.sink == "chunk_attempts")
+    assert other.full_table_comment() == other.table_comment()
+
+    # As apply leaves it: nothing to do, and the table counts as a planned sink.
+    live = _live(p)
+    live["dev_certwatch"]["domains"] = ("ReplacingMergeTree", full)
+    d = diff(FakeCH(live), p, "kafka:9092", VERSIONS)
+    assert d.empty and not d.warnings and not d.stale
+
+
+def test_shared_sink_description_change_modifies_comment():
+    p = _shared_plan()
+    s = next(s for s in p.sinks() if s.sink == "domains")
+    live = _live(p)  # the table has the marker only, as before descriptions were written
+    live["dev_certwatch"]["domains"] = ("ReplacingMergeTree", s.table_comment())
+    ch = FakeCH(live)
+    d = diff(ch, p, "kafka:9092", VERSIONS)
+    (c,) = d.changes
+    assert c.update_comment and not (c.accept_table or c.create_table or c.recreate_pipeline)
+    apply(ch, d, "kafka:9092", {})
+    assert ch.executed == [
+        f"ALTER TABLE dev_certwatch.domains MODIFY COMMENT {_quote(s.full_table_comment())}"
+    ]
+
+    # A changed schema with a description is still a changed schema.
+    live["dev_certwatch"]["domains"] = (
+        "ReplacingMergeTree",
+        f"{ATTRIBUTION}\nleasehold: sink=domains table=old",
+    )
+    d = diff(FakeCH(live), p, "kafka:9092", VERSIONS)
+    assert d.skipped == ["dev_certwatch.domains"]
+
+
+def test_tables_unescapes_comments():
+    comment = f"{ATTRIBUTION}\nleasehold: sink=domains table=x"
+    escaped = comment.replace("\\", "\\\\").replace("\n", "\\n").replace("'", "\\'")
+
+    def handler(request):
+        return httpx.Response(200, text=f"domains\tMergeTree\t{escaped}\n")
+
+    ch = ClickHouse("http://ch", "u", "p")
+    ch._http = httpx.Client(base_url="http://ch", transport=httpx.MockTransport(handler))
+    assert ch.tables("dev_certwatch") == {"domains": ("MergeTree", comment)}
+
+
+def test_shared_derived_description_in_comment(derived_spec):
+    spec = load_spec(derived_spec / "service.yml")
+    spec.clickhouse.shared["counts"] = SharedTable(description=ATTRIBUTION)
+    p = clickhouse.plan([(spec, derived_spec)], "dev")
+    (dp,) = p.databases[0].derived
+    assert dp.create_table_sql().endswith(f"COMMENT {_quote(dp.full_table_comment())}")
+    live = {"dev_certwatch": {"counts_refresh": ("MaterializedView", dp.view_comment())}}
+    live["dev_certwatch"]["counts"] = ("MergeTree", dp.table_comment())
+    (c,) = diff(FakeCH(live), p, "kafka:9092", VERSIONS).derived
+    assert c.update_comment and not (c.accept_table or c.recreate_view)
+    live["dev_certwatch"]["counts"] = ("MergeTree", dp.full_table_comment())
+    assert not diff(FakeCH(live), p, "kafka:9092", VERSIONS).derived

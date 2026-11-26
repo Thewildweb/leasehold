@@ -601,11 +601,16 @@ class Sink(_Strict):
 
 
 class SharedTable(_Strict):
-    """One of this service's sinks that other services' planners may read. Its columns
-    are the contract. (Views come later, when a service must hide columns: they need a
-    definer user per service, so readers don't need grants on the tables underneath.)"""
+    """One of this service's sinks, derived or snapshot tables that other services'
+    planners may read. Its columns are the contract. (Views come later, when a service
+    must hide columns: they need a definer user per service, so readers don't need grants
+    on the tables underneath.)"""
 
-    description: str = Field(min_length=1)
+    description: str = Field(
+        min_length=1,
+        description="What the table holds, its licence and attribution; also written to the "
+        "ClickHouse comment of the table (of the view, for a snapshot table)",
+    )
 
 
 class Derived(_Strict):
