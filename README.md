@@ -275,6 +275,53 @@ that were never current. A snapshot rolled back from comes back only with
 ClickHouse user that runs `apply` needs named collection control
 (`named_collection_control`; the dev stack sets it in `dev/clickhouse/`).
 
+## Sandboxed components
+
+A component that runs untrusted code (a browser) declares a `sandbox`. Its job's group
+then runs in its own network namespace (Nomad bridge mode; the tasks reach each other
+on 127.0.0.1), with the component's own task, the extra `tasks` and an optional
+`netfilter` prestart task:
+
+```yaml
+components:
+  render:
+    kind: task-worker
+    ...
+    sandbox:
+      user: 10000                  # the component's own task; group defaults to the user
+      seccomp: /etc/leasehold/seccomp/chromium.json   # on the Nomad client
+      tmpfs: { /tmp: 256M }
+      cores: 8                     # whole cores (Nomad `cores`), instead of `cpu`
+      netfilter:                   # prestart: installs the rules and exits
+        command: [/app/netfilter.sh, "10001", "20000"]
+      tasks:
+        gateway:
+          user: 10001
+          command: [/app/gateway, --listen, "127.0.0.1:3128"]
+          resources: { cpu: 500, memory: 256 }
+        browser:
+          user: 20000
+          image: ghcr.io/example/chromium:131.0   # default: the component's image
+          command: [chromium, --headless]
+          resources: { cpu: 2000, memory: 2048 }
+          shm_size: 2G
+          tmpfs: { /tmp: 1G, /home/pwuser: 512M }
+          runtime: runsc           # gVisor
+```
+
+Every task runs as its numeric `user:group` (never 0) with a read-only root file
+system, all capabilities dropped and `no-new-privileges`, plus its own `seccomp`,
+`tmpfs`, `shm_size`, `runtime` and `cores`. Sizes are `512K`, `256M`, `2G`. Only the
+component's own task gets the template with its secrets, the Nomad Variables and the
+workload identity (and the egress agent's socket, when it uses one); it is the group's
+leader, so the other tasks stop with it. Extra tasks get only their own `env`, which may
+not hold secrets, and no host volumes. `netfilter` runs as root with `NET_ADMIN` as its
+only capability; its rules come from the service (a script in its image and its
+arguments). No task declares capabilities, and every task in the group shares the
+allocation directory (`$NOMAD_ALLOC_DIR`). Bridge mode needs the CNI plugins on the
+Nomad clients, and the Docker plugin must allow `NET_ADMIN` (`allow_caps`) and each
+runtime used (`allow_runtimes`).
+
 ## License
 
 TBD

@@ -51,6 +51,7 @@ from leasehold.types import (
     RuleName,
     SecretPath,
     ServiceName,
+    Size,
     SnakeName,
     SnapshotTableName,
     TaskTypeName,
@@ -110,6 +111,158 @@ class Scaling(_Strict):
 _SECRETISH = re.compile(r"(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|CREDENTIAL)")
 
 
+def _secret_env_names(env: dict[str, str]) -> list[str]:
+    return sorted(k for k in env if _SECRETISH.search(k))
+
+
+# --- Sandbox -----------------------------------------------------------------------------------
+
+NETFILTER_TASK = "netfilter"
+SandboxTaskName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]*$", max_length=30)]
+_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/:-]*(:[A-Za-z0-9_.-]+|@sha256:[a-f0-9]{64})$")
+
+
+def _check_tmpfs(value: dict[str, int]) -> dict[str, int]:
+    for target in value:
+        if not target.startswith("/") or ".." in target.split("/"):
+            raise ValueError(f"tmpfs target {target!r}: an absolute path without '..'")
+        if target.rstrip("/") == "":
+            raise ValueError("tmpfs target '/': the root file system stays read-only")
+    return value
+
+
+def _check_image(value: str | None) -> str | None:
+    if value is None:
+        return value
+    if not _IMAGE_RE.match(value) or value.endswith(":latest"):
+        raise ValueError(f"image {value!r}: a full reference with a tag or digest, not latest")
+    return value
+
+
+class _Container(_Strict):
+    """Container settings of one task in a sandboxed group, on top of the fixed ones
+    (read-only root file system, every capability dropped, no-new-privileges)."""
+
+    tmpfs: dict[str, Size] = Field(
+        default_factory=dict,
+        description="Writable in-memory mounts, target path -> size, e.g. {/tmp: 256M}",
+    )
+    seccomp: str | None = Field(
+        default=None,
+        description="Seccomp profile (JSON) on the Nomad client, as an absolute path; "
+        "default: Docker's profile",
+    )
+    runtime: Identifier | None = Field(
+        default=None, description="Docker runtime, e.g. 'runsc' (gVisor); default: runc"
+    )
+
+    @field_validator("tmpfs")
+    @classmethod
+    def _tmpfs(cls, value: dict[str, int]) -> dict[str, int]:
+        return _check_tmpfs(value)
+
+    @field_validator("seccomp")
+    @classmethod
+    def _seccomp(cls, value: str | None) -> str | None:
+        if value is not None and (not value.startswith("/") or ".." in value.split("/")):
+            raise ValueError(f"seccomp {value!r}: an absolute path on the client, without '..'")
+        return value
+
+
+class _RunsAs(_Container):
+    user: int = Field(description="Numeric user ID the task runs as; not 0 (root)")
+    group: int | None = Field(default=None, description="Numeric group ID; default: the user ID")
+    shm_size: Size | None = Field(
+        default=None, description="Size of /dev/shm, e.g. 2G (Chromium needs more than 64M)"
+    )
+    cores: int | None = Field(
+        default=None,
+        ge=1,
+        description="Whole CPU cores reserved for the task (Nomad `cores`); replaces the "
+        "`cpu` reservation",
+    )
+
+    @field_validator("user", "group")
+    @classmethod
+    def _not_root(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("a sandboxed task runs as a non-root user (an ID above 0)")
+        return value
+
+
+class SandboxTask(_RunsAs):
+    """A task next to the component's own in its sandboxed group, e.g. a browser. It
+    gets no secrets, no Nomad Variables and no workload identity."""
+
+    image: str | None = Field(
+        default=None,
+        description="Full image reference with a tag or digest; default: the component's image",
+    )
+    command: list[str] = Field(min_length=1, description="Command and arguments")
+    resources: Resources
+    env: dict[EnvVarName, str] = Field(default_factory=dict, description="Non-secret only")
+
+    @field_validator("image")
+    @classmethod
+    def _image(cls, value: str | None) -> str | None:
+        return _check_image(value)
+
+    @field_validator("env")
+    @classmethod
+    def _no_secrets_in_env(cls, value: dict[str, str]) -> dict[str, str]:
+        if bad := _secret_env_names(value):
+            raise ValueError(
+                f"env looks like it holds secrets ({', '.join(bad)}); extra tasks of a "
+                "sandbox get no secrets"
+            )
+        return value
+
+
+class Netfilter(_Container):
+    """A prestart task that installs the group's packet filter rules (e.g. iptables
+    owner matches per user) in the shared network namespace and exits. The only task
+    with a capability: NET_ADMIN. It runs as root, which iptables needs."""
+
+    image: str | None = Field(
+        default=None,
+        description="Full image reference with a tag or digest; default: the component's image",
+    )
+    command: list[str] = Field(
+        min_length=1, description="Command and arguments that install the rules and exit"
+    )
+    resources: Resources = Field(default_factory=lambda: Resources(cpu=50, memory=64))
+    env: dict[EnvVarName, str] = Field(default_factory=dict, description="Non-secret only")
+
+    @field_validator("image")
+    @classmethod
+    def _image(cls, value: str | None) -> str | None:
+        return _check_image(value)
+
+    @field_validator("env")
+    @classmethod
+    def _no_secrets_in_env(cls, value: dict[str, str]) -> dict[str, str]:
+        if bad := _secret_env_names(value):
+            raise ValueError(f"env looks like it holds secrets ({', '.join(bad)})")
+        return value
+
+
+class Sandbox(_RunsAs):
+    """Runs the component as a group of hardened containers in one network namespace
+    (Nomad bridge mode): its own task, the extra ``tasks`` and an optional ``netfilter``
+    prestart task. The settings at this level are the component's own task's."""
+
+    netfilter: Netfilter | None = None
+    tasks: dict[SandboxTaskName, SandboxTask] = Field(
+        default_factory=dict, description="Extra tasks in the group, by name"
+    )
+
+    @model_validator(mode="after")
+    def _names(self) -> Sandbox:
+        if NETFILTER_TASK in self.tasks:
+            raise ValueError(f"the task name {NETFILTER_TASK!r} is reserved")
+        return self
+
+
 class _ComponentBase(_Strict):
     node_class: str = Field(min_length=1, description="Nomad node class to run on")
     resources: Resources
@@ -154,6 +307,11 @@ class _ComponentBase(_Strict):
         "cooldown, targets:escalate moves a target to its next egress tier (health "
         "consumers, classifiers)",
     )
+    sandbox: Sandbox | None = Field(
+        default=None,
+        description="Run as hardened containers in their own network namespace, with "
+        "extra tasks (e.g. a browser) and a packet filter",
+    )
 
     def bucket_refs(self, service: str) -> tuple[set[naming.BucketRef], set[naming.BucketRef]]:
         """(read, write) bucket references. Write implies read; it isn't listed twice."""
@@ -179,7 +337,7 @@ class _ComponentBase(_Strict):
     @field_validator("env")
     @classmethod
     def _no_secrets_in_env(cls, value: dict[str, str]) -> dict[str, str]:
-        bad = sorted(k for k in value if _SECRETISH.search(k))
+        bad = _secret_env_names(value)
         if bad:
             raise ValueError(
                 f"env looks like it holds secrets ({', '.join(bad)}); "
@@ -1184,6 +1342,13 @@ class ServiceSpec(_Strict):
             where = f"components.{cname}"
             if cname in naming.RESERVED_COMPONENT_NAMES:
                 yield f"{where}: the component name {cname!r} is reserved"
+            if c.sandbox is not None:
+                taken = set(c.sandbox.tasks) | {NETFILTER_TASK}
+                if cname in taken:
+                    yield (
+                        f"{where}.sandbox: a task has the component's name {cname!r} "
+                        "(the component's own task)"
+                    )
             for t in c.produces:
                 if t not in own_topics:
                     yield f"{where}.produces: unknown topic {t!r}; declare it under kafka.produces"

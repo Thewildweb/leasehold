@@ -49,6 +49,16 @@ What each job gets:
   process, and tags ``leasehold``, ``env=..``, ``service=..``, ``component=..``. The
   Prometheus ``nomad_sd`` scrape keeps targets tagged ``leasehold`` and turns the other
   tags into the ``env``, ``service`` and ``component`` labels the dashboards select on.
+- Components with a ``sandbox``: the group's network in bridge mode (its own network
+  namespace; the http port is mapped there, so the container publishes none). Every
+  task runs as its numeric ``user:group``, with ``readonly_rootfs``, ``cap_drop =
+  ["ALL"]``, ``no-new-privileges`` (and ``seccomp=<path>`` when set), its tmpfs
+  mounts, ``shm_size``, ``runtime`` and ``cores`` (instead of ``cpu``). The extra tasks
+  run next to the component's own (the leader) with only their own env: no template,
+  Nomad Variable or workload identity. ``netfilter`` is a prestart task (not a
+  sidecar), root with ``NET_ADMIN`` as its only capability, that installs the packet
+  filter rules in the shared namespace and exits. No host volume is mounted into the
+  extra tasks; the component's own task keeps the egress agent's socket when it uses it.
 - Scheduled components: a periodic batch job (cron in UTC, no overlapping runs), no
   port, no restarts inside a run; the next firing is the retry.
 
@@ -65,10 +75,15 @@ from typing import Any
 
 from leasehold import naming
 from leasehold.spec.models import (
+    NETFILTER_TASK,
     Api,
     ArchiveComponent,
     Component,
+    Netfilter,
     Processor,
+    Resources,
+    Sandbox,
+    SandboxTask,
     Scheduled,
     ServiceSpec,
     SnapshotLoaderComponent,
@@ -342,11 +357,17 @@ def _task(
             }
         )
 
-    resources: dict[str, Any] = {"CPU": c.resources.cpu, "MemoryMB": c.resources.memory}
-    if c.resources.memory_max:
-        resources["MemoryMaxMB"] = c.resources.memory_max
+    sandbox = c.sandbox
+    if sandbox is not None:
+        # The group's bridge network maps the port; the container itself publishes none.
+        config.pop("ports", None)
+        config = _hardened(config, sandbox)
 
     task: dict[str, Any] = {}
+    if sandbox is not None:
+        task["User"] = _user(sandbox.user, sandbox.group)
+        if sandbox.tasks:
+            task["Leader"] = True  # the other tasks stop when the component's own does
     if _uses_agent(spec, c, platform):
         task["VolumeMounts"] = [
             {"Volume": AGENT_VOLUME, "Destination": AGENT_DIR, "ReadOnly": False}
@@ -358,7 +379,7 @@ def _task(
         "Config": config,
         "Env": _env(spec, cname, c, env, version, platform),
         "Templates": templates,
-        "Resources": resources,
+        "Resources": _resources(c.resources, sandbox.cores if sandbox else None),
         "KillTimeout": _ns(c.kill_timeout),
         "Identities": [
             {
@@ -369,6 +390,87 @@ def _task(
             }
         ],
     }
+
+
+def _resources(r: Resources, cores: int | None = None) -> dict[str, Any]:
+    """Nomad task resources; ``cores`` (whole cores) replaces the ``cpu`` reservation."""
+    out: dict[str, Any] = {"Cores": cores} if cores else {"CPU": r.cpu}
+    out["MemoryMB"] = r.memory
+    if r.memory_max:
+        out["MemoryMaxMB"] = r.memory_max
+    return out
+
+
+def _user(user: int, group: int | None) -> str:
+    # Docker gives a bare UID group 0 (root) when the image has no such user.
+    return f"{user}:{group if group is not None else user}"
+
+
+def _hardened(
+    config: dict[str, Any],
+    s: Sandbox | SandboxTask | Netfilter,
+    cap_add: list[str] | None = None,
+) -> dict[str, Any]:
+    """A sandboxed task's Docker settings: read-only root file system, no capabilities
+    (but ``cap_add``), no-new-privileges, the tmpfs mounts, seccomp, /dev/shm, runtime."""
+    out = dict(config)
+    out["readonly_rootfs"] = True
+    out["cap_drop"] = ["ALL"]
+    if cap_add:
+        out["cap_add"] = list(cap_add)
+    out["security_opt"] = ["no-new-privileges"] + ([f"seccomp={s.seccomp}"] if s.seccomp else [])
+    if s.tmpfs:
+        out["mount"] = [
+            {"type": "tmpfs", "target": t, "readonly": False, "tmpfs_options": {"size": size}}
+            for t, size in s.tmpfs.items()
+        ]
+    if getattr(s, "shm_size", None):
+        out["shm_size"] = s.shm_size
+    if s.runtime:
+        out["runtime"] = s.runtime
+    return out
+
+
+def _command(config: dict[str, Any], command: list[str]) -> dict[str, Any]:
+    out = dict(config, command=command[0])
+    if command[1:]:
+        out["args"] = list(command[1:])
+    return out
+
+
+def _sandbox_tasks(sandbox: Sandbox, image: str, kill_timeout: timedelta) -> list[dict[str, Any]]:
+    """The netfilter prestart task and the extra tasks of a sandboxed group. They get
+    only their own env: no template, no Nomad Variables, no workload identity."""
+    tasks = []
+    if sandbox.netfilter is not None:
+        nf = sandbox.netfilter
+        config = _command({"image": nf.image or image}, nf.command)
+        tasks.append(
+            {
+                "Name": NETFILTER_TASK,
+                "Driver": "docker",
+                "User": "0:0",  # iptables needs root; NET_ADMIN is its only capability
+                "Lifecycle": {"Hook": "prestart", "Sidecar": False},
+                "Config": _hardened(config, nf, cap_add=["NET_ADMIN"]),
+                "Env": dict(nf.env),
+                "Resources": _resources(nf.resources),
+                "KillTimeout": _ns(kill_timeout),
+            }
+        )
+    for name, t in sandbox.tasks.items():
+        config = _command({"image": t.image or image}, t.command)
+        tasks.append(
+            {
+                "Name": name,
+                "Driver": "docker",
+                "User": _user(t.user, t.group),
+                "Config": _hardened(config, t),
+                "Env": dict(t.env),
+                "Resources": _resources(t.resources, t.cores),
+                "KillTimeout": _ns(kill_timeout),
+            }
+        )
+    return tasks
 
 
 def _service(spec: ServiceSpec, cname: str, env: str) -> dict[str, Any]:
@@ -399,6 +501,11 @@ def render_job(
     namespace = naming.nomad_namespace(env)
     task = _task(spec, cname, c, env, version, platform)
     group: dict[str, Any] = {"Name": cname, "Tasks": [task]}
+    sandbox = c.sandbox
+    if sandbox is not None:
+        group["Tasks"] += _sandbox_tasks(sandbox, task["Config"]["image"], c.kill_timeout)
+        # Every task in its own containers, sharing one network namespace (127.0.0.1).
+        group["Networks"] = [{"Mode": "bridge"}]
     if _uses_agent(spec, c, platform):
         group["Volumes"] = {
             AGENT_VOLUME: {"Name": AGENT_VOLUME, "Type": "host", "Source": platform.agent_volume}
@@ -459,7 +566,8 @@ def render_job(
     port: dict[str, Any] = {"Label": HTTP_PORT}
     if platform.host_network:
         port["HostNetwork"] = platform.host_network
-    group["Networks"] = [{"DynamicPorts": [port]}]
+    network: dict[str, Any] = {"Mode": "bridge"} if sandbox is not None else {}
+    group["Networks"] = [network | {"DynamicPorts": [port]}]
     group["Services"] = [_service(spec, cname, env)]
     group["RestartPolicy"] = {
         "Attempts": 10,

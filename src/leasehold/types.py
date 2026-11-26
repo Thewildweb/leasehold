@@ -1,4 +1,4 @@
-"""Shared field types for the spec: durations, priorities and validated names."""
+"""Shared field types for the spec: durations, sizes, priorities and validated names."""
 
 from __future__ import annotations
 
@@ -51,6 +51,41 @@ Duration = Annotated[
                 {"const": 0},
             ],
             "description": "Duration: '30s', '15m', '24h', '7d', '2w' (or 0)",
+        }
+    ),
+]
+
+# --- Sizes: "512K", "256M", "2G" (binary units), as bytes ----------------------------------
+
+_SIZE_RE = re.compile(r"^(\d+)(K|M|G)$")
+_SIZE_UNITS = {"G": 1024**3, "M": 1024**2, "K": 1024}
+
+
+def parse_size(value: object) -> int:
+    # A bare number is rejected, like a duration's: its unit would be ambiguous.
+    if isinstance(value, str):
+        m = _SIZE_RE.match(value.strip())
+        if m and int(m[1]) > 0:
+            return int(m[1]) * _SIZE_UNITS[m[2]]
+    raise ValueError("expected a size like '512K', '256M' or '2G'")
+
+
+def format_size(value: int) -> str:
+    for unit, size in _SIZE_UNITS.items():
+        if value % size == 0:
+            return f"{value // size}{unit}"
+    raise AssertionError("sizes are whole kibibytes")
+
+
+Size = Annotated[
+    int,
+    BeforeValidator(parse_size),
+    PlainSerializer(format_size, return_type=str),
+    WithJsonSchema(
+        {
+            "type": "string",
+            "pattern": r"^\d+(K|M|G)$",
+            "description": "Size: '512K', '256M', '2G' (1024-based)",
         }
     ),
 ]

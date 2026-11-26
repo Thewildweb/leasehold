@@ -445,3 +445,154 @@ def test_datacenter_via_exit_needs_the_datacenter_tier():
 
     with pytest.raises(ValidationError, match="datacenter_via"):
         TaskEgress.model_validate({"tiers": [{"isp": ["isp-a"]}], "datacenter_via": "exit"})
+
+
+# --- sandbox ---------------------------------------------------------------------------------
+
+
+def sandbox_block() -> dict:
+    return {
+        "user": 10000,
+        "seccomp": "/etc/leasehold/seccomp/chromium.json",
+        "tmpfs": {"/tmp": "256M"},
+        "cores": 2,
+        "netfilter": {"command": ["/app/netfilter.sh", "10001", "20000"]},
+        "tasks": {
+            "gateway": {
+                "user": 10001,
+                "command": ["/app/gateway", "--listen", "127.0.0.1:3128"],
+                "resources": {"cpu": 500, "memory": 256},
+                "env": {"GATEWAY_LOG_LEVEL": "info"},
+            },
+            "browser": {
+                "user": 20000,
+                "image": "ghcr.io/example/chromium:131.0",
+                "command": ["chromium", "--headless"],
+                "resources": {"cpu": 2000, "memory": 2048},
+                "shm_size": "2G",
+                "tmpfs": {"/tmp": "1G", "/home/pwuser": "512M"},
+                "runtime": "runsc",
+            },
+        },
+    }
+
+
+def with_sandbox(certwatch: dict, sandbox: dict) -> dict:
+    certwatch["components"]["worker"]["sandbox"] = sandbox
+    return certwatch
+
+
+def test_sandbox_valid(certwatch):
+    spec = ServiceSpec.model_validate(with_sandbox(certwatch, sandbox_block()))
+    sb = spec.components["worker"].sandbox
+    assert (sb.user, sb.group, sb.cores) == (10000, None, 2)
+    assert sb.tmpfs == {"/tmp": 256 * 1024**2}
+    assert sb.netfilter.resources.cpu == 50  # default
+    browser = sb.tasks["browser"]
+    assert browser.shm_size == 2 * 1024**3
+    assert browser.tmpfs == {"/tmp": 1024**3, "/home/pwuser": 512 * 1024**2}
+    assert browser.runtime == "runsc"
+    # Sizes are written back the way they are declared (leasehold schema, dumps).
+    dumped = spec.model_dump(mode="json", by_alias=True)["components"]["worker"]["sandbox"]
+    assert dumped["tasks"]["browser"]["shm_size"] == "2G"
+    assert ServiceSpec.model_validate(spec.model_dump(mode="json", by_alias=True)) == spec
+
+
+def test_component_without_sandbox_has_none(certwatch):
+    assert ServiceSpec.model_validate(certwatch).components["worker"].sandbox is None
+
+
+@pytest.mark.parametrize("user", [0, -1, "root"])
+def test_sandbox_refuses_root(certwatch, user):
+    sb = sandbox_block()
+    sb["user"] = user
+    assert "user" in errors_of(with_sandbox(certwatch, sb))
+    sb = sandbox_block()
+    sb["tasks"]["browser"]["user"] = user
+    assert "user" in errors_of(with_sandbox(certwatch, sb))
+
+
+def test_sandbox_refuses_root_group(certwatch):
+    sb = sandbox_block()
+    sb["tasks"]["gateway"]["group"] = 0
+    assert "non-root" in errors_of(with_sandbox(certwatch, sb))
+
+
+@pytest.mark.parametrize("field", ["secrets", "templates", "identity", "volumes"])
+def test_sandbox_extra_task_gets_no_secrets_or_templates(certwatch, field):
+    sb = sandbox_block()
+    sb["tasks"]["browser"][field] = ["nomad/jobs/x"]
+    assert "Extra inputs are not permitted" in errors_of(with_sandbox(certwatch, sb))
+
+
+def test_sandbox_extra_task_env_may_not_hold_secrets(certwatch):
+    sb = sandbox_block()
+    sb["tasks"]["gateway"]["env"] = {"PROXY_PASSWORD": "x"}
+    assert "extra tasks of a sandbox get no secrets" in errors_of(with_sandbox(certwatch, sb))
+
+
+@pytest.mark.parametrize("where", ["main", "task", "netfilter"])
+def test_sandbox_has_no_cap_add(certwatch, where):
+    # NET_ADMIN is the netfilter task's, rendered by leasehold; nothing declares caps.
+    sb = sandbox_block()
+    target = {"main": sb, "task": sb["tasks"]["browser"], "netfilter": sb["netfilter"]}[where]
+    target["cap_add"] = ["SYS_ADMIN"]
+    assert "cap_add" in errors_of(with_sandbox(certwatch, sb))
+
+
+@pytest.mark.parametrize("target", ["/", "//", "tmp", "/tmp/../etc"])
+def test_sandbox_refuses_bad_tmpfs_targets(certwatch, target):
+    sb = sandbox_block()
+    sb["tasks"]["browser"]["tmpfs"] = {target: "64M"}
+    assert "tmpfs target" in errors_of(with_sandbox(certwatch, sb))
+
+
+@pytest.mark.parametrize("size", ["256", 256, "1.5G", "2T", "0M", ""])
+def test_sandbox_refuses_bad_sizes(certwatch, size):
+    sb = sandbox_block()
+    sb["tasks"]["browser"]["shm_size"] = size
+    assert "expected a size" in errors_of(with_sandbox(certwatch, sb))
+
+
+def test_sandbox_refuses_reserved_and_clashing_task_names(certwatch):
+    sb = sandbox_block()
+    sb["tasks"]["netfilter"] = sb["tasks"].pop("gateway")
+    assert "'netfilter' is reserved" in errors_of(with_sandbox(certwatch, sb))
+    sb = sandbox_block()
+    sb["tasks"]["worker"] = sb["tasks"].pop("gateway")
+    assert "a task has the component's name 'worker'" in errors_of(with_sandbox(certwatch, sb))
+
+
+def test_sandbox_refuses_duplicate_task_names(certwatch, tmp_path):
+    text = yaml.safe_dump(with_sandbox(certwatch, sandbox_block()), sort_keys=False)
+    # The same task twice in the file: YAML would otherwise keep the last one.
+    text = text.replace("      browser:", "      gateway:", 1)
+    path = tmp_path / "service.yml"
+    path.write_text(text)
+    with pytest.raises(SpecError, match="duplicate key 'gateway'"):
+        load_spec(path, dashboards=False)
+
+
+@pytest.mark.parametrize(
+    "image", ["chromium", "ghcr.io/example/chromium:latest", "ghcr.io/example/chromium"]
+)
+def test_sandbox_task_image_needs_a_tag(certwatch, image):
+    sb = sandbox_block()
+    sb["tasks"]["browser"]["image"] = image
+    assert "a full reference with a tag or digest" in errors_of(with_sandbox(certwatch, sb))
+
+
+@pytest.mark.parametrize("seccomp", ["seccomp/chromium.json", "/etc/../chromium.json"])
+def test_sandbox_seccomp_is_an_absolute_path(certwatch, seccomp):
+    sb = sandbox_block()
+    sb["seccomp"] = seccomp
+    assert "an absolute path on the client" in errors_of(with_sandbox(certwatch, sb))
+
+
+def test_sandbox_task_needs_a_command(certwatch):
+    sb = sandbox_block()
+    del sb["tasks"]["gateway"]["command"]
+    assert "command" in errors_of(with_sandbox(certwatch, sb))
+    sb = sandbox_block()
+    sb["netfilter"]["command"] = []
+    assert "command" in errors_of(with_sandbox(certwatch, sb))

@@ -22,6 +22,22 @@ class SpecError(Exception):
         super().__init__(f"{path}: " + "; ".join(messages))
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """A safe loader that refuses a key given twice in one mapping (PyYAML keeps the
+    last one), so two components or tasks with the same name are an error."""
+
+    def construct_mapping(self, node, deep=False):
+        seen: set = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"duplicate key {key!r}", key_node.start_mark
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def _format(exc: ValidationError) -> list[str]:
     out: list[str] = []
     for err in exc.errors(include_url=False):
@@ -40,7 +56,7 @@ def load_spec(path: str | Path, *, dashboards: bool = True) -> ServiceSpec:
     """
     path = Path(path)
     try:
-        data = yaml.safe_load(path.read_text())
+        data = yaml.load(path.read_text(), Loader=_UniqueKeyLoader)
     except OSError as e:
         raise SpecError(path, [str(e)]) from e
     except yaml.YAMLError as e:
