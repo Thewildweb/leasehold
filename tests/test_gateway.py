@@ -175,6 +175,9 @@ def test_admit_rules_in_order():
     assert ctx.admit("www.example.nl", 443, ports, Foreign(), 120, now=1.0) is False
     assert _reason(admit("www.example.nl", 22)) == "port"
     assert _reason(admit("::1")) == "ipv6"
+    for private in ("127.0.0.1", "10.0.0.1", "169.254.169.254", "100.83.247.12", "localhost",
+                    "x.localhost", "0.0.0.0"):  # fmt: skip
+        assert _reason(admit(private)) == "private_address", private
     assert _reason(admit("cdn.other.nl")) == "no_page"
     ctx.page_deadline = 10.0
     assert _reason(admit("cdn.other.nl", foreign=Foreign())) == "foreign_stale"
@@ -551,9 +554,9 @@ def test_foreign_targets_and_a_stale_list_are_refused(tmp_path):
 
 def test_ip_target_page_host_and_redirects(tmp_path):
     async def body(s: Stack):
-        await s.open(target="127.0.0.1", kind="ip", page="shop.nl")
+        await s.open(target="93.184.215.14", kind="ip", page="shop.nl")
         out = []
-        for host in ("shop.nl", "127.0.0.1", "www.shop.nl"):
+        for host in ("shop.nl", "93.184.215.14", "www.shop.nl"):
             status, _, w = await s.connect(host)
             out.append(_header(status, "X-Leasehold-Refused") or status[:12].decode())
             w.close()
@@ -569,7 +572,9 @@ def test_ip_target_page_host_and_redirects(tmp_path):
 
     a, out = run(tmp_path, body)
     assert a == {"ok": True, "host": "www.shop.nl"}
-    assert out == ["HTTP/1.1 200", "HTTP/1.1 200", "no_page", "HTTP/1.1 200", "foreign_target"]
+    # The target address itself passes the gateway; the test exit then refuses it (it
+    # reaches only loopback, which the gateway refuses as a host: private_address).
+    assert out == ["HTTP/1.1 200", "exit_502", "no_page", "HTTP/1.1 200", "foreign_target"]
 
 
 def test_port_and_ipv6_refused_at_the_gateway(tmp_path):

@@ -13,6 +13,10 @@ reach:
   targets the controller keeps up to date), and at most ``third_party_tunnels`` tunnels
   and ``third_party_bytes`` bytes per context.
 
+Never, for either party: an IPv6 address, an IPv4 address that isn't public (loopback,
+private, link-local such as the cloud metadata address, the tailnet's 100.64.0.0/10) or a
+``localhost`` name (``private_address``); the exit refuses those too.
+
 Everything else is refused with a reason (``Refusal.reason``). No I/O here; the server
 (``leasehold.gateway.server``) applies it.
 """
@@ -299,8 +303,16 @@ class Context:
             raise Refusal(403, "port")
         if self.route_expires is not None and self.route_expires <= wall:
             raise Refusal(403, "route_expired")
-        if is_ip(host) and ipaddress.ip_address(host).version != 4:
-            raise Refusal(403, "ipv6")
+        if is_ip(host):
+            addr = ipaddress.ip_address(host)
+            if addr.version != 4:
+                raise Refusal(403, "ipv6")
+            if not addr.is_global:
+                # Loopback, private, link-local (metadata), CGNAT (the tailnet): the exit
+                # refuses them too, but they never leave the machine as a request.
+                raise Refusal(403, "private_address")
+        elif host == "localhost" or host.endswith(".localhost"):
+            raise Refusal(403, "private_address")
         party = self.hosts.party(host)
         if party == "target":
             return False
