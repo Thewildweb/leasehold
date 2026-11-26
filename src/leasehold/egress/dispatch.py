@@ -36,6 +36,14 @@ Holders renew their target leases with their task leases; a renewal lists the le
 that are lost (expired, revoked, the target cooling down, the proxy account or egress
 out of service) so the holder stops at once.
 
+Between two requests to one target there is at least its interval, also across leases,
+holders and egresses: a lease that takes over an ended row (released, expired, at its
+cap, moved to another egress) carries ``not_before``, the old lease's ``expires_at`` plus
+its interval. A holder sends its last request before it releases (which sets
+``expires_at`` to now) and none after ``expires_at``, so the new holder's first request
+waits until ``not_before``; the worker and the agent start their pacing there. A target
+without a row (never leased, or swept about an hour after its last lease) has none.
+
 Pushback reported by any holder cools the target: a block (``challenge``, ``block``) on
 the tier it happened on, escalating the target to the task type's next tier; rate
 pushback (``rate``, ``retry_after``, or no cause) on every tier. Moving to another
@@ -105,6 +113,9 @@ class TargetLease:
     granted: int
     tier: str = tr.DATACENTER
     route: dict | None = field(default=None, repr=False)  # holds credentials
+    # A new lease on a target that was leased before (by any holder, on any egress): its
+    # first request waits until then, one interval after the previous lease ended.
+    not_before: datetime | None = None
 
 
 @dataclass
@@ -371,6 +382,19 @@ class Dispatcher:
                         **{k: v for k, v in p.items() if k != "sticky_ttl_s"},
                     }
                 )
+            # The rows these claims may take over, locked so the upsert sees the same
+            # ones. A lease that ended (released or expired) sent its last request
+            # before its expires_at, so the next lease starts one interval after it.
+            ended = {
+                r["target"]: r
+                for r in await self._rows(
+                    conn,
+                    "SELECT target, lease_id, "
+                    "expires_at + interval_ms * interval '1 millisecond' AS free_at "
+                    "FROM {e}.target_leases WHERE target = ANY(%s) ORDER BY target FOR UPDATE",
+                    (sorted(per_target),),
+                )
+            }
             claimed = await self._rows(
                 conn,
                 """
@@ -480,6 +504,9 @@ class Dispatcher:
             route = None
             if r["account"] is not None:
                 route = routing.route(r)
+            prev = ended.get(r["target"])
+            # Another lease_id: the row had ended and this claim took it over.
+            not_before = prev["free_at"] if prev and prev["lease_id"] != r["lease_id"] else None
             out.append(
                 TargetLease(
                     target=r["target"],
@@ -491,6 +518,7 @@ class Dispatcher:
                     granted=r["granted"],
                     tier=r["tier"],
                     route=route,
+                    not_before=not_before,
                 )
             )
         return Grant(tasks=tasks, targets=out, waiting=dict(waiting))

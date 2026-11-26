@@ -27,7 +27,8 @@ def spec() -> ServiceSpec:
 
 class TargetControl(FakeControl):
     """Keys ``t:x`` go to target ``t``; one target lease per target, granted with the
-    first lease call that hands out its tasks."""
+    first lease call that hands out its tasks. A target leased again after its lease was
+    given back gets a new lease, with ``not_before`` one interval after the release."""
 
     def __init__(self, keys, interval_s=0.2, target_s=30.0, lost_targets=()):
         super().__init__(keys)
@@ -37,6 +38,7 @@ class TargetControl(FakeControl):
         self.lost_targets = set(lost_targets)
         self.renew_calls: list[tuple] = []
         self.egresses: list = []
+        self.ended: dict[str, datetime] = {}  # target -> when its last lease was given back
 
     def lease_with_targets(self, max, task_types=None, worker_id=None, per_group=None,
                            held=None, egress=None):  # fmt: skip
@@ -53,12 +55,15 @@ class TargetControl(FakeControl):
                 new = target not in self.target_ids
                 tid = self.target_ids.setdefault(target, uuid.uuid4())
                 if new:
+                    ended = self.ended.get(target)
+                    nb = ended + timedelta(seconds=self.interval_s) if ended else None
                     targets.append(
                         TargetLease(
                             target,
                             tid,
                             datetime.now(UTC) + timedelta(seconds=self.target_s),
                             self.interval_s,
+                            not_before=nb,
                         )  # fmt: skip
                     )
                 tasks.append(
@@ -78,6 +83,11 @@ class TargetControl(FakeControl):
     def renew_targets(self, egress, leases, release=(), worker_id=None, routes=None):
         self._check()
         self.renew_calls.append((egress, list(leases), list(release)))
+        with self.lock:
+            for t, x in list(self.target_ids.items()):
+                if x in release:
+                    del self.target_ids[t]
+                    self.ended[t] = datetime.now(UTC)
         renewed, lost = {}, {}
         for i in leases:
             target = next(t for t, x in self.target_ids.items() if x == i)
@@ -172,6 +182,27 @@ def test_one_task_per_target_at_a_time_at_the_interval():
     run_until(w, lambda: any(r for _, _, r in control.renew_calls if len(r) == 2) or
               sum(len(r) for _, _, r in control.renew_calls) >= 2)  # fmt: skip
     assert w.targets == {}
+
+
+def test_next_lease_on_a_target_waits_one_interval():
+    """Task done, target lease given back, the target leased again: the next task starts
+    at the new lease's not_before, one interval after the release."""
+    starts = []
+
+    def handle(task, ctx):
+        starts.append(time.monotonic())
+        ctx.emit("results", {"id": task.key, "n": 1})
+
+    control = TargetControl(["a:1"], interval_s=0.5)
+    w = make(handle, control)
+    run_until(w, lambda: "a" in control.ended)
+    released = time.monotonic()
+    assert w.targets == {}
+    control.pending.append("a:2")
+    w.next_lease = 0
+    run_until(w, lambda: len(control.acked) == 2)
+    assert starts[1] - released >= 0.45, starts[1] - released
+    assert starts[1] - starts[0] >= 0.5
 
 
 def test_lost_target_stops_its_tasks(monkeypatch):

@@ -190,8 +190,9 @@ class Route:
 @dataclass(frozen=True)
 class TargetLease:
     """An exclusive lease on a target (leasehold.egress.dispatch): send at most one
-    request per ``interval_s`` to it, and nothing after ``expires_at``. On a proxy tier,
-    ``route`` says how to reach it."""
+    request per ``interval_s`` to it, none before ``not_before`` (when the target was
+    leased before) and nothing after ``expires_at``. On a proxy tier, ``route`` says how
+    to reach it."""
 
     target: str
     lease_id: UUID
@@ -202,6 +203,7 @@ class TargetLease:
     granted: int = 0
     tier: str = "datacenter"
     route: Route | None = None
+    not_before: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -489,6 +491,7 @@ class ControlClient:
                 granted=int(x.get("granted") or 0),
                 tier=x.get("tier") or "datacenter",
                 route=Route.parse(x["route"]) if x.get("route") else None,
+                not_before=_parse_time(x["not_before"]) if x.get("not_before") else None,
             )
             for x in r.get("targets", [])
         ]
