@@ -244,6 +244,18 @@ def _cmd_agent_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_exit_serve(args: argparse.Namespace) -> int:
+    from leasehold.exit.server import ExitSettings, serve
+
+    try:
+        settings = ExitSettings.from_env()
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+    serve(settings)
+    return 0
+
+
 def _cmd_api_serve(args: argparse.Namespace) -> int:
     import logging
 
@@ -956,6 +968,15 @@ def build_parser() -> argparse.ArgumentParser:
         "leasehold.agent.server)",
     )
     ags.set_defaults(func=_cmd_agent_serve)
+
+    ex = sub.add_parser("exit", help="the CONNECT exit of a VPS for routed target leases")
+    exsub = ex.add_subparsers(dest="exit_command", required=True)
+    exs = exsub.add_parser(
+        "serve",
+        help="serve on LEASEHOLD_EXIT_LISTEN (settings from the environment, see "
+        "leasehold.exit.server)",
+    )
+    exs.set_defaults(func=_cmd_exit_serve)
 
     gr = sub.add_parser("grafana", help="dashboards derived from service.yml")
     grsub = gr.add_subparsers(dest="grafana_command", required=True)

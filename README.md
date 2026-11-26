@@ -32,6 +32,7 @@ Stack: Python 3.12, Postgres, Kafka, ClickHouse, Grafana, Nomad, MinIO.
 | `src/leasehold/{kafka,frontier,storage,clickhouse,grafana,nomad}` | one apply step each |
 | `src/leasehold/egress` | egress addresses, providers and budgets, shared by all environments; provider tagging for planners |
 | `src/leasehold/agent` | the egress agent: one per machine and environment, the only process there that talks to the dispatcher |
+| `src/leasehold/exit` | the registry exit: a CONNECT proxy on a VPS for target leases routed through its address, with offline exit tokens |
 | `src/leasehold/archive` | archive sinks: a topic to Parquet files in a bucket |
 | `src/leasehold/snapshots` | snapshot datasets: files in a bucket that ClickHouse loads, the manifest, the loader |
 | `src/leasehold/mocks` | a mock CT log for tests and the dev stack |
