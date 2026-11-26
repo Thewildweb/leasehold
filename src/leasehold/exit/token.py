@@ -1,17 +1,25 @@
 """Exit tokens: the proxy credentials of a target lease routed through a registry exit.
 
 The dispatcher signs one per lease (and again on every renewal); the exit verifies it
-offline with the same key, so a connection needs no call to the control API.
+offline, so a connection needs no call to the control API.
 
 - username: the target lease id;
 - password: ``v1.<claims>.<mac>``, both base64url without padding. ``claims`` is the
   JSON object ``{"l": lease id, "e": egress address, "t": target, "v": environment,
   "x": expiry (unix seconds)}``; ``mac`` is HMAC-SHA256 over ``v1.<claims>``.
 
+Keys. The control API holds a master key; each exit holds only the key derived for its
+own address, ``HMAC-SHA256(master, "exit:" + egress)`` (``exit_key``), so one exit's key
+can't sign for another. ``leasehold exit key --egress <address>`` prints it for the
+exit's job variable.
+
 The exit accepts a token when the MAC matches one of its keys (the current one and,
 during a rotation, the previous one), the lease id equals the username, the egress is
-the exit's own address and the expiry has not passed. The target is not checked: a page
-loads third-party hosts through the same exit. It is in the token for the exit's logs.
+the exit's own address, the environment is one the exit serves, and the expiry has not
+passed. The token says which target the lease is for, but it is not bound to the hosts
+a tunnel opens to: a page loads third-party hosts through the same exit. Which hosts a
+lease may reach is the browser gateway's policy (it alone holds tokens), and the exit
+caps tunnels and bytes per lease (``leasehold.exit.server``).
 """
 
 from __future__ import annotations
@@ -22,6 +30,7 @@ import hashlib
 import hmac
 import json
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -73,12 +82,19 @@ def parse_keys(text: str) -> list[bytes]:
     return keys
 
 
+def exit_key(master: bytes, egress: str) -> bytes:
+    """The key of the exit on ``egress``, derived from the master key."""
+    return hmac.new(master, f"exit:{egress}".encode(), hashlib.sha256).digest()
+
+
 def _mac(key: bytes, signed: str) -> bytes:
     return hmac.new(key, signed.encode(), hashlib.sha256).digest()
 
 
-def sign(key: bytes, claims: Claims) -> tuple[str, str]:
-    """(username, password) for a lease."""
+def sign(master: bytes, claims: Claims) -> tuple[str, str]:
+    """(username, password) for a lease, signed with the egress's derived key."""
+    if not claims.env:
+        raise ValueError("an exit token needs an environment")
     body = json.dumps(
         {
             "l": claims.lease_id,
@@ -91,19 +107,26 @@ def sign(key: bytes, claims: Claims) -> tuple[str, str]:
         sort_keys=True,
     ).encode()
     signed = f"{VERSION}.{_b64(body)}"
+    key = exit_key(master, claims.egress)
     return claims.lease_id, f"{signed}.{_b64(_mac(key, signed))}"
 
 
 def sign_lease(
-    key: bytes, lease_id: str, egress: str, target: str, env: str, expires_at: datetime
+    master: bytes, lease_id: str, egress: str, target: str, env: str, expires_at: datetime
 ) -> tuple[str, str]:
-    return sign(key, Claims(str(lease_id), egress, target, env, int(expires_at.timestamp())))
+    return sign(master, Claims(str(lease_id), egress, target, env, int(expires_at.timestamp())))
 
 
 def verify(
-    keys: list[bytes], username: str, password: str, egress: str, now: float | None = None
+    keys: list[bytes],
+    username: str,
+    password: str,
+    egress: str,
+    envs: Iterable[str],
+    now: float | None = None,
 ) -> Claims:
-    """The claims of a valid token for this exit; ``TokenError`` otherwise."""
+    """The claims of a valid token for this exit (``keys``: its derived keys; ``envs``:
+    the environments it serves); ``TokenError`` otherwise."""
     parts = password.split(".")
     if len(parts) != 3 or parts[0] != VERSION:
         raise TokenError("malformed token")
@@ -120,6 +143,8 @@ def verify(
         raise TokenError("token is for another lease")
     if claims.egress != egress:
         raise TokenError("token is for another egress")
+    if not claims.env or claims.env not in set(envs):
+        raise TokenError("token is for another environment")
     if claims.expires_at <= (time.time() if now is None else now):
         raise TokenError("token expired")
     return claims
