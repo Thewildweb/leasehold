@@ -438,6 +438,12 @@ class TaskEgress(_Strict):
         description="Per proxy tier: no route through an account once this share of its "
         "quota is used ('70%'); the task type's own stop. Unset: until quota_exhausted",
     )
+    datacenter_via: Literal["bind", "exit"] = Field(
+        default="bind",
+        description="How the datacenter tier is reached: bind (the worker runs on the VPS "
+        "and binds its address) or exit (the worker has no address of its own; routes go "
+        "through the exits of registry egresses, leasehold.exit)",
+    )
     session: EgressSession | None = None
     per_env: dict[str, EgressEnvOverride] = Field(
         default_factory=dict,
@@ -478,6 +484,8 @@ class TaskEgress(_Strict):
         if self.session is not None and self.session.mode == "sticky":
             if not any(t in _PROXY_TIERS for t in seen):
                 raise ValueError("sticky sessions are for proxy tiers")
+        if self.datacenter_via == "exit" and "datacenter" not in seen:
+            raise ValueError("datacenter_via is for task types with the datacenter tier")
         return self
 
     def resolve(self, env: str) -> dict:
@@ -485,7 +493,10 @@ class TaskEgress(_Strict):
         tiers = []
         for entry in self.tiers:
             if isinstance(entry, str):
-                tiers.append({"tier": entry, "names": []})
+                t: dict = {"tier": entry, "names": []}
+                if self.datacenter_via == "exit":
+                    t["via"] = "exit"
+                tiers.append(t)
             else:
                 ((tier, names),) = entry.items()
                 tiers.append({"tier": tier, "names": list(names)})

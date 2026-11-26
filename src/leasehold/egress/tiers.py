@@ -14,9 +14,16 @@ again. A tier with nothing eligible leaves the target waiting on it: escalation 
 skips a tier, and a task type without ``datacenter`` never reaches a target from our
 own addresses.
 
+``datacenter`` is reached in one of two ways. By default the worker binds its own
+address (it runs on the VPS). With ``via: exit`` on the tier (``datacenter_via: exit``
+in ``service.yml``) the worker has no address of its own: the dispatcher picks a
+registry egress that runs an exit (``leasehold.exit``) and the route goes through it
+with an exit token. Such a task type is never served from a worker's own address.
+
 The resolved block is stored per environment in ``task_types.egress`` (frontier schema):
 
-    {"tiers": [{"tier": "datacenter", "names": []}, {"tier": "isp", "names": ["isp-a"]}],
+    {"tiers": [{"tier": "datacenter", "names": [], "via": "exit"},
+               {"tier": "isp", "names": ["isp-a"]}],
      "countries": ["NL"], "stop_at_used": {"isp": 0.7},
      "session": {"mode": "sticky", "ttl_s": 600} | null}
 """
@@ -26,6 +33,7 @@ from __future__ import annotations
 from typing import Any
 
 DATACENTER = "datacenter"
+VIA_EXIT = "exit"
 TIERS = ("datacenter", "isp", "residential", "mobile")
 PROXY_TIERS = TIERS[1:]
 ALL_TIERS = "*"  # a cooldown on every tier (rate pushback)
@@ -59,7 +67,16 @@ def uses_proxies(egress: dict[str, Any] | None) -> bool:
 
 
 def uses_datacenter(egress: dict[str, Any] | None) -> bool:
-    return DATACENTER in tier_names(egress)
+    """Served on the datacenter tier from the worker's own address."""
+    return DATACENTER in tier_names(egress) and not via_exit(egress)
+
+
+def via_exit(egress: dict[str, Any] | None) -> bool:
+    """Served on the datacenter tier through registry exits."""
+    for t in resolved(egress)["tiers"]:
+        if t["tier"] == DATACENTER:
+            return t.get("via") == VIA_EXIT
+    return False
 
 
 def rank(tier: str) -> int:

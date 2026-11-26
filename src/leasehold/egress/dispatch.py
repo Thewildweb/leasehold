@@ -44,6 +44,16 @@ its interval. A holder sends its last request before it releases (which sets
 waits until ``not_before``; the worker and the agent start their pacing there. A target
 without a row (never leased, or swept about an hour after its last lease) has none.
 
+A task type that reaches the datacenter tier through exits (``datacenter_via: exit``,
+``leasehold.egress.tiers``) is leased by workers without an address of their own (the
+sandboxed browser). For its targets on that tier the dispatcher picks a registry egress
+that runs an exit (``exit_endpoint``, not taken out by ``exit_override``), the least
+loaded one first, with the same pair budget, provider tokens and one-holder rule as the
+VPS's own workers: the lease is on that egress's address, with ``via = 'exit'``. The route
+names the exit's endpoint and carries an exit token (``leasehold.exit.token``) signed
+with the exit key, valid until the lease expires plus ``EXIT_TOKEN_GRACE``; every renewal
+returns the route again with a fresh token. Without an exit key no such route is given.
+
 Pushback reported by any holder cools the target: a block (``challenge``, ``block``) on
 the tier it happened on, escalating the target to the task type's next tier; rate
 pushback (``rate``, ``retry_after``, or no cause) on every tier. Moving to another
@@ -75,6 +85,11 @@ from leasehold.egress.config import SHARED_IP_PREFIX, Budgets
 from leasehold.egress.planner import ANY_CLASS, effective_class
 from leasehold.egress.schema import SCHEMA
 from leasehold.egress.secrets import Keyring, SecretsError
+from leasehold.exit import token as exit_token
+
+# The account name routes through registry exits carry (RouteRef): no proxy account.
+EXIT_ACCOUNT = "exit"
+EXIT_TOKEN_GRACE = timedelta(seconds=30)
 
 SCAN_PER_TASK = 20  # due tasks read per task asked for, to look past busy targets
 SCAN_MAX = 5000
@@ -161,7 +176,13 @@ def _spread(target: str, key: str) -> str:
     return hashlib.sha256(f"{target}|{key}".encode()).hexdigest()[:8]
 
 
-_DIRECT = {"account": None, "route_fp": None, "sticky_ttl_s": None, "country": None}
+_DIRECT = {
+    "account": None,
+    "route_fp": None,
+    "sticky_ttl_s": None,
+    "country": None,
+    "via": None,
+}
 
 
 class Dispatcher:
@@ -171,10 +192,12 @@ class Dispatcher:
         frontier_schema: str,
         egress_schema: str = SCHEMA,
         keyring: Keyring | None = None,
+        exit_key: bytes | None = None,
     ):
         self.env = env
         self.schema = egress_schema
         self.keyring = keyring or Keyring([])
+        self.exit_key = exit_key  # signs exit tokens; None: no routes through exits
         self._f = sql.Identifier(frontier_schema)
         self._e = sql.Identifier(egress_schema)
         self.stopped: set[Stopped] = set()  # from the last lease call, for metrics
@@ -253,7 +276,7 @@ class Dispatcher:
                 for r in await self._rows(
                     conn,
                     "SELECT target, egress, holder, env, cap, granted, account, tier, session, "
-                    "expires_at > now() AS live, revoked_at IS NOT NULL AS revoked "
+                    "via, expires_at > now() AS live, revoked_at IS NOT NULL AS revoked "
                     "FROM {e}.target_leases WHERE target = ANY(%s)",
                     (targets,),
                 )
@@ -288,7 +311,8 @@ class Dispatcher:
 
             routing = await _Routing.load(self, conn, types)
             self.stopped = routing.stopped
-            keys = sorted(({egress} if egress else set()) | routing.keys)
+            exits = await _Exits.load(self, conn, types)
+            keys = sorted(({egress} if egress else set()) | routing.keys | exits.keys)
             toks = await _Tokens.load(
                 self,
                 conn,
@@ -308,6 +332,7 @@ class Dispatcher:
                 direct,
                 holder,
                 routing,
+                exits,
             )
             taken: dict[tuple[str, str], tuple[str, str, str]] = {}  # task -> allocation row
             waiting: dict[str, int] = defaultdict(int)
@@ -338,7 +363,7 @@ class Dispatcher:
                 p = plan.get(target)
                 if p is None or room[target] <= 0:
                     continue
-                if not self._accepts(c["task_type"], p, types, direct, routing):
+                if not self._accepts(c["task_type"], p, types, direct, routing, exits):
                     continue
                 if budget:
                     row = toks.take(p["egress"], provider, klass)
@@ -401,16 +426,17 @@ class Dispatcher:
                 INSERT INTO {e}.target_leases AS l
                   (target, egress, holder, env, lease_id, provider, interval_ms, duration_ms,
                    cap, granted, expires_at, account, tier, session, session_ttl_s, country,
-                   route_fp)
+                   route_fp, via)
                 SELECT c.target, c.egress, %(holder)s, %(env)s, c.lease_id, c.provider,
                        c.interval_ms, c.duration_ms, c.cap, c.granted,
                        now() + c.duration_ms * interval '1 millisecond',
-                       c.account, c.tier, c.session, c.session_ttl_s, c.country, c.route_fp
+                       c.account, c.tier, c.session, c.session_ttl_s, c.country, c.route_fp,
+                       c.via
                 FROM jsonb_to_recordset(%(claims)s::jsonb)
                   AS c(target text, lease_id uuid, provider text, interval_ms int,
                        duration_ms int, cap int, granted int, egress text, account text,
                        tier text, session text, session_ttl_s int, country text,
-                       route_fp text)
+                       route_fp text, via text)
                 ON CONFLICT (target) DO UPDATE SET
                   lease_id    = CASE WHEN l.expires_at > now() THEN l.lease_id
                                      ELSE EXCLUDED.lease_id END,
@@ -436,6 +462,7 @@ class Dispatcher:
                   duration_ms = EXCLUDED.duration_ms,
                   account     = EXCLUDED.account,
                   tier        = EXCLUDED.tier,
+                  via         = EXCLUDED.via,
                   revoked_at  = NULL,
                   revoke_reason = NULL
                 WHERE l.expires_at <= now()
@@ -444,7 +471,7 @@ class Dispatcher:
                        AND l.granted + EXCLUDED.granted <= l.cap)
                 RETURNING l.target, l.lease_id, l.expires_at, l.interval_ms, l.provider,
                           l.cap, l.granted, l.egress, l.account, l.tier, l.session,
-                          l.session_ttl_s, l.country
+                          l.session_ttl_s, l.country, l.via
                 """,
                 {"holder": holder, "env": self.env, "claims": json.dumps(claims)},
             )
@@ -504,6 +531,8 @@ class Dispatcher:
             route = None
             if r["account"] is not None:
                 route = routing.route(r)
+            elif r["via"] == tr.VIA_EXIT:
+                route = exits.route(r)
             prev = ended.get(r["target"])
             # Another lease_id: the row had ended and this claim took it over.
             not_before = prev["free_at"] if prev and prev["lease_id"] != r["lease_id"] else None
@@ -550,7 +579,9 @@ class Dispatcher:
             and (allowed is None or t in allowed)
             and tr.uses_datacenter(types[t]["egress"])
         ]
-        if not ok and not any(tr.uses_proxies(types[t]["egress"]) for t in types):
+        if not ok and not any(
+            tr.uses_proxies(types[t]["egress"]) or tr.via_exit(types[t]["egress"]) for t in types
+        ):
             raise EgressRefused(f"egress {egress} may not lease these task types")
         return set(ok)
 
@@ -582,7 +613,14 @@ class Dispatcher:
             if (target, tr.ALL_TIERS) in x.cooling or (target, tier) in x.cooling:
                 return None, "cooling"
             key = lease["egress"]
-            if lease["account"] is None:
+            if lease["via"] == tr.VIA_EXIT:
+                if not tr.via_exit(tt["egress"]) or tier != tr.DATACENTER:
+                    return None, "held"
+                ex = x.exits.by_key.get(key)
+                if ex is None or not ex.serves(c["task_type"]):
+                    return None, "exit_unavailable"
+                fields = {**_DIRECT, "tier": tier, "via": tr.VIA_EXIT}
+            elif lease["account"] is None:
                 if key != x.egress or c["task_type"] not in x.direct:
                     return None, "held"
                 fields = {**_DIRECT, "tier": tier}
@@ -600,6 +638,13 @@ class Dispatcher:
         tier = tr.effective(tt["egress"], x.on_tier.get(target))
         if (target, tr.ALL_TIERS) in x.cooling or (target, tier) in x.cooling:
             return None, "cooling"
+        if tier == tr.DATACENTER and tr.via_exit(tt["egress"]):
+            ex, why = x.exits.pick(c["task_type"], target, pair_left, has_token)
+            if ex is None:
+                return None, why
+            x.exits.claim(ex)
+            fields = {**_DIRECT, "tier": tier, "via": tr.VIA_EXIT}
+            return {**base, "egress": ex.key, **fields, "room": min(cap, pair_left(ex.key))}, ""
         if tier == tr.DATACENTER:
             if x.egress is None or c["task_type"] not in x.direct:
                 return None, "no_datacenter_egress"
@@ -617,8 +662,18 @@ class Dispatcher:
         fields = x.routing.plan_fields(eg, tt)
         return {**base, "egress": eg.key, **fields, "room": min(cap, pair_left(eg.key))}, ""
 
-    def _accepts(self, task_type: str, p: dict, types, direct, routing: _Routing) -> bool:
+    def _accepts(
+        self, task_type: str, p: dict, types, direct, routing: _Routing, exits: _Exits
+    ) -> bool:
         """A second task type on a planned target must accept the same egress."""
+        if p.get("via") == tr.VIA_EXIT:
+            ex = exits.by_key.get(p["egress"])
+            return (
+                ex is not None
+                and ex.serves(task_type)
+                and tr.via_exit(types[task_type]["egress"])
+                and p["tier"] == tr.DATACENTER
+            )
         if p["account"] is None:
             return task_type in direct
         eg = routing.by_key.get(p["egress"])
@@ -720,7 +775,8 @@ class Dispatcher:
                     self._q(
                         "UPDATE {e}.target_leases SET expires_at = now() "
                         "WHERE lease_id = ANY(%s) AND holder = %s "
-                        "AND (egress = %s OR account IS NOT NULL) AND expires_at > now()"
+                        "AND (egress = %s OR account IS NOT NULL OR via IS NOT NULL) "
+                        "AND expires_at > now()"
                     ),
                     (list(release), holder, egress),
                 )
@@ -734,7 +790,7 @@ class Dispatcher:
                                           now() + l.duration_ms * interval '1 millisecond')
                 WHERE l.lease_id = ANY(%(ids)s) AND l.holder = %(holder)s
                   AND l.env = %(env)s
-                  AND (l.egress = %(egress)s OR l.account IS NOT NULL)
+                  AND (l.egress = %(egress)s OR l.account IS NOT NULL OR l.via IS NOT NULL)
                   AND l.expires_at > now() AND l.revoked_at IS NULL
                   AND NOT EXISTS (SELECT 1 FROM {e}.target_cooldowns c
                                   WHERE c.target = l.target AND c.until > now()
@@ -752,8 +808,13 @@ class Dispatcher:
                         SELECT 1 FROM {e}.proxy_pools p
                         WHERE 'pool:' || p.name = l.egress AND p.override_status IS NULL
                           AND p.status <> 'disabled' AND p.removed_at IS NULL))
+                  AND (l.via IS NULL OR EXISTS (
+                        SELECT 1 FROM {e}.egresses x
+                        WHERE host(x.address) = l.egress AND x.exit_endpoint IS NOT NULL
+                          AND x.exit_override IS NULL AND x.override_status IS NULL
+                          AND x.status <> 'disabled' AND x.removed_at IS NULL))
                 RETURNING l.lease_id, l.expires_at, l.target, l.egress, l.account, l.tier,
-                          l.session, l.session_ttl_s, l.country, l.route_fp
+                          l.session, l.session_ttl_s, l.country, l.route_fp, l.via
                 """,
                 {"ids": list(lease_ids), "egress": egress, "holder": holder, "env": self.env},
             )
@@ -761,6 +822,11 @@ class Dispatcher:
             routed = [r for r in renewed if r["account"] is not None]
             if routes is not None and routed:
                 await self._refresh_routes(conn, routed, routes)
+            via_exit = [r for r in renewed if r["via"] == tr.VIA_EXIT]
+            if routes is not None and via_exit:
+                # The exit token expires with the lease: a renewal always signs a new one.
+                for r, route in (await _Exits.routes_for(self, conn, via_exit)).items():
+                    routes[r] = route
             missing = [i for i in lease_ids if i not in ok]
             lost: dict[UUID, str] = {}
             if missing:
@@ -768,7 +834,7 @@ class Dispatcher:
                     conn,
                     """
                     SELECT l.lease_id, l.expires_at <= now() AS expired, l.revoke_reason,
-                           l.revoked_at IS NOT NULL AS revoked, l.account,
+                           l.revoked_at IS NOT NULL AS revoked, l.account, l.via, l.holder,
                            (SELECT c.reason FROM {e}.target_cooldowns c
                             WHERE c.target = l.target AND c.until > now()
                               AND c.tier IN ('*', l.tier) LIMIT 1) AS cooling,
@@ -791,6 +857,8 @@ class Dispatcher:
                         why[r["lease_id"]] = f"proxy account {r['account']} is {r['account_state']}"
                     elif r["account"] is not None:
                         why[r["lease_id"]] = "proxy egress or account disabled"
+                    elif r["via"] is not None and r["holder"] == holder:
+                        why[r["lease_id"]] = "exit out of service"
                 for i in missing:
                     lost[i] = why.get(i, "not held")
         return ok, lost
@@ -1079,7 +1147,7 @@ class Dispatcher:
             return {}
         rows = await self._rows(
             conn,
-            "SELECT target, lease_id, egress, account, tier, holder, env, "
+            "SELECT target, lease_id, egress, account, tier, holder, env, via, "
             "expires_at > now() AS live FROM {e}.target_leases WHERE target = ANY(%s)",
             (targets,),
         )
@@ -1169,6 +1237,7 @@ class _PlanContext:
     direct: set
     holder: str
     routing: _Routing
+    exits: _Exits
 
 
 class _Routing:
@@ -1325,6 +1394,135 @@ class _Routing:
             )
         except SecretsError:
             return None
+
+
+@dataclass(frozen=True)
+class RegistryExit:
+    """A registry egress that runs an exit (``leasehold.exit``)."""
+
+    key: str  # the egress address
+    endpoint: str
+    country: str | None = None
+    task_types: tuple[str, ...] | None = None
+
+    def serves(self, task_type: str) -> bool:
+        return self.task_types is None or task_type in self.task_types
+
+
+_EXITS_SQL = """
+    SELECT host(address) AS key, exit_endpoint, country, task_types FROM {e}.egresses
+    WHERE source = 'registry' AND exit_endpoint IS NOT NULL AND exit_override IS NULL
+      AND status = 'active' AND override_status IS NULL AND removed_at IS NULL
+"""
+
+
+def _exit_of(r: dict) -> RegistryExit:
+    return RegistryExit(
+        key=r["key"],
+        endpoint=r["exit_endpoint"],
+        country=r["country"],
+        task_types=tuple(r["task_types"]) if r["task_types"] is not None else None,
+    )
+
+
+class _Exits:
+    """The registry exits a lease call may route through."""
+
+    def __init__(self, d: Dispatcher):
+        self.d = d
+        self.by_key: dict[str, RegistryExit] = {}
+        self.open: dict[str, int] = defaultdict(int)
+
+    @property
+    def keys(self) -> set[str]:
+        return set(self.by_key)
+
+    @classmethod
+    async def load(cls, d: Dispatcher, conn: AsyncConnection, types: dict) -> _Exits:
+        x = cls(d)
+        if d.exit_key is None or not any(tr.via_exit(t["egress"]) for t in types.values()):
+            return x  # fail closed: no exit routes without a key
+        x.by_key = {r["key"]: _exit_of(r) for r in await d._rows(conn, _EXITS_SQL)}
+        for row in await d._rows(
+            conn,
+            "SELECT egress, count(*) AS n FROM {e}.target_leases "
+            "WHERE via IS NOT NULL AND expires_at > now() AND revoked_at IS NULL "
+            "GROUP BY egress",
+        ):
+            x.open[row["egress"]] = row["n"]
+        return x
+
+    def pick(self, task_type, target, pair_left, has_token):
+        """The least loaded exit that serves the task type and has budget left."""
+        if not self.by_key:
+            return None, "no_exit"
+        why = "no_exit"
+        options = []
+        for ex in self.by_key.values():
+            if not ex.serves(task_type):
+                continue
+            if pair_left(ex.key) <= 0:
+                why = "pair_budget"
+                continue
+            if not has_token(ex.key):
+                why = "no_tokens"
+                continue
+            options.append(ex)
+        if not options:
+            return None, why
+        options.sort(key=lambda e: (self.open[e.key], _spread(target, e.key)))
+        return options[0], ""
+
+    def claim(self, ex: RegistryExit) -> None:
+        self.open[ex.key] += 1
+
+    def route(self, row: dict) -> dict | None:
+        ex = self.by_key.get(row["egress"])
+        if ex is None or self.d.exit_key is None:
+            return None
+        return exit_route(self.d.exit_key, ex, row, self.d.env)
+
+    @staticmethod
+    async def routes_for(d: Dispatcher, conn: AsyncConnection, rows: list[dict]) -> dict:
+        if d.exit_key is None:
+            return {}
+        by_key = {r["key"]: _exit_of(r) for r in await d._rows(conn, _EXITS_SQL)}
+        out = {}
+        for r in rows:
+            ex = by_key.get(r["egress"])
+            if ex is not None:
+                out[r["lease_id"]] = exit_route(d.exit_key, ex, r, d.env)
+        return out
+
+
+def exit_route(key: bytes, ex: RegistryExit, row: dict, env: str) -> dict:
+    """The route of a target lease through a registry exit. Holds the exit token: never
+    log it."""
+    scheme, host, port = px.parse_endpoint(ex.endpoint)
+    user, password = exit_token.sign_lease(
+        key, str(row["lease_id"]), ex.key, row["target"], env, row["expires_at"] + EXIT_TOKEN_GRACE
+    )
+    return {
+        "egress": ex.key,
+        "kind": tr.DATACENTER,
+        "country": ex.country,
+        "account": EXIT_ACCOUNT,
+        "pool": None,
+        "proxy": {
+            "scheme": scheme,
+            "host": host,
+            "port": port,
+            "username": user,
+            "password": password,
+        },
+        "session": None,
+        "exit_ip": ex.key,
+        "exit_ip_header": None,
+        "account_remaining": None,
+        "errors": [],
+        "credentials_fp": None,
+        "expires_at": row["expires_at"].isoformat(),
+    }
 
 
 def _stopped(acc: px.Account, stop: float) -> bool:

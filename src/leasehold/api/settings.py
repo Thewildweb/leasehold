@@ -31,6 +31,11 @@ is given and proxy credentials can't be stored:
     LEASEHOLD_PROXY_INTERVAL  seconds between checks for due proxy jobs: usage polls,
                               exit address checks, probes (default: 60; schema owner only)
 
+Registry exits (``leasehold.exit``); without a key no route through an exit is given:
+
+    LEASEHOLD_EXIT_KEYS       the exit key(s), hex or base64url, comma-separated; the first
+                              signs exit tokens (the exits accept all of them)
+
 The alert inbox (``leasehold.api.alerts``), off when LEASEHOLD_CLICKHOUSE_URL is unset:
 
     LEASEHOLD_CLICKHOUSE_URL       ClickHouse HTTP interface, e.g. http://clickhouse:8123
@@ -58,7 +63,7 @@ Consumer lag (``leasehold.kafka.lag``), off without a bootstrap address and a pa
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from leasehold import naming
@@ -100,6 +105,7 @@ class Settings:
     lag_interval: float = 60.0
     monitor_services: frozenset[str] | None = None
     paused_runs: frozenset[str] = frozenset()
+    exit_key: bytes | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> Settings:
@@ -138,4 +144,16 @@ class Settings:
             monitor_services=_names(e.get("LEASEHOLD_MONITOR_SERVICES")) or None,
             paused_runs=_names(e.get("LEASEHOLD_PAUSED_RUNS")),
             lag_interval=float(e.get("LEASEHOLD_LAG_INTERVAL", "60")),
+            exit_key=_exit_key(e.get("LEASEHOLD_EXIT_KEYS")),
         )
+
+
+def _exit_key(value: str | None) -> bytes | None:
+    if not value:
+        return None
+    from leasehold.exit.token import parse_keys
+
+    try:
+        return parse_keys(value)[0]
+    except ValueError as err:
+        raise SettingsError(f"LEASEHOLD_EXIT_KEYS: {err}") from None

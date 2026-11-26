@@ -72,7 +72,13 @@ from leasehold.api.runs import RunLog
 from leasehold.api.runs import jobs as scheduled_jobs
 from leasehold.api.settings import Settings
 from leasehold.egress import tiers
-from leasehold.egress.dispatch import ClearRefused, Cooling, Dispatcher, EgressRefused
+from leasehold.egress.dispatch import (
+    EXIT_ACCOUNT,
+    ClearRefused,
+    Cooling,
+    Dispatcher,
+    EgressRefused,
+)
 from leasehold.egress.planner import Planner, effective_class, publish_demand
 from leasehold.egress.probe import Prober
 from leasehold.egress.proxies import STATES as PROXY_STATES
@@ -605,7 +611,9 @@ def create_app(
     )
     frontier = Frontier(settings.env)
     keyring = keyring if keyring is not None else Keyring.from_env()
-    dispatcher = Dispatcher(settings.env, frontier.schema, settings.egress_schema, keyring)
+    dispatcher = Dispatcher(
+        settings.env, frontier.schema, settings.egress_schema, keyring, settings.exit_key
+    )
     planner = Planner(settings.egress_schema)
     admin = ProxyAdmin(settings.egress_schema, settings.env, keyring)
     adapters = adapters if adapters is not None else load_adapters()
@@ -1279,6 +1287,7 @@ def create_app(
             or getattr(i, "route", None) is not None
         ]
         routed = [i for i in routed if i.task_type in registry.target_leased]
+        routed = await _exit_outcomes(conn, routed)
         if not routed or not await proxy_tables_exist(conn, settings.egress_schema):
             return
         targets = await dispatcher.targets_of(conn, [(i.task_type, i.key) for i in routed])
@@ -1357,6 +1366,40 @@ def create_app(
         await dispatcher.release_targets(conn, release)
         await admin.record_usage(conn, usage)
         await admin.clear_failures(conn, ok_accounts)
+
+    async def _exit_outcomes(conn, items: list) -> list:
+        """Outcomes of routes through registry exits (no proxy account): bytes and errors
+        are counted per exit; a refusal or connect failure releases the target (not
+        cooled), as for proxies. Returns the other items."""
+        rest, release = [], []
+        exit_items = []
+        for i in items:
+            r = getattr(i, "route", None)
+            if r is not None and r.account == EXIT_ACCOUNT:
+                exit_items.append(i)
+            else:
+                rest.append(i)
+        if not exit_items:
+            return rest
+        targets = await dispatcher.targets_of(conn, [(i.task_type, i.key) for i in exit_items])
+        for i in exit_items:
+            if i.bytes:
+                metrics.proxy_bytes.labels(settings.env, EXIT_ACCOUNT, i.task_type).inc(i.bytes)
+            err = getattr(i, "proxy_error", None)
+            if err is None:
+                continue
+            metrics.proxy_errors.labels(settings.env, EXIT_ACCOUNT, err.kind).inc()
+            log.warning(
+                "exit error",
+                extra={
+                    "fields": {"egress": i.route.egress, "kind": err.kind, "status": err.status}
+                },
+            )
+            t = targets.get((i.task_type, i.key))
+            if t and err.kind != "gateway":
+                release.append((t, i.route.lease_id))
+        await dispatcher.release_targets(conn, release)
+        return rest
 
     def _check_refs(c: Caller, refs) -> None:
         registry.require_lease(c, {r.task_type for r in refs})

@@ -10,7 +10,11 @@ with ``leasehold egress apply <dir>``:
       - { address: 192.0.2.10, host: worker-1, ipv6: "2001:db8:1::/64" }
       - { address: 192.0.2.11, host: worker-2 }
 
-The subnet of an IPv4 egress is its /24 unless ``subnet`` is given.
+The subnet of an IPv4 egress is its /24 unless ``subnet`` is given. An egress that runs
+an exit (``leasehold.exit``) gives its endpoint on the private network, for task types
+that reach the datacenter tier through exits (``datacenter_via: exit``)::
+
+      - { address: 192.0.2.12, host: worker-3, exit: { endpoint: "http://100.64.0.12:3130" } }
 
 ``providers.yml``: network groups that score an egress across many domains (CDNs,
 WAFs, hosted platforms), and how a target is recognised::
@@ -87,6 +91,19 @@ class EgressDefaults(_Strict):
     status: EgressStatus = "active"
 
 
+class ExitEntry(_Strict):
+    endpoint: str = Field(
+        description="http://host:port of the exit on the private network (leasehold.exit)"
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> ExitEntry:
+        m = re.fullmatch(r"http://([^/:@\s]+|\[[0-9a-fA-F:]+\]):(\d{1,5})", self.endpoint)
+        if m is None or not 0 < int(m.group(2)) < 65536:
+            raise ValueError(f"exit endpoint must be http://host:port, not {self.endpoint!r}")
+        return self
+
+
 class EgressEntry(_Strict):
     address: str
     host: str | None = Field(default=None, max_length=100)
@@ -100,6 +117,7 @@ class EgressEntry(_Strict):
     task_types: list[str] | None = Field(
         default=None, description="Only these task types may use this egress; unset: any"
     )
+    exit: ExitEntry | None = None
 
 
 class Egress(_Strict):
@@ -115,6 +133,7 @@ class Egress(_Strict):
     status: EgressStatus
     cost: float | None
     task_types: list[str] | None = None
+    exit_endpoint: str | None = None
 
 
 class RegistryFile(_Strict):
@@ -158,6 +177,7 @@ class RegistryFile(_Strict):
                     status=e.status or d.status,
                     cost=e.cost,
                     task_types=sorted(e.task_types) if e.task_types is not None else None,
+                    exit_endpoint=e.exit.endpoint if e.exit is not None else None,
                 )
             )
         return out

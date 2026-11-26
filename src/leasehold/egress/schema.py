@@ -407,6 +407,29 @@ MIGRATIONS.append(
     )
 )
 
+MIGRATIONS.append(
+    (
+        6,
+        [
+            # Registry exits (leasehold.exit): a VPS's address also reached through a
+            # CONNECT proxy on its private address, by workers that have no address of
+            # their own. `exit_override` takes the exit out of service (the probe, an
+            # operator) without touching the VPS's own workers.
+            """
+            ALTER TABLE {s}.egresses
+              ADD COLUMN exit_endpoint text,
+              ADD COLUMN exit_override text CHECK (exit_override IN ('drain', 'disabled')),
+              ADD COLUMN exit_override_reason text,
+              ADD CONSTRAINT egresses_exit_registry
+                CHECK (exit_endpoint IS NULL OR account IS NULL)
+            """,
+            # A target lease routed through a registry exit: via = 'exit'.
+            "ALTER TABLE {s}.target_leases ADD COLUMN via text",
+            "CREATE INDEX target_leases_via ON {s}.target_leases (egress) WHERE via IS NOT NULL",
+        ],
+    )
+)
+
 # Tables the dispatchers of every environment write; the schema owner grants them to
 # the other environments' roles (`leasehold egress migrate --writer <role>`).
 # Allocations only take spending (`used`): other environments never create or resize them.
@@ -425,7 +448,8 @@ SHARED_WRITE = {
     "proxy_audit": "INSERT",
     "proxy_accounts": "UPDATE (state, state_reason, state_since, updated_at)",
     "proxy_pools": "UPDATE (consecutive_failures, override_status, override_reason, updated_at)",
-    "egresses": "UPDATE (consecutive_failures, override_status, override_reason, updated_at)",
+    "egresses": "UPDATE (consecutive_failures, override_status, override_reason, "
+    "exit_override, exit_override_reason, updated_at)",
 }
 # Columns a read-only role (Grafana) may not select: the ciphertexts.
 SECRET_COLUMNS = {"proxy_accounts": ("credentials", "usage_credentials")}
@@ -534,6 +558,7 @@ _EGRESS_COLS = (
     "status",
     "cost",
     "task_types",
+    "exit_endpoint",
 )
 
 

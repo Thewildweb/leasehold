@@ -68,7 +68,10 @@ encrypted with a key only the control API has (`LEASEHOLD_SECRETS_KEY`). A task 
 proxies only through its `egress:` block in `service.yml`: tiers in escalation order
 (`datacenter`, `isp`, `residential`, `mobile`), each proxy tier naming the accounts or
 pools it may use. A block moves a target to the next tier; a task type without
-`datacenter` never reaches a target from our own addresses. See `leasehold.egress.tiers`,
+`datacenter` never reaches a target from our own addresses. A task type with
+`datacenter_via: exit` reaches the datacenter tier through the exits of registry egresses
+(`exit: {endpoint: ...}` in `registry.yml`, `leasehold exit serve` on the VPS) instead of
+the worker's own address: for workers that have none, such as a sandboxed browser. See `leasehold.egress.tiers`,
 `leasehold.egress.proxies` and `leasehold.runtime.proxy`. An account is drained or enabled only
 with a limit (`--cap-gb`, or one its usage API reports); `leasehold proxy account poll`
 reads the usage API once while the account is still disabled. Account states, quota warnings and

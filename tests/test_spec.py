@@ -422,3 +422,26 @@ def test_derived_offset():
             Derived.model_validate({"schema_file": "s.sql", "refresh": "1d", "offset": offset})
     with pytest.raises(ValidationError, match="duration"):
         Derived.model_validate({"schema_file": "s.sql", "refresh": "1d", "offset": "9"})
+
+
+def test_datacenter_via_exit_is_stored_on_the_datacenter_tier():
+    from leasehold.egress import tiers
+    from leasehold.spec.models import TaskEgress
+
+    e = TaskEgress.model_validate(
+        {"tiers": ["datacenter", {"isp": ["isp-a"]}], "datacenter_via": "exit"}
+    )
+    block = e.resolve("dev")
+    assert block["tiers"][0] == {"tier": "datacenter", "names": [], "via": "exit"}
+    assert tiers.via_exit(block) and not tiers.uses_datacenter(block)
+    plain = TaskEgress.model_validate({"tiers": ["datacenter"]}).resolve("dev")
+    assert plain["tiers"] == [{"tier": "datacenter", "names": []}]
+    assert tiers.uses_datacenter(plain) and not tiers.via_exit(plain)
+    assert not tiers.via_exit(None) and tiers.uses_datacenter(None)
+
+
+def test_datacenter_via_exit_needs_the_datacenter_tier():
+    from leasehold.spec.models import TaskEgress
+
+    with pytest.raises(ValidationError, match="datacenter_via"):
+        TaskEgress.model_validate({"tiers": [{"isp": ["isp-a"]}], "datacenter_via": "exit"})
