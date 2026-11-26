@@ -14,7 +14,8 @@ Per sink:
   old one stopped; messages produced in between are read afterwards.
 
 Per derived table, the same for its target table (description included); its refresh
-view (no data) is recreated when its SELECT or interval changed, or when it is missing.
+view (no data) is recreated when its SELECT, interval or offset changed, or when it is
+missing.
 
 Stale objects (marked ``leasehold:`` in a planned database, for a sink or derived table
 the plan no longer has) are reported. ``prune`` drops their Kafka tables and views; target tables

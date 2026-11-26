@@ -312,11 +312,42 @@ def test_derived_plan_and_diff(derived_spec):
     assert not diff(FakeCH(live), p, "kafka:9092", VERSIONS).derived
     faster = dataclasses.replace(dp, refresh_seconds=600)
     assert faster.view_comment() != dp.view_comment()
+    # The fingerprint of a derived table without an offset, as before offsets existed.
+    assert dp.view_comment() == "leasehold: derived=counts view=5a532b003e31370e"
 
     # A derived table the plan no longer has is stale.
     live["dev_certwatch"]["gone"] = ("MergeTree", "leasehold: derived=gone table=x")
     d = diff(FakeCH(live), p, "kafka:9092", VERSIONS)
     assert ("dev_certwatch.gone", "MergeTree") in d.stale
+
+
+def test_derived_offset(derived_spec):
+    text = (derived_spec / "service.yml").read_text()
+    text = text.replace("refresh: 1h }", "refresh: 1d, offset: 9h }", 1)
+    (derived_spec / "service.yml").write_text(text)
+    spec = load_spec(derived_spec / "service.yml")
+    (db,) = clickhouse.plan([(spec, derived_spec)], "dev").databases
+    (dp,) = db.derived
+    assert dp.create_view_sql().startswith(
+        "CREATE MATERIALIZED VIEW dev_certwatch.counts_refresh\n"
+        "REFRESH EVERY 86400 SECOND OFFSET 32400 SECOND TO dev_certwatch.counts\n"
+    )
+    without = dataclasses.replace(dp, offset_seconds=None)
+    assert "OFFSET" not in without.create_view_sql().split("\nAS ")[0]
+
+    # A live view with another offset (or none) is recreated; the table is left alone.
+    for live_view in (without, dataclasses.replace(dp, offset_seconds=3600)):
+        assert live_view.view_comment() != dp.view_comment()
+        live = {
+            "dev_certwatch": {
+                "counts": ("MergeTree", dp.table_comment()),
+                "counts_refresh": ("MaterializedView", live_view.view_comment()),
+            }
+        }
+        (c,) = diff(
+            FakeCH(live), clickhouse.plan([(spec, derived_spec)], "dev"), "kafka:9092", VERSIONS
+        ).derived
+        assert c.recreate_view and not c.create_table
 
 
 def test_derived_schema_file_is_checked(derived_spec):

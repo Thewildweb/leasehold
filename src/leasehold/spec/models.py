@@ -623,6 +623,12 @@ class Derived(_Strict):
         "SELECT over this service's tables, named {database}.<table>",
     )
     refresh: Duration = Field(description="How often the table is recomputed (at least 1m)")
+    offset: Duration | None = Field(
+        default=None,
+        description="Shift of the refresh times: ClickHouse refreshes at multiples of "
+        "refresh counted from midnight, plus this offset (refresh 1d with offset 9h: daily "
+        "at 09:00). Less than refresh. Default: none",
+    )
 
     @field_validator("refresh")
     @classmethod
@@ -630,6 +636,15 @@ class Derived(_Strict):
         if v < timedelta(minutes=1):
             raise ValueError("refresh must be at least 1m")
         return v
+
+    @model_validator(mode="after")
+    def _offset(self) -> Derived:
+        if self.offset is not None:
+            if self.offset <= timedelta(0):
+                raise ValueError("offset must be more than 0 (omit it for none)")
+            if self.offset >= self.refresh:
+                raise ValueError("offset must be less than refresh")
+        return self
 
 
 class ClickHouseSection(_Strict):
