@@ -156,13 +156,16 @@ def test_routes_through_exits_with_a_token_the_exit_accepts(world):
         assert r.exit_ip == r.egress
         assert (r.proxy.scheme, r.proxy.port) == ("http", 3130)
         assert r.proxy.host == {"192.0.2.1": "100.64.0.1", "192.0.2.2": "100.64.0.2"}[r.egress]
-        claims = exit_token.verify([KEY], r.proxy.username, r.proxy.password, r.egress)
+        own = exit_token.exit_key(KEY, r.egress)
+        claims = exit_token.verify([own], r.proxy.username, r.proxy.password, r.egress, [env])
         assert (claims.lease_id, claims.target, claims.env) == (str(t.lease_id), t.target, env)
-        assert claims.expires_at >= int(t.expires_at.timestamp()) + 30
-        # The token is for this exit only.
-        with pytest.raises(exit_token.TokenError):
-            other = "192.0.2.2" if r.egress == "192.0.2.1" else "192.0.2.1"
-            exit_token.verify([KEY], r.proxy.username, r.proxy.password, other)
+        # Valid until the lease expires, not longer.
+        assert claims.expires_at == int(t.expires_at.timestamp())
+        # Signed with this exit's derived key: the other exit's key and the master don't verify.
+        other = "192.0.2.2" if r.egress == "192.0.2.1" else "192.0.2.1"
+        for keys in ([exit_token.exit_key(KEY, other)], [KEY]):
+            with pytest.raises(exit_token.TokenError, match="signature"):
+                exit_token.verify(keys, r.proxy.username, r.proxy.password, r.egress, [env])
     rows = egress_sql(eg, "SELECT via, account FROM {e}.target_leases")
     assert rows == [("exit", None), ("exit", None)]
 
@@ -226,8 +229,9 @@ def test_renewal_signs_a_new_token_and_a_disabled_exit_loses_the_lease(world):
     ok, lost = run(lambda c: d.renew(c, None, "b1", [t.lease_id], routes=routes))
     assert set(ok) == {t.lease_id} and lost == {}
     r = Route.parse(routes[t.lease_id])
-    claims = exit_token.verify([KEY], r.proxy.username, r.proxy.password, r.egress)
-    assert claims.expires_at >= int(ok[t.lease_id].timestamp()) + 30
+    own = exit_token.exit_key(KEY, r.egress)
+    claims = exit_token.verify([own], r.proxy.username, r.proxy.password, r.egress, [env])
+    assert claims.expires_at == int(ok[t.lease_id].timestamp())
     # Another holder can't renew it.
     ok, lost = run(lambda c: d.renew(c, None, "b2", [t.lease_id]))
     assert ok == {} and lost == {t.lease_id: "not held"}

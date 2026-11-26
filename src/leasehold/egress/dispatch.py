@@ -51,8 +51,9 @@ that runs an exit (``exit_endpoint``, not taken out by ``exit_override``), the l
 loaded one first, with the same pair budget, provider tokens and one-holder rule as the
 VPS's own workers: the lease is on that egress's address, with ``via = 'exit'``. The route
 names the exit's endpoint and carries an exit token (``leasehold.exit.token``) signed
-with the exit key, valid until the lease expires plus ``EXIT_TOKEN_GRACE``; every renewal
-returns the route again with a fresh token. Without an exit key no such route is given.
+with the key derived for that exit from the exit master key, valid until the lease
+expires (the exit closes its tunnels then); every renewal returns the route again with a
+fresh token. Without an exit key no such route is given.
 
 Pushback reported by any holder cools the target: a block (``challenge``, ``block``) on
 the tier it happened on, escalating the target to the task type's next tier; rate
@@ -89,7 +90,6 @@ from leasehold.exit import token as exit_token
 
 # The account name routes through registry exits carry (RouteRef): no proxy account.
 EXIT_ACCOUNT = "exit"
-EXIT_TOKEN_GRACE = timedelta(seconds=30)
 
 SCAN_PER_TASK = 20  # due tasks read per task asked for, to look past busy targets
 SCAN_MAX = 5000
@@ -1500,7 +1500,7 @@ def exit_route(key: bytes, ex: RegistryExit, row: dict, env: str) -> dict:
     log it."""
     scheme, host, port = px.parse_endpoint(ex.endpoint)
     user, password = exit_token.sign_lease(
-        key, str(row["lease_id"]), ex.key, row["target"], env, row["expires_at"] + EXIT_TOKEN_GRACE
+        key, str(row["lease_id"]), ex.key, row["target"], env, row["expires_at"]
     )
     return {
         "egress": ex.key,
