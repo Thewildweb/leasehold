@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import pytest
@@ -487,6 +488,12 @@ def test_sandbox_netfilter_prestart_is_the_only_task_with_a_capability(spec):
         "security_opt": ["no-new-privileges"],
     }
     assert nf["Resources"] == {"CPU": 50, "MemoryMB": 64}
+    # What its rules are about: the users and the component's addresses; no secrets.
+    assert nf["Env"] == {
+        "LEASEHOLD_API_URL": PLATFORM.api_url,
+        "LEASEHOLD_KAFKA_BOOTSTRAP": "kafka:9092",
+        "LEASEHOLD_SANDBOX_USERS": '{"worker":10000,"gateway":10001,"browser":20000}',
+    }
     for t in tasks:
         assert t["Config"]["readonly_rootfs"] is True
         assert t["Config"]["cap_drop"] == ["ALL"]
@@ -504,8 +511,11 @@ def test_sandbox_extra_tasks_get_no_secrets(spec):
         t = by_name[name]
         for absent in ("Templates", "Identities", "VolumeMounts", "Leader"):
             assert absent not in t, (name, absent)
-        assert not any(k.startswith("LEASEHOLD_") for k in t["Env"])
         assert "ports" not in t["Config"]
+    for name in ("gateway", "browser"):
+        assert not any(k.startswith("LEASEHOLD_") for k in by_name[name]["Env"])
+    secretish = ("PASSWORD", "TOKEN", "SECRET", "KEY", "DSN")
+    assert not any(w in k for k in by_name["netfilter"]["Env"] for w in secretish)
 
     gw = by_name["gateway"]
     assert gw["User"] == "10001:10001"
@@ -585,3 +595,21 @@ def test_no_sandbox_renders_as_before(spec):
         "image": "ghcr.io/example/certwatch-worker:0123abc",
         "ports": ["http"],
     }
+
+
+def test_sandbox_netfilter_users_come_from_the_spec_not_its_env(spec):
+    from leasehold.spec import ServiceSpec
+
+    s = _sandboxed(spec)
+    data = s.model_dump(mode="json", exclude_none=True, by_alias=True)
+    data["components"]["worker"]["sandbox"]["netfilter"]["env"] = {
+        "LEASEHOLD_SANDBOX_USERS": '{"worker":0}',
+        "EXIT_PORT": "3130",
+    }
+    tasks = render_job(ServiceSpec.model_validate(data), "worker", "prod", SHA, PLATFORM).job[
+        "TaskGroups"
+    ][0]["Tasks"]
+    nf = next(t for t in tasks if t["Name"] == "netfilter")
+    assert nf["Env"]["EXIT_PORT"] == "3130"
+    users = json.loads(nf["Env"]["LEASEHOLD_SANDBOX_USERS"])
+    assert users == {"worker": 10000, "gateway": 10001, "browser": 20000}
