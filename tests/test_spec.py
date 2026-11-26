@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from leasehold.spec import ServiceSpec, check_registry, load_spec, resource_names
 from leasehold.spec.load import SpecError
+from leasehold.spec.models import Derived
 from leasehold.types import format_duration, parse_duration
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -410,3 +411,14 @@ def test_reads_from_points_reader_grants_and_job_env_at_another_environment():
         "Env"
     ]
     assert env["LEASEHOLD_PLANNER_ENVS"] == '{"certwatch":"prod"}'
+
+
+def test_derived_offset():
+    d = Derived.model_validate({"schema_file": "s.sql", "refresh": "1d", "offset": "9h"})
+    assert d.offset == timedelta(hours=9)
+    assert Derived.model_validate({"schema_file": "s.sql", "refresh": "1d"}).offset is None
+    for offset, message in (("1d", "less than refresh"), ("2d", "less than refresh"), (0, "0")):
+        with pytest.raises(ValidationError, match=message):
+            Derived.model_validate({"schema_file": "s.sql", "refresh": "1d", "offset": offset})
+    with pytest.raises(ValidationError, match="duration"):
+        Derived.model_validate({"schema_file": "s.sql", "refresh": "1d", "offset": "9"})
