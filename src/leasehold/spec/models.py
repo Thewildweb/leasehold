@@ -248,8 +248,10 @@ class Netfilter(_Container):
 
 class Sandbox(_RunsAs):
     """Runs the component as a group of hardened containers in one network namespace
-    (Nomad bridge mode): its own task, the extra ``tasks`` and an optional ``netfilter``
-    prestart task. The settings at this level are the component's own task's."""
+    (Nomad bridge mode): its own task, the extra ``tasks`` and a ``netfilter`` prestart
+    task (required when there are extra tasks: without it, bridge mode lets every task
+    reach the host, the private network and the internet). The settings at this level
+    are the component's own task's."""
 
     netfilter: Netfilter | None = None
     tasks: dict[SandboxTaskName, SandboxTask] = Field(
@@ -260,6 +262,11 @@ class Sandbox(_RunsAs):
     def _names(self) -> Sandbox:
         if NETFILTER_TASK in self.tasks:
             raise ValueError(f"the task name {NETFILTER_TASK!r} is reserved")
+        if self.tasks and self.netfilter is None:
+            raise ValueError(
+                "a sandbox with extra tasks needs a netfilter task: bridge mode alone "
+                "doesn't keep them off the host, the private network or the internet"
+            )
         return self
 
 

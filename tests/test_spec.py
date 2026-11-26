@@ -433,6 +433,7 @@ def test_datacenter_via_exit_is_stored_on_the_datacenter_tier():
     )
     block = e.resolve("dev")
     assert block["tiers"][0] == {"tier": "datacenter", "names": [], "via": "exit"}
+    assert block["tiers"][1] == {"tier": "isp", "names": ["isp-a"]}  # proxy tiers: no via
     assert tiers.via_exit(block) and not tiers.uses_datacenter(block)
     plain = TaskEgress.model_validate({"tiers": ["datacenter"]}).resolve("dev")
     assert plain["tiers"] == [{"tier": "datacenter", "names": []}]
@@ -596,3 +597,14 @@ def test_sandbox_task_needs_a_command(certwatch):
     sb = sandbox_block()
     sb["netfilter"]["command"] = []
     assert "command" in errors_of(with_sandbox(certwatch, sb))
+
+
+def test_sandbox_with_extra_tasks_needs_netfilter():
+    from leasehold.spec.models import Sandbox
+
+    block = sandbox_block()
+    del block["netfilter"]
+    with pytest.raises(ValidationError, match="needs a netfilter task"):
+        Sandbox.model_validate(block)
+    block["tasks"] = {}
+    Sandbox.model_validate(block)  # a single hardened task needs none
