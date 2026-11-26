@@ -754,6 +754,13 @@ class TaskType(_Strict):
             raise ValueError("egress needs target_leases")
         return self
 
+    def needs_own_egress(self) -> bool:
+        """The datacenter tier from the worker's own address: its tiers include
+        datacenter (the default) and it isn't reached through exits."""
+        if self.egress is None:
+            return True
+        return "datacenter" in self.egress.tiers and self.egress.datacenter_via != "exit"
+
 
 class FrontierSection(_Strict):
     task_types: dict[TaskTypeName, TaskType] = Field(default_factory=dict)

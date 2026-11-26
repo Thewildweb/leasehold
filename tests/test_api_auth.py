@@ -155,3 +155,25 @@ def test_permissions(registry):
         registry.require_create(other, "resolver.a_record")
     with pytest.raises(Forbidden):  # the worker itself doesn't declare creates_tasks
         registry.require_create(worker, "resolver.a_record")
+
+
+def test_only_the_own_datacenter_tier_needs_the_workers_egress():
+    from leasehold.spec.models import ServiceSpec
+
+    def svc(name, egress):
+        return ServiceSpec.model_validate({
+            "spec_version": 1, "name": name, "description": "x", "owner": "x",
+            "components": {"w": {"kind": "task-worker", "node_class": "x",
+                                 "resources": {"cpu": 100, "memory": 128},
+                                 "consumes_tasks": [f"{name}.t"], "count": {"min": 1, "max": 1}}},
+            "frontier": {"task_types": {f"{name}.t": {"key": "url", "target_leases": True}
+                                        | ({"egress": egress} if egress else {})}},
+        })  # fmt: skip
+
+    r = Registry([
+        svc("plain", None),
+        svc("bound", {"tiers": ["datacenter"]}),
+        svc("exits", {"tiers": ["datacenter"], "datacenter_via": "exit"}),
+        svc("isp", {"tiers": [{"isp": ["isp-a"]}]}),
+    ])  # fmt: skip
+    assert r.needs_egress == {"plain.t", "bound.t"}

@@ -97,13 +97,14 @@ class Registry:
             for name, tt in s.frontier.task_types.items()
             if tt.target_leases
         }
-        # Task types whose tiers include datacenter (the default): leasing them needs the
-        # worker's own egress.
+        # Task types whose tiers include datacenter (the default) on the worker's own
+        # address: leasing them needs the worker's egress. Through exits
+        # (``datacenter_via: exit``) the worker has no address of its own.
         self.needs_egress = {
             name
             for s in specs
             for name, tt in s.frontier.task_types.items()
-            if tt.target_leases and (tt.egress is None or "datacenter" in tt.egress.tiers)
+            if tt.target_leases and tt.needs_own_egress()
         }
         self.egress_specs = {
             name: tt.egress

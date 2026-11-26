@@ -351,13 +351,10 @@ class Worker:
         self.task_types = sorted(comp.consumes_tasks)
         own = ctx.cfg.spec.frontier.task_types
         self.targeted = {t for t in self.task_types if t in own and own[t].target_leases}
-        # Task types whose tiers leave out datacenter: only through a proxy route, never
-        # from this machine's address.
-        self.proxy_only = {
-            t
-            for t in self.targeted
-            if own[t].egress is not None and "datacenter" not in own[t].egress.tiers
-        }
+        # Task types that never leave from this machine's address: tiers without
+        # datacenter, or datacenter through exits. A task of one without a route is a
+        # bug, given back untried.
+        self.proxy_only = {t for t in self.targeted if not own[t].needs_own_egress()}
         self.egress = ctx.cfg.egress_ip
         self.via_agent = bool(getattr(self.client, "via_agent", False))
         direct = self.targeted - self.proxy_only
