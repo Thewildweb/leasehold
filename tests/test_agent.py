@@ -25,6 +25,7 @@ class FakeAPI:
         self.spend_granted = None  # None: grant what's asked
         self.lost: list[dict] = []
         self.down = False
+        self.not_before: str | None = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if self.down:
@@ -43,7 +44,8 @@ class FakeAPI:
                 ],
                 "targets": [{"target": "192.0.2.9", "lease_id": self.lease_id,
                              "expires_at": exp, "interval_s": 0.3,
-                             "provider": "example-cdn", "cap": 10, "granted": 2}],
+                             "provider": "example-cdn", "cap": 10, "granted": 2,
+                             "not_before": self.not_before}],
             })  # fmt: skip
         if request.url.path == "/v1/targets/spend":
             n = body["n"] if self.spend_granted is None else self.spend_granted
@@ -181,6 +183,31 @@ def test_done_tasks_give_the_target_back(agent):
     _, body, _ = agent.api.calls[-1]
     assert body["release"] == [agent.api.lease_id]
     assert agent.state.targets == {}
+
+
+def test_next_lease_on_a_target_waits_one_interval(agent):
+    """Tasks done, the target lease given back, the target leased again: the first token
+    waits for the new lease's not_before (one interval after the last lease ended)."""
+    lease(agent)
+    assert token(agent, first=True)["granted"] is True
+    agent.post("/v1/tasks/ack", json={"tasks": [
+        {"task_type": "sites.fetch", "key": k, "lease_id": str(uuid.uuid4()),
+         "event_id": str(uuid.uuid4())} for k in ("a.example", "b.example")]})  # fmt: skip
+    asyncio.run(agent.state.maintain())
+    assert agent.state.targets == {}
+    released = datetime.now(UTC)
+    agent.api.lease_id = str(uuid.uuid4())
+    agent.api.not_before = (released + timedelta(seconds=0.3)).isoformat()
+    lease(agent)
+    r = token(agent, first=True)
+    assert r["granted"] is False and 0.2 < r["wait_s"] <= 0.3
+    time.sleep(0.31)
+    assert token(agent, first=True)["granted"] is True
+    # A not_before in the past: no wait.
+    agent.api.lease_id = str(uuid.uuid4())
+    agent.api.not_before = (released - timedelta(seconds=60)).isoformat()
+    lease(agent)
+    assert token(agent, first=True)["granted"] is True
 
 
 def test_api_down(agent):

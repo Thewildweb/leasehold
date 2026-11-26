@@ -202,6 +202,11 @@ class TargetLeaseOut(_Model):
         description="For a target on a proxy tier: the proxy to reach it through, with "
         "credentials (leasehold.egress.proxies.render_route)",
     )
+    not_before: datetime | None = Field(
+        default=None,
+        description="For a target leased before: no request before this time (one interval "
+        "after the previous lease ended, whatever its holder or egress)",
+    )
 
     def __repr__(self) -> str:
         return f"TargetLeaseOut(target={self.target!r}, lease_id={self.lease_id}, tier={self.tier})"
