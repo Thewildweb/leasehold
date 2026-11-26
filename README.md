@@ -233,9 +233,10 @@ per kept snapshot), a view `<table>` that readers use (`SQL SECURITY DEFINER` as
 service's definer user, so readers need a grant on the view only), `snapshot_loads` (one
 row per state change of a load) and `snapshot_current`. In object storage, a read-only
 user for ClickHouse, whose keys go into a named collection with the bucket's URL, none
-of them overridable. A loader user per dataset, limited to `_staging_*` tables, its
-`__snapshots` partitions, `snapshot_loads` and its named collection. A periodic job
-`<service>-load-<dataset>` that runs `leasehold snapshot load`.
+of them overridable; datasets on the same bucket share that collection. A loader user
+per dataset, limited to `_staging_*` tables, its `__snapshots` partitions,
+`snapshot_loads` and its named collection. A periodic job `<service>-load-<dataset>`
+that runs `leasehold snapshot load`.
 
 **One load.** The loader checks the files against the manifest, loads each table into a
 new `_staging_*` table, compares row counts and runs the checks, attaches each as a new
