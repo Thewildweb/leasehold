@@ -80,6 +80,7 @@ from leasehold.egress.dispatch import (
     Cooling,
     Dispatcher,
     EgressRefused,
+    registry_exits,
 )
 from leasehold.egress.planner import Planner, effective_class, publish_demand
 from leasehold.egress.probe import Prober
@@ -968,6 +969,32 @@ def create_app(
     if run_log is not None:
         metrics.logs_read.labels(settings.env).set(time.time())
 
+    async def exits_report() -> None:
+        """One line at start for task types through registry exits: a missing key or no
+        exit rows fail closed (targets wait as no_exit_key / no_exit), so say which.
+        The task types come from the specs; leasing reads the frontier's task_types rows
+        (``leasehold frontier apply``), so an unapplied spec can differ from this line."""
+        routed = sorted(registry.routed)
+        if not routed:
+            return
+        names = ", ".join(routed)
+        if settings.exit_key is None:
+            log.warning("no exit key (LEASEHOLD_EXIT_KEYS): %s get no exit routes", names)
+            return
+        try:
+            async with pool.connection(timeout=2) as conn:
+                found = await asyncio.wait_for(registry_exits(dispatcher, conn), 5)
+        except Exception as e:  # the egress schema may not be migrated yet
+            log.warning("registry exits not readable (%s): %r", settings.egress_schema, e)
+            return
+        if not found:
+            log.warning(
+                "no registry exits in %s (active rows with exit: { endpoint }): "
+                "%s get no exit routes", settings.egress_schema, names,
+            )  # fmt: skip
+        else:
+            log.info("registry exits for %s: %s", names, ", ".join(sorted(x.key for x in found)))
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await pool.open(wait=True)
@@ -979,6 +1006,7 @@ def create_app(
                 f"frontier schema for {settings.env} is at version {version}, "
                 f"expected {schema.LATEST}; run `leasehold frontier migrate`"
             )
+        await exits_report()
         tasks = [
             asyncio.create_task(background("sweeper", settings.sweep_interval, sweep_once)),
             asyncio.create_task(background("stats", settings.stats_interval, stats_once)),

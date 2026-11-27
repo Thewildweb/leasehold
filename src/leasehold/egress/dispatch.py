@@ -1441,6 +1441,11 @@ def _exit_of(r: dict) -> RegistryExit:
     )
 
 
+async def registry_exits(d: Dispatcher, conn: AsyncConnection) -> list[RegistryExit]:
+    """The registry exits leases may route through now (``_EXITS_SQL``)."""
+    return [_exit_of(r) for r in await d._rows(conn, _EXITS_SQL)]
+
+
 class _Exits:
     """The registry exits a lease call may route through."""
 
@@ -1448,6 +1453,10 @@ class _Exits:
         self.d = d
         self.by_key: dict[str, RegistryExit] = {}
         self.open: dict[str, int] = defaultdict(int)
+        # Why a target waits when there is no exit at all: the API has no exit key
+        # (LEASEHOLD_EXIT_KEYS), or no registry row has an exit (``exit: { endpoint }``).
+        # Exits that don't serve the task type: no_exit_for_type (``pick``).
+        self.none = "no_exit_key" if d.exit_key is None else "no_exit"
 
     @property
     def keys(self) -> set[str]:
@@ -1471,8 +1480,8 @@ class _Exits:
     def pick(self, task_type, target, pair_left, has_token):
         """The least loaded exit that serves the task type and has budget left."""
         if not self.by_key:
-            return None, "no_exit"
-        why = "no_exit"
+            return None, self.none
+        why = "no_exit_for_type"  # exits, but none serves the task type
         options = []
         for ex in self.by_key.values():
             if not ex.serves(task_type):
