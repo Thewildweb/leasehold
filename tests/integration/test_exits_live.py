@@ -175,7 +175,44 @@ def test_no_exit_key_no_routes(world):
     upsert(env, "render.page", ["a.example"], "198.51.100.10")
     d = Dispatcher(env, schema.schema_name(env), eg)
     g = lease(d, ["render.page"])
+    # Its own reason: the API's key is missing, not the exits.
+    assert g.tasks == [] and g.waiting == {"no_exit_key": 1}
+
+
+def test_no_exit_rows_no_routes(world):
+    env, eg, _ = world
+    upsert(env, "render.page", ["a.example"], "198.51.100.10")
+    egress_sql(eg, "UPDATE {e}.egresses SET exit_endpoint = NULL")
+    d = Dispatcher(env, schema.schema_name(env), eg, exit_key=KEY)
+    g = lease(d, ["render.page"])
     assert g.tasks == [] and g.waiting == {"no_exit": 1}
+
+
+@pytest.mark.parametrize(
+    "key, clear, line",
+    [
+        (KEY, False, "registry exits for render.page: 192.0.2.1, 192.0.2.2"),
+        (None, False, "no exit key (LEASEHOLD_EXIT_KEYS): render.page get"),
+        (KEY, True, "no registry exits in"),
+    ],
+)
+def test_the_api_says_at_start_which_exits_it_routes_through(world, tmp_path, caplog, key,
+                                                             clear, line):  # fmt: skip
+    from fastapi.testclient import TestClient
+
+    from leasehold.api.app import create_app
+    from leasehold.api.auth import Registry
+    from leasehold.api.settings import Settings
+
+    env, eg, _ = world
+    if clear:
+        egress_sql(eg, "UPDATE {e}.egresses SET exit_endpoint = NULL")
+    settings = Settings(env=env, dsn=DSN, services=(), egress_schema=eg,
+                        sweep_interval=3600, stats_interval=3600, exit_key=key)  # fmt: skip
+    with caplog.at_level("INFO", logger="leasehold.api"):
+        with TestClient(create_app(settings, registry=Registry([SPEC]))):
+            pass
+    assert any(line in r.getMessage() for r in caplog.records), caplog.text
 
 
 def test_never_from_a_workers_own_address(world):
