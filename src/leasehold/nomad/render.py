@@ -57,7 +57,11 @@ What each job gets:
   run next to the component's own (the leader) with only their own env: no template,
   Nomad Variable or workload identity. ``netfilter`` is a prestart task (not a
   sidecar), root with ``NET_ADMIN`` as its only capability, that installs the packet
-  filter rules in the shared namespace and exits. No host volume is mounted into the
+  filter rules in the shared namespace and exits. Besides its own env it gets what its
+  rules are about, no secrets: ``LEASEHOLD_SANDBOX_USERS`` (JSON, task name -> user ID,
+  the component's own task included) and the addresses the component's own task talks
+  to (``LEASEHOLD_API_URL``, and ``LEASEHOLD_KAFKA_BOOTSTRAP`` / ``LEASEHOLD_S3_ENDPOINT``
+  when it has them). No host volume is mounted into the
   extra tasks; the component's own task keeps the egress agent's socket when it uses it.
 - Scheduled components: a periodic batch job (cron in UTC, no overlapping runs), no
   port, no restarts inside a run; the next firing is the retry.
@@ -438,12 +442,22 @@ def _command(config: dict[str, Any], command: list[str]) -> dict[str, Any]:
     return out
 
 
-def _sandbox_tasks(sandbox: Sandbox, image: str, kill_timeout: timedelta) -> list[dict[str, Any]]:
+# The component's addresses the netfilter task may need for its rules (never secrets).
+NETFILTER_ADDRESSES = ("LEASEHOLD_API_URL", "LEASEHOLD_KAFKA_BOOTSTRAP", "LEASEHOLD_S3_ENDPOINT")
+
+
+def _sandbox_tasks(
+    sandbox: Sandbox, cname: str, leader_env: dict[str, str], image: str, kill_timeout: timedelta
+) -> list[dict[str, Any]]:
     """The netfilter prestart task and the extra tasks of a sandboxed group. They get
-    only their own env: no template, no Nomad Variables, no workload identity."""
+    no template, no Nomad Variables, no workload identity; the extra tasks only their
+    own env, netfilter also the users and addresses its rules are about."""
     tasks = []
     if sandbox.netfilter is not None:
         nf = sandbox.netfilter
+        users = {cname: sandbox.user} | {name: t.user for name, t in sandbox.tasks.items()}
+        nf_env = {k: leader_env[k] for k in NETFILTER_ADDRESSES if k in leader_env}
+        nf_env["LEASEHOLD_SANDBOX_USERS"] = json.dumps(users, separators=(",", ":"))
         config = _command({"image": nf.image or image}, nf.command)
         tasks.append(
             {
@@ -452,7 +466,7 @@ def _sandbox_tasks(sandbox: Sandbox, image: str, kill_timeout: timedelta) -> lis
                 "User": "0:0",  # iptables needs root; NET_ADMIN is its only capability
                 "Lifecycle": {"Hook": "prestart", "Sidecar": False},
                 "Config": _hardened(config, nf, cap_add=["NET_ADMIN"]),
-                "Env": dict(nf.env),
+                "Env": dict(nf.env) | nf_env,
                 "Resources": _resources(nf.resources),
                 "KillTimeout": _ns(kill_timeout),
             }
@@ -503,7 +517,9 @@ def render_job(
     group: dict[str, Any] = {"Name": cname, "Tasks": [task]}
     sandbox = c.sandbox
     if sandbox is not None:
-        group["Tasks"] += _sandbox_tasks(sandbox, task["Config"]["image"], c.kill_timeout)
+        group["Tasks"] += _sandbox_tasks(
+            sandbox, cname, task["Env"], task["Config"]["image"], c.kill_timeout
+        )
         # Every task in its own containers, sharing one network namespace (127.0.0.1).
         group["Networks"] = [{"Mode": "bridge"}]
     if _uses_agent(spec, c, platform):

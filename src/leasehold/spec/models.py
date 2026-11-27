@@ -267,6 +267,21 @@ class Sandbox(_RunsAs):
                 "a sandbox with extra tasks needs a netfilter task: bridge mode alone "
                 "doesn't keep them off the host, the private network or the internet"
             )
+        # The packet filter tells the tasks apart by user, and files and sockets by user
+        # and group: two tasks sharing either would share what the other may reach.
+        runs_as = {"(the component)": self} | dict(self.tasks)
+        for what, ids in (
+            ("user", {n: t.user for n, t in runs_as.items()}),
+            ("group", {n: t.group if t.group is not None else t.user for n, t in runs_as.items()}),
+        ):
+            seen: dict[int, str] = {}
+            for name, i in ids.items():
+                if i in seen:
+                    raise ValueError(
+                        f"sandbox tasks {seen[i]} and {name} share {what} {i}: each task "
+                        f"needs its own {what}"
+                    )
+                seen[i] = name
         return self
 
 
@@ -753,6 +768,13 @@ class TaskType(_Strict):
         if self.egress is not None and not self.target_leases:
             raise ValueError("egress needs target_leases")
         return self
+
+    def needs_own_egress(self) -> bool:
+        """The datacenter tier from the worker's own address: its tiers include
+        datacenter (the default) and it isn't reached through exits."""
+        if self.egress is None:
+            return True
+        return "datacenter" in self.egress.tiers and self.egress.datacenter_via != "exit"
 
 
 class FrontierSection(_Strict):

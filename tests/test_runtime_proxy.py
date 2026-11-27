@@ -162,11 +162,11 @@ def test_redaction():
 # --- the worker ---------------------------------------------------------------------------------
 
 
-def spec(tiers) -> ServiceSpec:
+def spec(tiers, via=None) -> ServiceSpec:
     data = copy.deepcopy(RUNTIME_SPEC)
     tt = data["frontier"]["task_types"]["jobs.item"]
     tt["target_leases"] = True
-    tt["egress"] = {"tiers": tiers}
+    tt["egress"] = {"tiers": tiers} | ({"datacenter_via": via} if via else {})
     return ServiceSpec.model_validate(data)
 
 
@@ -190,12 +190,12 @@ class RouteControl(TargetControl):
         return tasks, targets
 
 
-def make(handler, control, tiers, egress=None):
+def make(handler, control, tiers, egress=None, via=None):
     cfg = RuntimeConfig(
         env="dev",
         service="jobs",
         component="worker",
-        spec=spec(tiers),
+        spec=spec(tiers, via),
         instance="alloc-1",
         egress_ip=egress,
         payload_models={"jobs.results.v1": "payload_models:R"},
@@ -212,6 +212,22 @@ def test_proxy_only_worker_needs_no_egress_but_mixed_does():
     make(lambda t, c: None, RouteControl([], None), [{"isp": ["isp-a"]}])
     with pytest.raises(ConfigError, match="LEASEHOLD_EGRESS_IP"):
         make(lambda t, c: None, RouteControl([], None), ["datacenter", {"isp": ["isp-a"]}])
+
+
+def test_a_worker_through_exits_needs_no_egress():
+    # datacenter_via: exit (the sandboxed browser): routes through registry exits only.
+    w = make(lambda t, c: None, RouteControl([], None), ["datacenter"], via="exit")
+    assert w.proxy_only == {"jobs.item"}
+
+
+def test_a_task_through_exits_without_a_route_goes_back_untried():
+    # Fail closed: without a route it would leave from this machine's own address.
+    ran = []
+    control = RouteControl(["a:1"], None)
+    w = make(lambda t, c: ran.append(t), control, ["datacenter"], via="exit")
+    run_until(w, lambda: len(control.released) == 1)
+    (rel,) = control.released
+    assert "no route" in rel.reason and not ran and not control.acked
 
 
 def test_worker_fetches_through_the_route(proxy):

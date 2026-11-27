@@ -19,6 +19,8 @@ Endpoints (all under ``/v1`` need a bearer token):
     POST /v1/targets/{target}/escalate move a target to its next egress tier
                                        (targets:escalate scope)
     POST /v1/targets/spend         tokens for requests beyond a task's first (agents)
+    GET  /v1/targets/held          targets other holders have leased (workers of task
+                                   types through exits: their gateway's third-party rule)
     GET  /v1/task-types            settings and counts per task type
     POST /v1/task-types/{name}/pause   stop leasing; release current leases (admin)
     POST /v1/task-types/{name}/resume  (admin)
@@ -40,7 +42,7 @@ import dataclasses
 import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -109,6 +111,7 @@ log = logging.getLogger("leasehold.api")
 MAX_UPSERT = 5000
 MAX_LEASE = 500
 MAX_REFS = 1000
+HELD_LIMIT = 200_000  # held targets in one answer; a routed browser refuses third parties past it
 KEY_MAX = 2048
 
 
@@ -258,6 +261,12 @@ class TargetRenewResponse(_Model):
         default_factory=list,
         description="New routes for renewed leases whose proxy credentials changed",
     )
+
+
+class HeldTargetsResponse(_Model):
+    targets: list[str] = Field(description="Targets with a live lease held by someone else")
+    complete: bool = Field(description="False when the list was cut at its limit")
+    as_of: datetime
 
 
 class SpendRequest(_Model):
@@ -1176,6 +1185,18 @@ def create_app(
             renewed=[RenewedTarget(lease_id=i, expires_at=e) for i, e in ok.items()],
             lost=[LostTarget(lease_id=i, reason=r) for i, r in lost.items()],
             routes=[RouteUpdate(lease_id=i, route=r) for i, r in routes.items()],
+        )
+
+    @app.get("/v1/targets/held", response_model=HeldTargetsResponse)
+    async def held_targets(c: CallerDep, worker_id: str | None = Query(None, max_length=200)):
+        if c.agent or not registry.leasable(c) & registry.routed:
+            raise Forbidden(f"{c.name} consumes no task types through exits")
+        holder = f"{c.name}:{c.instance or worker_id or 'unknown'}"
+        async with pool.connection() as conn:
+            as_of = datetime.now(UTC)
+            targets = await dispatcher.held_by_others(conn, holder, HELD_LIMIT + 1)
+        return HeldTargetsResponse(
+            targets=targets[:HELD_LIMIT], complete=len(targets) <= HELD_LIMIT, as_of=as_of
         )
 
     @app.post("/v1/targets/spend", response_model=SpendResponse)

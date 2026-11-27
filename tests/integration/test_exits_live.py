@@ -258,3 +258,64 @@ def test_release_ends_an_exit_lease(world):
     run(lambda c: d.renew(c, None, "b1", [], release=[t.lease_id]))
     rows = egress_sql(eg, "SELECT expires_at <= now() FROM {e}.target_leases")
     assert rows == [(True,)]
+
+
+def test_held_by_others_lists_every_other_holders_live_targets(world):
+    env, eg, _ = world
+    upsert(env, "render.fetch", ["a.example"], "198.51.100.10")
+    upsert(env, "render.page", ["b.example"], "198.51.100.11")
+    d = Dispatcher(env, schema.schema_name(env), eg, exit_key=KEY)
+    lease(d, ["render.fetch"], egress="192.0.2.1", holder="vps-1")
+    lease(d, ["render.page"], holder="browser-1")
+    # Another environment's holder with the browser's name still counts.
+    other = Dispatcher(f"{env}x", schema.schema_name(env), eg, exit_key=KEY)
+    egress_sql(
+        eg,
+        "INSERT INTO {e}.target_leases (target, egress, holder, env, lease_id, interval_ms, "
+        "duration_ms, cap, granted, expires_at) VALUES ('198.51.100.12', '192.0.2.3', "
+        "'browser-1', %s, gen_random_uuid(), 1000, 30000, 1, 1, now() + interval '1 minute'), "
+        "('198.51.100.13', '192.0.2.3', 'old', %s, gen_random_uuid(), 1000, 30000, 1, 1, "
+        "now() - interval '1 second')",
+        (f"{env}x", env),
+    )
+    held = run(lambda c: d.held_by_others(c, "browser-1"))
+    assert held == ["198.51.100.10", "198.51.100.12"]  # not its own, not the expired one
+    assert run(lambda c: other.held_by_others(c, "browser-1")) == [
+        "198.51.100.10",
+        "198.51.100.11",
+    ]
+    assert run(lambda c: d.held_by_others(c, "browser-1", limit=1)) == ["198.51.100.10"]
+
+
+def test_held_targets_over_http_for_a_routed_worker_not_for_an_agent(world, tmp_path):
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from leasehold.api.app import create_app
+    from leasehold.api.auth import Registry, hash_token, new_token
+    from leasehold.api.settings import Settings
+
+    env, eg, _ = world
+    upsert(env, "render.fetch", ["a.example"], "198.51.100.10")
+    d = Dispatcher(env, schema.schema_name(env), eg, exit_key=KEY)
+    lease(d, ["render.fetch"], egress="192.0.2.1", holder="vps-1")
+    tokens = {"worker": new_token(), "agent": new_token()}
+    entries = {"worker": {"service": "render", "component": "worker"},
+               "agent": {"agent": "egress-agent"}}  # fmt: skip
+    path = tmp_path / "tokens.json"
+    path.write_text(_json.dumps({"tokens": [
+        {"sha256": hash_token(tokens[r])} | e for r, e in entries.items()]}))  # fmt: skip
+    settings = Settings(env=env, dsn=DSN, services=(), tokens_file=path, egress_schema=eg,
+                        sweep_interval=3600, stats_interval=3600, exit_key=KEY)  # fmt: skip
+    with TestClient(create_app(settings, registry=Registry([SPEC]))) as api:
+
+        def get(role, q=""):
+            h = {"Authorization": f"Bearer {tokens[role]}"}
+            return api.get("/v1/targets/held" + q, headers=h)
+
+        r = get("worker", "?worker_id=browser-1")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["targets"] == ["198.51.100.10"] and body["complete"] is True
+        assert get("agent").status_code == 403
