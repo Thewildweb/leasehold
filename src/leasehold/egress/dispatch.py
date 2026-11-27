@@ -1455,6 +1455,7 @@ class _Exits:
         self.open: dict[str, int] = defaultdict(int)
         # Why a target waits when there is no exit at all: the API has no exit key
         # (LEASEHOLD_EXIT_KEYS), or no registry row has an exit (``exit: { endpoint }``).
+        # Exits that don't serve the task type: no_exit_for_type (``pick``).
         self.none = "no_exit_key" if d.exit_key is None else "no_exit"
 
     @property
@@ -1480,7 +1481,7 @@ class _Exits:
         """The least loaded exit that serves the task type and has budget left."""
         if not self.by_key:
             return None, self.none
-        why = "no_exit"
+        why = "no_exit_for_type"  # exits, but none serves the task type
         options = []
         for ex in self.by_key.values():
             if not ex.serves(task_type):

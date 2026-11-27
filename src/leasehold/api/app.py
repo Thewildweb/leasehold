@@ -971,7 +971,9 @@ def create_app(
 
     async def exits_report() -> None:
         """One line at start for task types through registry exits: a missing key or no
-        exit rows fail closed (targets wait as no_exit_key / no_exit), so say which."""
+        exit rows fail closed (targets wait as no_exit_key / no_exit), so say which.
+        The task types come from the specs; leasing reads the frontier's task_types rows
+        (``leasehold frontier apply``), so an unapplied spec can differ from this line."""
         routed = sorted(registry.routed)
         if not routed:
             return
@@ -980,10 +982,10 @@ def create_app(
             log.warning("no exit key (LEASEHOLD_EXIT_KEYS): %s get no exit routes", names)
             return
         try:
-            async with pool.connection() as conn:
-                found = await registry_exits(dispatcher, conn)
+            async with pool.connection(timeout=2) as conn:
+                found = await asyncio.wait_for(registry_exits(dispatcher, conn), 5)
         except Exception as e:  # the egress schema may not be migrated yet
-            log.warning("registry exits not readable (%s): %s", settings.egress_schema, e)
+            log.warning("registry exits not readable (%s): %r", settings.egress_schema, e)
             return
         if not found:
             log.warning(

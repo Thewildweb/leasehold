@@ -188,6 +188,15 @@ def test_no_exit_rows_no_routes(world):
     assert g.tasks == [] and g.waiting == {"no_exit": 1}
 
 
+def test_exits_for_other_task_types_only(world):
+    env, eg, _ = world
+    upsert(env, "render.page", ["a.example"], "198.51.100.10")
+    egress_sql(eg, "UPDATE {e}.egresses SET task_types = ARRAY['render.other']")
+    d = Dispatcher(env, schema.schema_name(env), eg, exit_key=KEY)
+    g = lease(d, ["render.page"])
+    assert g.tasks == [] and g.waiting == {"no_exit_for_type": 1}
+
+
 @pytest.mark.parametrize(
     "key, clear, line",
     [
